@@ -128,12 +128,11 @@ def simulate_data_poly(N=400, G=20, sigma=0.5):
 # 5. Permutation Test
 
 def permutation_test(S, A, M=30):
-    print("Training on true data...")
     L_true = train_model(S, A)
 
     perm_losses = []
 
-    print(f"Running {M} permutations...")
+    print(f"Running {M} permutations")
     for _ in tqdm(range(M)):
         # Permute gene expression values across cells
         perm = np.random.permutation(A.shape[0])
@@ -155,7 +154,7 @@ if __name__ == "__main__":
     N = 400
     G = 20
     sigma = 0.5
-    M = 30
+    M = 100
 
     print("Positive Control")
     S_pos, A_pos = simulate_data(N, G, sigma, positive=True)
