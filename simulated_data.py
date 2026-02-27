@@ -3,171 +3,149 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 # 1. Set random seeds for reproducibility
-np.random.seed(0)
-torch.manual_seed(0)
+np.random.seed(42)
+torch.manual_seed(42)
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 2. Simulate Spatial Data
 
-def simulate_data(N=400, G=20, sigma=0.5, positive=True):
+def simulate_data(N=400, G=20, sigma=0.1, positive=True):
     gridsize = int(np.sqrt(N))
-    N = gridsize**2 # Ensures N matches the actual grid size
+    N = gridsize**2 
     
-    # Grid construction
-    S = np.array([[i, j] for i in range(1, gridsize + 1) for j in range(1, gridsize + 1)])
-    x = S[:, 0] / gridsize
-    y = S[:, 1] / gridsize
+    coords = np.linspace(0, 1, gridsize)
+    x, y = np.meshgrid(coords, coords)
+    S = np.stack([x.ravel(), y.ravel()], axis=1)
 
     if positive:
-        d = x**2 + y**2
-        polynomial_degree = 5 
-        gene_coeff = np.random.randn(polynomial_degree + 1, G)
-        H = np.vander(d, N=polynomial_degree+1) @ gene_coeff
-        noise = sigma * np.random.randn(N, G)
-        A = H + noise
-    
+        d = np.sqrt((S[:, 0] - 0.5)**2 + (S[:, 1] - 0.5)**2)
+        H = np.zeros((N, G))
+        for g in range(G):
+            coeffs = np.random.randn(4)
+            H[:, g] = np.polyval(coeffs, d)
+        A = H + sigma * np.random.randn(N, G)
     else:
         A = np.random.randn(N, G)
 
+    # Standardize gene expression
+    A = (A - A.mean(axis=0)) / (A.std(axis=0) + 1e-8)
+
     return S.astype(np.float32), A.astype(np.float32)
 
-# 3. Define GASTON-style Neural Network
+# 3. Define Neural Network
 
 class IsoDepthNet(nn.Module):
-    """
-    Neural network approximating: f_g(x,y) = h_g(d(x,y))
-    Matches architecture from Appendix 1.1: 2 -> 20 -> 20 -> 1 -> 20 -> 20 -> G
-    """
     def __init__(self, G):
         super(IsoDepthNet, self).__init__()
-
-        self.encoder = nn.Sequential(
-            nn.Linear(2, 20),
-            nn.ReLU(),
-            nn.Linear(20, 20),
-            nn.ReLU(),
-            nn.Linear(20, 1)   # 1D isodepth bottleneck d_theta
-        )
-
-        self.decoder = nn.Sequential(
-            nn.Linear(1, 20),
-            nn.ReLU(),
-            nn.Linear(20, 20),
-            nn.ReLU(),
-            nn.Linear(20, G)   # h_theta'
-        )
+        self.encoder = nn.Sequential(nn.Linear(2, 20), nn.ReLU(), nn.Linear(20, 20), nn.ReLU(), nn.Linear(20, 1))
+        self.decoder = nn.Sequential(nn.Linear(1, 20), nn.ReLU(), nn.Linear(20, 20), nn.ReLU(), nn.Linear(20, G))
 
     def forward(self, x):
-        d = self.encoder(x)
-        out = self.decoder(d)
-        return out
+        return self.decoder(self.encoder(x))
 
-# 4. Train network and compute Negative Log-Likelihood
+# 4. Train network
 
-def train_model(S, A, epochs=300, lr=1e-3):
-    """
-    Trains network and returns final exact Gaussian negative log-likelihood.
-    """
+def train_model(S, A, epochs=500, lr=1e-3):
+    torch.manual_seed(42)
     S_tensor = torch.tensor(S).to(device)
     A_tensor = torch.tensor(A).to(device)
-
-    N, G = A.shape
-
-    model = IsoDepthNet(G).to(device)
+    model = IsoDepthNet(A.shape[1]).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
 
-    # Train model
     for _ in range(epochs):
         optimizer.zero_grad()
-        output = model(S_tensor)
-        loss = criterion(output, A_tensor)
+        loss = criterion(model(S_tensor), A_tensor)
         loss.backward()
         optimizer.step()
 
-    # Compute exact Gaussian Negative Log-Likelihood
     with torch.no_grad():
-        output = model(S_tensor)
-        mse = criterion(output, A_tensor).item()
+        mse = criterion(model(S_tensor), A_tensor).item()
         
-    # NLL for Gaussian: (n/2)*log(2*pi*sigma^2) + (n/2) 
-    # where n = N*G and empirical sigma^2 = MSE
-    n_total = N * G
-    nll = (n_total / 2) * np.log(2 * np.pi * mse) + (n_total / 2)
-
-    return nll
-
-def simulate_data_poly(N=400, G=20, sigma=0.5):
-    gridsize = int(np.sqrt(N))
-
-    coords = np.linspace(0, 1, gridsize)
-    x, y = np.meshgrid(coords, coords)
-    x_centered = x.ravel() - 0.5
-    y_centered = y.ravel() - 0.5
-    S = np.stack([x_centered, y_centered], axis=1)
-    
-    # 2. Define a clean distance metric (isodepth)
-    d = np.sqrt(S[:,0]**2 + S[:,1]**2) 
-    
-    poly_degree = 3
-    gene_coeff = np.random.uniform(-1, 1, (poly_degree + 1, G))
-    
-    # 4. Generate H
-    H = np.zeros((N, G))
-    for p in range(poly_degree + 1):
-        H += np.outer(d**p, gene_coeff[p, :])
-        
-    noise = sigma * np.random.randn(N, G)
-    A = H + noise
-    return S.astype(np.float32), A.astype(np.float32)
+    n_total = A.shape[0] * A.shape[1]
+    nll = (n_total / 2) * np.log(2 * np.pi * mse + 1e-12) + (n_total / 2)
+    return nll, model
 
 # 5. Permutation Test
 
-def permutation_test(S, A, M=30):
-    L_true = train_model(S, A)
-
+def permutation_test(S, A, M=20):
+    L_true, model = train_model(S, A)
     perm_losses = []
-
     print(f"Running {M} permutations")
     for _ in tqdm(range(M)):
-        # Permute gene expression values across cells
         perm = np.random.permutation(A.shape[0])
-        A_perm = A[perm]
-
-        L_perm = train_model(S, A_perm)
+        L_perm, _ = train_model(S, A[perm])
         perm_losses.append(L_perm)
-
+    
     perm_losses = np.array(perm_losses)
-
-    # extreme values under the null hypothesis are smaller than L_true.
     p_value = (1 + np.sum(perm_losses <= L_true)) / (M + 1)
+    return p_value, L_true, perm_losses, model
 
-    return p_value, L_true, perm_losses
+# 6. Visualization
 
-# 6. Execution
+def visualize_results(S, A, model, L_true, L_perm, title=""):
+    plt.figure(figsize=(12, 5))
+    gridsize = int(np.sqrt(S.shape[0]))
+    with torch.no_grad():
+        d_learned = model.encoder(torch.tensor(S).to(device)).cpu().numpy().flatten()
+        d_learned = (d_learned - d_learned.min()) / (d_learned.max() - d_learned.min() + 1e-8)
+        Z_d = d_learned.reshape(gridsize, gridsize)
+
+    # 1. Learned Isodepth
+    ax1 = plt.subplot(1, 2, 1)
+    im = ax1.imshow(Z_d, cmap="viridis", extent=[0, 1, 0, 1], origin="lower")
+    ax1.contour(Z_d, levels=8, colors="white", linewidths=1, extent=[0, 1, 0, 1], alpha=0.6)
+    plt.colorbar(im, ax=ax1, label="Depth Value")
+    ax1.set_title(f"{title}: Learned Isodepths")
+    
+    # 2. NLL Distribution
+    ax2 = plt.subplot(1, 2, 2)
+    sns.histplot(L_perm, ax=ax2, color="skyblue", kde=False)
+    p_val = (1 + np.sum(L_perm <= L_true)) / (len(L_perm) + 1)
+    ax2.axvline(L_true, color="red", linestyle="--", label=f"True NLL (p={p_val:.3f})")
+    ax2.set_title("Permutation Test Results")
+    ax2.legend()
+    
+    plt.tight_layout()
+    plt.savefig(f"{title.lower()}_results.png")
+    plt.close()
+
+def visualize_gene_data(S, A, gene_indices=range(10), title=""):
+    plt.figure(figsize=(20, 8))
+    gridsize = int(np.sqrt(S.shape[0]))
+    rows, cols = 2, 5
+    
+    for i, g_idx in enumerate(gene_indices):
+        if i < rows * cols:
+            ax = plt.subplot(rows, cols, i + 1)
+            im = ax.imshow(A[:, g_idx].reshape(gridsize, gridsize), cmap="magma", extent=[0, 1, 0, 1], origin="lower")
+            ax.set_title(f"Gene {g_idx}")
+            ax.axis("off")
+            if i % cols == (cols - 1):
+                plt.colorbar(im, ax=ax, shrink=0.8)
+
+    plt.suptitle(f"{title}: Spatial Expression of Genes 0-9")
+    plt.tight_layout()
+    plt.savefig(f"{title.lower()}_genes.png")
+    plt.close()
+
+# 7. Execution
 
 if __name__ == "__main__":
-    N = 400
-    G = 20
-    sigma = 0.5
-    M = 100
-
-    print("Positive Control")
-    S_pos, A_pos = simulate_data(N, G, sigma, positive=True)
-    p_pos, L_true_pos, L_perm_pos = permutation_test(S_pos, A_pos, M)
-
-    print(f"\nTrue NLL: {L_true_pos:.4f}")
-    print(f"Mean permuted NLL: {L_perm_pos.mean():.4f}")
-    print(f"P-value: {p_pos:.4f}")
-
-    print("Negative Control")
-    S_neg, A_neg = simulate_data(N, G, sigma, positive=False)
-    p_neg, L_true_neg, L_perm_neg = permutation_test(S_neg, A_neg, M)
-
-    print(f"\nTrue NLL: {L_true_neg:.4f}")
-    print(f"Mean permuted NLL: {L_perm_neg.mean():.4f}")
-    print(f"P-value: {p_neg:.4f}")
+    N, G, M = 900, 30, 100
+    
+    for control_type in ["Positive", "Negative"]:
+        print(f"\n--- {control_type.upper()} CONTROL ---")
+        is_pos = (control_type == "Positive")
+        S, A = simulate_data(N, G, positive=is_pos)
+        p, L_true, L_perm, model = permutation_test(S, A, M)
+        print(f"P-value: {p:.4f}")
+        
+        visualize_results(S, A, model, L_true, L_perm, title=control_type)
+        visualize_gene_data(S, A, gene_indices=range(10), title=control_type)
