@@ -1,74 +1,77 @@
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
-import seaborn as sns
-from tqdm import tqdm
+import pandas as pd
 from data_manager import SpatialDataSimulator
-from gaston_mix_frozen_encoder import closed_form_permutation_test
+from gaston_mix_frozen_encoder import closed_form_permutation_test as gaston_mix_test
+from permutation_frozen_encoder import frozen_permutation_test as gaston_test
 
-def run_power_test(n_trials=20, N=900, G=20, M=200, P=3):
+def run_qq_honesty_test(n_trials=30, N=900, G=20, M_gaston_mix=200, M_gaston=20):
     """
-    Runs the Negative Control (pure noise) multiple times to check 
-    if the p-value distribution is Uniform(0, 1).
+    Runs a Q-Q plot analysis to check for statistical honesty (Uniformity of P-values).
+    Focuses on the NOISE mode for both methods.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     simulator = SpatialDataSimulator(N, G, device=device)
     
-    p_values = []
-    
-    print(f"Starting Power Test: {n_trials} trials on Negative Control (Noise)")
-    print(f"Each trial uses M={M} permutations.")
-    
-    for i in range(n_trials):
-        # Generate new random noise for each trial
-        S, A = simulator.generate(positive=False, seed=42 + i)
-        
-        # Run the permutation test
-        p, _, _, _ = closed_form_permutation_test(S, A, P=P, M=M)
-        p_values.append(p)
-        
-        print(f"Trial {i+1}/{n_trials} | P-value: {p:.4f}")
+    results = []
 
-    # Visualization
-    plt.figure(figsize=(10, 5))
+    print(f"--- STARTING Q-Q HONESTY TEST ({n_trials} Trials on Noise) ---")
+    for i in range(n_trials):
+        print(f"Trial {i+1}/{n_trials}")
+        S, A = simulator.generate(mode="noise", seed=42+i)
+        
+        # 1. Test GASTON-Mix
+        p_gaston_mix, _, _, _ = gaston_mix_test(S, A, P=3, M=M_gaston_mix)
+        results.append({"method": "GASTON-Mix", "p": p_gaston_mix})
+        
+        # 2. Test GASTON
+        p_gaston, _, _, _ = gaston_test(S, A, M=M_gaston)
+        results.append({"method": "GASTON", "p": p_gaston})
+
+    df = pd.DataFrame(results)
     
-    # 1. Histogram of P-values
+    # Visualization
+    plt.figure(figsize=(12, 5))
+    
+    # 1. Histogram
     plt.subplot(1, 2, 1)
-    plt.hist(p_values, bins=10, range=(0, 1), color='skyblue', edgecolor='black', alpha=0.7)
-    plt.axhline(n_trials/10, color='red', linestyle='--', label='Theoretical Uniform')
-    plt.title("P-value Distribution (Noise)")
+    for method in ["GASTON-Mix", "GASTON"]:
+        data = df[df['method'] == method]['p']
+        plt.hist(data, bins=10, range=(0, 1), alpha=0.4, label=method, density=True)
+    plt.axhline(1, color='black', linestyle='--', label='Ideal Uniform')
+    plt.title("P-value Density (Noise)")
     plt.xlabel("P-value")
-    plt.ylabel("Frequency")
+    plt.ylabel("Density")
     plt.legend()
 
-    # 2. Cumulative Distribution (Q-Q Plot style)
+    # 2. Q-Q Plot
     plt.subplot(1, 2, 2)
-    sorted_p = np.sort(p_values)
-    expected_p = np.linspace(0, 1, len(p_values))
-    plt.plot(expected_p, sorted_p, marker='o', linestyle='none', color='blue')
-    plt.plot([0, 1], [0, 1], color='red', linestyle='--')
-    plt.title("Cumulative P-value Distribution")
-    plt.xlabel("Expected Quantile")
-    plt.ylabel("Observed P-value")
+    expected_p = np.linspace(0, 1, n_trials)
+    
+    for method, color in zip(["GASTON-Mix", "GASTON"], ["blue", "orange"]):
+        observed_p = np.sort(df[df['method'] == method]['p'])
+        plt.plot(expected_p, observed_p, 'o', label=method, color=color, markersize=5)
+        
+    plt.plot([0, 1], [0, 1], color='red', linestyle='--', label='Perfect Calibration')
+    
+    plt.title("P-value Q-Q Plot (Noise)")
+    plt.xlabel("Theoretical Quantiles (Uniform)")
+    plt.ylabel("Observed P-values")
+    plt.legend()
+    plt.grid(True, which='both', linestyle='--', alpha=0.5)
 
     plt.tight_layout()
-    plt.savefig("power_test_results.png")
+    plt.savefig("qq_honesty_test.png")
     plt.show()
 
-    # Statistical Check
-    n_sig = np.sum(np.array(p_values) <= 0.05)
-    false_positive_rate = n_sig / n_trials
-    print(f"\n--- POWER TEST SUMMARY ---")
-    print(f"Total Trials: {n_trials}")
-    print(f"Significant results (p <= 0.05): {n_sig}")
-    print(f"Observed False Positive Rate: {false_positive_rate:.2%}")
-    print(f"Expected False Positive Rate: 5.00%")
-    
-    if false_positive_rate > 0.15:
-        print("WARNING: The test may be OVERFITTING. P-values are clustering too low.")
-    else:
-        print("SUCCESS: The test appears statistically honest.")
+    # Summary Statistics
+    print("\n--- HONESTY SUMMARY (False Positive Rates) ---")
+    for method in ["GASTON-Mix", "GASTON"]:
+        p_vals = df[df['method'] == method]['p']
+        fpr = np.sum(p_vals <= 0.05) / n_trials
+        print(f"{method}: Observed FPR at alpha=0.05: {fpr:.2%} (Target: 5.00%)")
 
 if __name__ == "__main__":
-    # We use fewer permutations (M=200) and trials (20) to keep it fast
-    run_power_test(n_trials=20, M=200)
+    # n_trials=30 provides a much clearer Q-Q curve
+    run_qq_honesty_test(n_trials=30, M_gaston_mix=200, M_gaston=20)

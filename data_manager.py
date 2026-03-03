@@ -2,7 +2,6 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import seaborn as sns
-import os
 
 class SpatialDataSimulator:
     def __init__(self, N=900, G=20, sigma=0.1, device="cpu"):
