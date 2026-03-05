@@ -78,38 +78,40 @@ def closed_form_permutation_test(S, A, P=3, M=1000):
     model.eval()
     
     S_t = torch.tensor(S).to(device)
+    # Center A to ensure intercept-only model is a baseline
     A_t = torch.tensor(A).to(device)
+    A_t = A_t - A_t.mean(dim=0, keepdim=True)
     
     with torch.no_grad():
         _, gates, isodepths = model(S_t)
     
     print("Step 2: Constructing Design Matrix (X) and Projection Matrix (I - H)...")
-    # Build X matrix of size [N, 2P]
+    # Build X matrix of size [N, 2P + 1]
     X_cols = []
+    # 1. Global intercept
+    X_cols.append(torch.ones((S_t.shape[0], 1), device=device))
+    
     for p in range(P):
         g_p = gates[:, p:p+1]  # [N, 1]
         d_p = isodepths[p]     # [N, 1]
-        X_cols.append(g_p * d_p)  # Feature 1: Gated Isodepth
-        X_cols.append(g_p)        # Feature 2: Gated Intercept
+        # 2. Gated Isodepth
+        X_cols.append(g_p * d_p)  
+        # 3. Gated Intercept (already partially covered by global if P=1, but distinct for mixture)
+        X_cols.append(g_p)        
     
-    X = torch.cat(X_cols, dim=1)  # Shape: [N, 2P]
+    X = torch.cat(X_cols, dim=1)  # Shape: [N, 2P + 1]
     
-    # Calculate H = X(X^T X)^-1 X^T
-    XtX = torch.matmul(X.T, X)
-    # Add small ridge (jitter) for numerical stability during inversion
-    XtX += torch.eye(2*P, device=device) * 1e-6 
-    XtX_inv = torch.inverse(XtX)
-    
-    X_pseudo = torch.matmul(XtX_inv, X.T)
-    H = torch.matmul(X, X_pseudo)
-    
-    # Calculate (I - H)
-    I = torch.eye(X.shape[0], device=device)
-    I_minus_H = I - H
+    # Use QR decomposition for numerical stability instead of explicit inversion
+    # H = Q Q^T where Q is the orthogonal basis for the column space of X
+    Q, _ = torch.linalg.qr(X)
     
     print(f"Step 3: Running {M} lightning-fast closed-form permutations...")
-    # Calculate True Loss: L = ||(I-H)A||_F^2
-    residuals_true = torch.matmul(I_minus_H, A_t)
+    
+    # Calculate True Loss: L = ||A - Q(Q^T A)||_F^2
+    # This is equivalent to ||(I - QQ^T)A||_F^2
+    QtA = torch.matmul(Q.T, A_t)
+    proj_A = torch.matmul(Q, QtA)
+    residuals_true = A_t - proj_A
     L_true = torch.sum(residuals_true ** 2).item()
     
     perm_losses = np.zeros(M)
@@ -119,7 +121,9 @@ def closed_form_permutation_test(S, A, P=3, M=1000):
         A_perm = A_t[perm_idx]
         
         # Calculate permuted loss analytically
-        residuals_perm = torch.matmul(I_minus_H, A_perm)
+        QtA_perm = torch.matmul(Q.T, A_perm)
+        proj_A_perm = torch.matmul(Q, QtA_perm)
+        residuals_perm = A_perm - proj_A_perm
         L_perm = torch.sum(residuals_perm ** 2).item()
         perm_losses[m] = L_perm
         
@@ -128,12 +132,14 @@ def closed_form_permutation_test(S, A, P=3, M=1000):
 
 # 5. Execution
 if __name__ == "__main__":
-    N, G, M, P = 900, 20, 1000, 3
+    N, G, M, P = 900, 20, 1000, 2
+    
     simulator = SpatialDataSimulator(N, G, device=device)
 
     for control in ["Checkerboard", "Noise"]:
         print(f"\n--- {control.upper()} CONTROL ---")
         mode = control.lower()
+        
         S, A = simulator.generate(mode=mode)
         
         # Visualize Input Data

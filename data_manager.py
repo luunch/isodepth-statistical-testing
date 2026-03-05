@@ -1,7 +1,10 @@
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.optim as optim
 import matplotlib.pyplot as plt
 import seaborn as sns
+from tqdm import tqdm
 
 class SpatialDataSimulator:
     def __init__(self, N=900, G=20, sigma=0.1, device="cpu"):
@@ -19,7 +22,7 @@ class SpatialDataSimulator:
 
     def generate(self, mode="radial", seed=None):
         """
-        Generates simulated spatial gene expression data.
+        Generates simulated spatial gene expression data (Continuous/Gaussian).
         Modes: 'radial', 'checkerboard', 'noise'
         """
         if seed is not None:
@@ -36,20 +39,16 @@ class SpatialDataSimulator:
             d = np.zeros(self.N)
             for i in range(self.N):
                 xi, yi = self.S[i]
-                # Determine 3x3 cell coordinates
                 col = min(int(xi * 3), 2)
                 row = min(int(yi * 3), 2)
-                # Alternate between x-gradient and y-gradient
                 if (row + col) % 2 == 0:
-                    d[i] = xi  # Horizontal gradient
+                    d[i] = xi
                 else:
-                    d[i] = yi  # Vertical gradient
-            
+                    d[i] = yi
             H = self._apply_expression_manifold(d)
             A = H + self.sigma * np.random.randn(self.N, self.G)
             
         else:
-            # Pure random noise
             A = np.random.randn(self.N, self.G)
 
         # Standardize gene expression
@@ -57,18 +56,16 @@ class SpatialDataSimulator:
         return self.S, A.astype(np.float32)
 
     def _apply_expression_manifold(self, d):
-        """Helper to map a 1D depth manifold to multi-gene expression space."""
         H = np.zeros((self.N, self.G))
         for g in range(self.G):
-            coeffs = np.random.randn(4) # Cubic relationship
+            coeffs = np.random.randn(4)
             H[:, g] = np.polyval(coeffs, d)
         return H
 
     def visualize_genes(self, S, A, title="Data", n_genes=10, save_path=None):
-        """Visualizes the spatial expression of the first n_genes."""
         rows, cols = 2, 5
         plt.figure(figsize=(20, 8))
-        for i in range(min(n_genes, self.G)):
+        for i in range(min(n_genes, A.shape[1])):
             ax = plt.subplot(rows, cols, i + 1)
             im = ax.imshow(A[:, i].reshape(self.gridsize, self.gridsize), 
                            cmap="magma", extent=[0, 1, 0, 1], origin="lower")
@@ -76,31 +73,24 @@ class SpatialDataSimulator:
             ax.axis("off")
             if i % cols == (cols - 1):
                 plt.colorbar(im, ax=ax, shrink=0.8)
-        
         plt.suptitle(f"{title}: Spatial Expression Patterns")
         plt.tight_layout()
-        if save_path:
-            plt.savefig(save_path)
-        plt.show()
-        plt.close()
+        if save_path: plt.savefig(save_path)
+        plt.show(); plt.close()
 
     def visualize_permutation(self, L_true, L_perm, title="Permutation Test", save_path=None):
-        """Visualizes the distribution of permutation losses vs true loss."""
         plt.figure(figsize=(6, 5))
         sns.histplot(L_perm, color="salmon", kde=False)
         p_val = (1 + np.sum(L_perm <= L_true)) / (len(L_perm) + 1)
         plt.axvline(L_true, color="red", linestyle="--", label=f"True Loss (p={p_val:.4f})")
         plt.title(f"{title}: Null Distribution")
-        plt.xlabel("Loss (Residual Sum of Squares)")
+        plt.xlabel("Loss")
         plt.legend()
         plt.tight_layout()
-        if save_path:
-            plt.savefig(save_path)
-        plt.show()
-        plt.close()
+        if save_path: plt.savefig(save_path)
+        plt.show(); plt.close()
 
     def visualize_gaston_mix_results(self, S, model, title="GASTON-MIX", save_path=None):
-        """Specialized visualization for Mixture of Experts (Gates and Isodepths)."""
         model.eval()
         S_t = torch.tensor(S).to(self.device)
         with torch.no_grad():
@@ -110,16 +100,13 @@ class SpatialDataSimulator:
         
         P = len(isodepths)
         fig, axes = plt.subplots(2, P, figsize=(P*4, 8))
-        
         for p in range(P):
-            # Plot Gate (Router Weights)
             ax_g = axes[0, p]
             Z_g = gates[:, p].reshape(self.gridsize, self.gridsize)
             im_g = ax_g.imshow(Z_g, cmap="Blues", extent=[0,1,0,1], origin="lower", vmin=0, vmax=1)
             ax_g.set_title(f"Expert {p} Gate Weight")
             plt.colorbar(im_g, ax=ax_g)
             
-            # Plot Isodepth
             ax_d = axes[1, p]
             d_learned = isodepths[p]
             d_norm = (d_learned - d_learned.min()) / (d_learned.max() - d_learned.min() + 1e-8)
@@ -128,10 +115,7 @@ class SpatialDataSimulator:
             ax_d.contour(Z_d, levels=8, colors="white", linewidths=1, extent=[0,1,0,1], alpha=0.4)
             ax_d.set_title(f"Expert {p} Isodepth")
             plt.colorbar(im_d, ax=ax_d)
-
         plt.suptitle(f"{title}: Spatial Mixture Decomposition")
         plt.tight_layout()
-        if save_path:
-            plt.savefig(save_path)
-        plt.show()
-        plt.close()
+        if save_path: plt.savefig(save_path)
+        plt.show(); plt.close()

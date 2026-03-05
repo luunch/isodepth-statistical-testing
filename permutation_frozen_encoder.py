@@ -128,12 +128,15 @@ def visualize_gene_data(S, A, gene_indices=range(10), title=""):
 # 6. Execution
 if __name__ == "__main__":
     N, G, M = 900, 20, 30
+
     simulator = SpatialDataSimulator(N=N, G=G, device=device)
     for control in ["Positive", "Negative"]:
         print(f"- {control.upper()} CONTROL ---")
         mode = "radial" if control == "Positive" else "noise"
+
         S, A = simulator.generate(mode=mode)
+
         p, L_true, L_perm, model = frozen_permutation_test(S, A, M)
         print(f"P-value: {p:.4f}")
         visualize_results(S, A, model, L_true, L_perm, title=control)
-        visualize_gene_data(S, A, gene_indices=range(10), title=control)
+        visualize_gene_data(S, A, gene_indices=range(min(10, A.shape[1])), title=control)
