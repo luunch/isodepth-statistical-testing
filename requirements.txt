@@ -1,0 +1,6 @@
+numpy
+torch
+matplotlib
+seaborn
+tqdm
+scipy
