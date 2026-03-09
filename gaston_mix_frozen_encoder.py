@@ -9,58 +9,19 @@ from data_manager import SpatialDataSimulator
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 2. Network Architecture: GASTON-MIX
-class GastonMixNet(nn.Module):
-    def __init__(self, G, P=2):
-        super(GastonMixNet, self).__init__()
-        self.P = P
-        
-        # Routing Network: R^2 -> [0,1]^P (Softmax ensures sum to 1)
-        # 2 hidden layers of size 20
-        self.router = nn.Sequential(
-            nn.Linear(2, 20), nn.ReLU(), 
-            nn.Linear(20, 20), nn.ReLU(),
-            nn.Linear(20, P), nn.Softmax(dim=1)
-        )
-        
-        # Local Encoders: P distinct networks R^2 -> R^1
-        # Each has 1 hidden layer of size 20 and a final ReLU for the isodepth
-        self.encoders = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(2, 20), nn.ReLU(), 
-                nn.Linear(20, 1), nn.ReLU()
-            ) 
-            for _ in range(P)
-        ])
-        
-        # Linear Experts (Decoder): P distinct linear layers (d -> Genes)
-        self.experts = nn.ModuleList([
-            nn.Linear(1, G) for _ in range(P)
-        ])
-
-    def forward(self, x):
-        gates = self.router(x) # Shape: [N, P]
-        
-        output = 0
-        isodepths = []
-        # Continuous routing: Sum across all P experts
-        for p in range(self.P):
-            g_p = gates[:, p:p+1]           # Gate prob for expert p
-            d_p = self.encoders[p](x)       # Isodepth for expert p
-            pred_p = self.experts[p](d_p)   # Linear prediction
-            
-            output += g_p * pred_p          # Blend predictions
-            isodepths.append(d_p)
-            
-        return output, gates, isodepths
+from models import GastonMixNet
 
 # 3. Phase 2: Train the Deep Learning Mapmaker
-def train_full_model(S, A, P=3, epochs=500):
+def train_full_model(S, A, P=3, epochs=10000, patience=100):
     torch.manual_seed(42)
     model = GastonMixNet(A.shape[1], P=P).to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.MSELoss()
     
     S_t, A_t = torch.tensor(S).to(device), torch.tensor(A).to(device)
+    
+    best_loss = float('inf')
+    patience_counter = 0
     
     for _ in range(epochs):
         optimizer.zero_grad()
@@ -69,6 +30,16 @@ def train_full_model(S, A, P=3, epochs=500):
         loss.backward()
         optimizer.step()
         
+        current_loss = loss.item()
+        if current_loss < best_loss - 1e-5:
+            best_loss = current_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= patience:
+            break
+            
     return model
 
 # 4. The Closed-Form Permutation Test
@@ -142,15 +113,17 @@ if __name__ == "__main__":
         
         S, A = simulator.generate(mode=mode)
         
+        import os
+        os.makedirs("results", exist_ok=True)
         # Visualize Input Data
-        simulator.visualize_genes(S, A, title=f"{control} Control", save_path=f"gaston_mix_{control.lower()}_genes.png")
+        simulator.visualize_genes(S, A, title=f"{control} Control", save_path=f"results/gaston_mix_{control.lower()}_genes.png")
 
         p, L_true, L_perm, model = closed_form_permutation_test(S, A, P=P, M=M)
         
         print(f"Final P-value: {p:.4f}")
         
         # Visualize Distribution
-        simulator.visualize_permutation(L_true, L_perm, title=control, save_path=f"gaston_mix_{control.lower()}_dist.png")
+        simulator.visualize_permutation(L_true, L_perm, title=control, save_path=f"results/gaston_mix_{control.lower()}_dist.png")
         
         # Visualize Learned Spatial Components
-        simulator.visualize_gaston_mix_results(S, model, title=control, save_path=f"gaston_mix_{control.lower()}_maps.png")
+        simulator.visualize_gaston_mix_results(S, model, title=control, save_path=f"results/gaston_mix_{control.lower()}_maps.png")

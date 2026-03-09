@@ -13,29 +13,38 @@ from data_manager import SpatialDataSimulator
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # 2. Network Architecture
-class IsoDepthNet(nn.Module):
-    def __init__(self, G):
-        super(IsoDepthNet, self).__init__()
-        self.encoder = nn.Sequential(nn.Linear(2, 20), nn.ReLU(), nn.Linear(20, 20), nn.ReLU(), nn.Linear(20, 1))
-        self.decoder = nn.Sequential(nn.Linear(1, 20), nn.ReLU(), nn.Linear(20, 20), nn.ReLU(), nn.Linear(20, G))
-    def forward(self, x):
-        return self.decoder(self.encoder(x))
+from models import IsoDepthNet
 
 # 3. Specialized Training Functions
-def train_full_model(S, A, epochs=500):
+def train_full_model(S, A, epochs=5000, patience=50):
     torch.manual_seed(42)
     model = IsoDepthNet(A.shape[1]).to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.MSELoss()
     S_t, A_t = torch.tensor(S).to(device), torch.tensor(A).to(device)
+    
+    best_loss = float('inf')
+    patience_counter = 0
+    
     for _ in range(epochs):
         optimizer.zero_grad()
         loss = criterion(model(S_t), A_t)
         loss.backward()
         optimizer.step()
+        
+        current_loss = loss.item()
+        if current_loss < best_loss - 1e-5:
+            best_loss = current_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= patience:
+            break
+            
     return model
 
-def train_frozen_decoder(model, S, A, epochs=500):
+def train_frozen_decoder(model, S, A, epochs=5000, patience=50):
     # Freeze encoder
     for param in model.encoder.parameters():
         param.requires_grad = False
@@ -49,11 +58,24 @@ def train_frozen_decoder(model, S, A, epochs=500):
     criterion = nn.MSELoss()
     S_t, A_t = torch.tensor(S).to(device), torch.tensor(A).to(device)
 
+    best_loss = float('inf')
+    patience_counter = 0
+
     for _ in range(epochs):
         optimizer.zero_grad()
         loss = criterion(model(S_t), A_t)
         loss.backward()
         optimizer.step()
+        
+        current_loss = loss.item()
+        if current_loss < best_loss - 1e-5:
+            best_loss = current_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= patience:
+            break
 
     with torch.no_grad():
         mse = criterion(model(S_t), A_t).item()
@@ -105,7 +127,9 @@ def visualize_results(S, A, model, L_true, L_perm, title=""):
     ax2.set_title("GASTON Permutation Results")
     ax2.legend()
     plt.tight_layout()
-    plt.savefig(f"gaston_{title.lower()}_results.png")
+    import os
+    os.makedirs("results", exist_ok=True)
+    plt.savefig(f"results/gaston_{title.lower()}_results.png")
     plt.close()
 
 def visualize_gene_data(S, A, gene_indices=range(10), title=""):
@@ -122,7 +146,9 @@ def visualize_gene_data(S, A, gene_indices=range(10), title=""):
                 plt.colorbar(im, ax=ax, shrink=0.8)
     plt.suptitle(f"{title}: Spatial Expression of Genes 0-9")
     plt.tight_layout()
-    plt.savefig(f"gaston_{title.lower()}_genes.png")
+    import os
+    os.makedirs("results", exist_ok=True)
+    plt.savefig(f"results/gaston_{title.lower()}_genes.png")
     plt.close()
 
 # 6. Execution

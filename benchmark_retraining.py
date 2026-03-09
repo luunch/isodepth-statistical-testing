@@ -8,7 +8,7 @@ from data_manager import SpatialDataSimulator
 from full_retraining_gaston import full_retraining_permutation_test as sequential_test
 from parallel_full_retraining import run_parallel_permutation_test as parallel_test
 
-def benchmark_retraining(M=20, N=400, G=10, epochs=200):
+def benchmark_retraining(M=20, N=400, G=10, epochs=5000):
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
@@ -61,4 +61,4 @@ def benchmark_retraining(M=20, N=400, G=10, epochs=200):
 
 if __name__ == "__main__":
     # We use a smaller M and epochs for a quick benchmark
-    benchmark_retraining(M=100, N=400, G=10, epochs=500)
+    benchmark_retraining(M=100, N=400, G=10, epochs=5000)

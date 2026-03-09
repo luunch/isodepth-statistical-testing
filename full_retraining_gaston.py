@@ -16,16 +16,10 @@ else:
     device = torch.device("cpu")
 
 # 2. Network Architecture
-class IsoDepthNet(nn.Module):
-    def __init__(self, G):
-        super(IsoDepthNet, self).__init__()
-        self.encoder = nn.Sequential(nn.Linear(2, 20), nn.ReLU(), nn.Linear(20, 20), nn.ReLU(), nn.Linear(20, 1))
-        self.decoder = nn.Sequential(nn.Linear(1, 20), nn.ReLU(), nn.Linear(20, 20), nn.ReLU(), nn.Linear(20, G))
-    def forward(self, x):
-        return self.decoder(self.encoder(x))
+from models import IsoDepthNet
 
 # 3. Training Function
-def train_model(S, A, epochs=500, lr=1e-3):
+def train_model(S, A, epochs=5000, lr=1e-3, patience=50):
     """Trains the full GASTON model (encoder + decoder) from scratch."""
     model = IsoDepthNet(A.shape[1]).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
@@ -34,12 +28,25 @@ def train_model(S, A, epochs=500, lr=1e-3):
     S_t = torch.tensor(S, dtype=torch.float32).to(device)
     A_t = torch.tensor(A, dtype=torch.float32).to(device)
     
+    best_loss = float('inf')
+    patience_counter = 0
+    
     for _ in range(epochs):
         optimizer.zero_grad()
         loss = criterion(model(S_t), A_t)
         loss.backward()
         optimizer.step()
         
+        current_loss = loss.item()
+        if current_loss < best_loss - 1e-5:
+            best_loss = current_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= patience:
+            break
+            
     with torch.no_grad():
         mse = criterion(model(S_t), A_t).item()
         
@@ -49,7 +56,7 @@ def train_model(S, A, epochs=500, lr=1e-3):
     return nll, model
 
 # 4. Full Retraining Permutation Test
-def full_retraining_permutation_test(S, A, M=20, epochs=500):
+def full_retraining_permutation_test(S, A, M=20, epochs=5000):
     print("Step 1: Training full model on true data...")
     L_true, true_model = train_model(S, A, epochs=epochs)
     
@@ -94,7 +101,9 @@ def visualize_results(S, A, model, L_true, L_perm, title=""):
     ax2.legend()
     
     plt.tight_layout()
-    plt.savefig(f"full_retrain_{title.lower()}_results.png")
+    import os
+    os.makedirs("results", exist_ok=True)
+    plt.savefig(f"results/full_retrain_{title.lower()}_results.png")
     plt.close()
 
 # 6. Execution

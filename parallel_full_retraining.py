@@ -18,57 +18,10 @@ else:
 print(f"Using device: {device}")
 
 # 2. Parallel Linear Layer
-class ParallelLinear(nn.Module):
-    """
-    A batched linear layer that maintains M independent weight matrices.
-    Input shape:  [M, N, in_features]
-    Output shape: [M, N, out_features]
-    """
-    def __init__(self, M, in_f, out_f):
-        super().__init__()
-        self.M = M
-        self.weight = nn.Parameter(torch.empty(M, out_f, in_f))
-        self.bias = nn.Parameter(torch.empty(M, out_f))
-        self.reset_parameters()
-
-    def reset_parameters(self):
-        # Initialize each of the M models using standard Kaiming/He initialization
-        for m in range(self.M):
-            nn.init.kaiming_uniform_(self.weight[m], a=np.sqrt(5))
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight[m])
-            bound = 1 / np.sqrt(fan_in) if fan_in > 0 else 0
-            nn.init.uniform_(self.bias[m], -bound, bound)
-
-    def forward(self, x):
-        # x: [M, N, in_f]
-        # weights: [M, out_f, in_f]
-        # We use bmm (Batch Matrix Multiplication) to apply M different weights to M different data blocks
-        return torch.bmm(x, self.weight.transpose(1, 2)) + self.bias.unsqueeze(1)
-
-# 3. Parallel GASTON Network
-class ParallelIsoDepthNet(nn.Module):
-    def __init__(self, M, G):
-        super().__init__()
-        # M is the number of parallel models (1 True + M-1 Permutations)
-        self.encoder = nn.Sequential(
-            ParallelLinear(M, 2, 20), nn.ReLU(),
-            ParallelLinear(M, 20, 20), nn.ReLU(),
-            ParallelLinear(M, 20, 1)
-        )
-        self.decoder = nn.Sequential(
-            ParallelLinear(M, 1, 20), nn.ReLU(),
-            ParallelLinear(M, 20, 20), nn.ReLU(),
-            ParallelLinear(M, 20, G)
-        )
-
-    def forward(self, x):
-        # x shape: [M, N, 2]
-        isodepth = self.encoder(x)
-        output = self.decoder(isodepth)
-        return output
+from models import ParallelIsoDepthNet
 
 # 4. Parallel Training Logic
-def run_parallel_permutation_test(S, A, M=100, epochs=500, lr=1e-3):
+def run_parallel_permutation_test(S, A, M=100, epochs=5000, lr=1e-3, patience=50):
     """
     Runs M permutations in parallel using a single batched neural network.
     Model 0 is the True data. Models 1 to M-1 are permuted data.
@@ -99,7 +52,10 @@ def run_parallel_permutation_test(S, A, M=100, epochs=500, lr=1e-3):
     optimizer = optim.Adam(model.parameters(), lr=lr, foreach=use_foreach)
     criterion = nn.MSELoss(reduction='none') # Don't reduce so we can get loss per model
     
-    print(f"Training {M} models in parallel for {epochs} epochs...")
+    best_loss = float('inf')
+    patience_counter = 0
+
+    print(f"Training {M} models in parallel for up to {epochs} epochs...")
     for _ in tqdm(range(epochs)):
         optimizer.zero_grad()
         output = model(S_batched)
@@ -110,6 +66,16 @@ def run_parallel_permutation_test(S, A, M=100, epochs=500, lr=1e-3):
         total_loss = loss_per_model.sum()
         total_loss.backward()
         optimizer.step()
+        
+        current_loss = total_loss.item()
+        if current_loss < best_loss - 1e-5:
+            best_loss = current_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            
+        if patience_counter >= patience:
+            break
         
     with torch.no_grad():
         final_output = model(S_batched)
@@ -137,7 +103,7 @@ def run_parallel_qq_analysis(n_trials=20, n_perms=100, N=400, G=10):
         S, A = simulator.generate(mode="noise")
         
         # We use a slightly higher M for the test to ensure good resolution
-        p, _, _, _ = run_parallel_permutation_test(S, A, M=n_perms, epochs=400)
+        p, _, _, _ = run_parallel_permutation_test(S, A, M=n_perms, epochs=5000)
         p_values.append(p)
         print(f"Trial {i+1} P-value: {p:.4f}")
 
@@ -163,8 +129,10 @@ def run_parallel_qq_analysis(n_trials=20, n_perms=100, N=400, G=10):
     plt.grid(True)
     
     plt.tight_layout()
-    plt.savefig("parallel_qq_plot.png")
-    print(f"\nAnalysis complete. Plot saved to 'parallel_qq_plot.png'")
+    import os
+    os.makedirs("results", exist_ok=True)
+    plt.savefig("results/parallel_qq_plot.png")
+    print(f"\nAnalysis complete. Plot saved to 'results/parallel_qq_plot.png'")
     print(f"Final Calibration Summary:")
     print(f"  - Kolmogorov-Smirnov test: p={ks_res.pvalue:.4f}")
     print(f"  - FPR at alpha=0.05: {fpr:.2%}")

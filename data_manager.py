@@ -76,7 +76,7 @@ class SpatialDataSimulator:
         plt.suptitle(f"{title}: Spatial Expression Patterns")
         plt.tight_layout()
         if save_path: plt.savefig(save_path)
-        plt.show(); plt.close()
+        plt.close()
 
     def visualize_permutation(self, L_true, L_perm, title="Permutation Test", save_path=None):
         plt.figure(figsize=(6, 5))
@@ -88,7 +88,7 @@ class SpatialDataSimulator:
         plt.legend()
         plt.tight_layout()
         if save_path: plt.savefig(save_path)
-        plt.show(); plt.close()
+        plt.close()
 
     def visualize_gaston_mix_results(self, S, model, title="GASTON-MIX", save_path=None):
         model.eval()
@@ -118,4 +118,4 @@ class SpatialDataSimulator:
         plt.suptitle(f"{title}: Spatial Mixture Decomposition")
         plt.tight_layout()
         if save_path: plt.savefig(save_path)
-        plt.show(); plt.close()
+        plt.close()

@@ -50,7 +50,7 @@ def run_comparison_qq(methods=['gaston_frozen', 'gaston_mix_frozen', 'full_retra
         # 3. Full Retraining GASTON
         if 'full_retrain' in methods:
             # Full retraining is slow, so we use lower M and epochs if needed
-            p_full, _, _, _ = full_retrain_test(S, A, M=M_full, epochs=300)
+            p_full, _, _, _ = full_retrain_test(S, A, M=M_full, epochs=5000)
             results.append({"method": "GASTON (Full Retrain)", "p": p_full})
 
     df = pd.DataFrame(results)
@@ -96,8 +96,10 @@ def run_comparison_qq(methods=['gaston_frozen', 'gaston_mix_frozen', 'full_retra
     plt.grid(True, which='both', linestyle='--', alpha=0.5)
 
     plt.tight_layout()
-    plt.savefig("comparison_qq_plot.png")
-    print("\nSaved comparison Q-Q plot to 'comparison_qq_plot.png'")
+    import os
+    os.makedirs("results", exist_ok=True)
+    plt.savefig("results/comparison_qq_plot.png")
+    print("\nSaved comparison Q-Q plot to 'results/comparison_qq_plot.png'")
     
     # Summary Statistics
     print(f"\n--- CALIBRATION SUMMARY ---")
