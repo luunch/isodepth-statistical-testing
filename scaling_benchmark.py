@@ -64,7 +64,7 @@ def run_scaling_benchmark(N=400, G=10, epochs=3000, timeout=120):
     S, A = simulator.generate(mode="noise", seed=42)
     
     # We use smaller epochs to allow hitting higher Ms within the 2-minute window
-    M_values = [10, 50, 100, 250, 500, 1000]
+    M_values = [10, 50, 100, 250, 500, 1000, 2000, 5000, 10000]
     
     results = []
     
