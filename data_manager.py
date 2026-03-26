@@ -1,10 +1,7 @@
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
 import matplotlib.pyplot as plt
 import seaborn as sns
-from tqdm import tqdm
 
 class SpatialDataSimulator:
     def __init__(self, N=900, G=20, sigma=0.1, device="cpu"):

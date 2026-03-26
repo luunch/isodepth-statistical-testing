@@ -10,6 +10,44 @@ class IsoDepthNet(nn.Module):
     def forward(self, x):
         return self.decoder(self.encoder(x))
 
+
+class IsoDepthNetMulti(nn.Module):
+    """
+    Multi-isodepth variant with arbitrary bottleneck width K.
+    Input: spatial coordinates [N, 2]
+    Latent: multi-isodepth embedding [N, K]
+    Output: reconstructed gene expression [N, G]
+    """
+
+    def __init__(self, G, K=4, hidden=32, nonlinear_decoder=True):
+        super().__init__()
+        self.K = K
+        self.encoder = nn.Sequential(
+            nn.Linear(2, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, K),
+        )
+        if nonlinear_decoder:
+            self.decoder = nn.Sequential(
+                nn.Linear(K, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, hidden),
+                nn.ReLU(),
+                nn.Linear(hidden, G),
+            )
+        else:
+            self.decoder = nn.Linear(K, G)
+
+    def forward(self, x, return_latent=False):
+        z = self.encoder(x)
+        out = self.decoder(z)
+        if return_latent:
+            return out, z
+        return out
+
+
 class GastonMixNet(nn.Module):
     def __init__(self, G, P=2):
         super(GastonMixNet, self).__init__()
@@ -100,4 +138,34 @@ class ParallelIsoDepthNet(nn.Module):
         # x shape: [M, N, 2]
         isodepth = self.encoder(x)
         output = self.decoder(isodepth)
+        return output
+
+
+class ParallelIsoDepthNetMulti(nn.Module):
+    """
+    Parallel version of IsoDepthNetMulti with arbitrary bottleneck width K.
+    Input shape:  [M, N, 2]
+    Output shape: [M, N, G]
+    """
+
+    def __init__(self, M, G, K=4, hidden=32):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            ParallelLinear(M, 2, hidden),
+            nn.ReLU(),
+            ParallelLinear(M, hidden, hidden),
+            nn.ReLU(),
+            ParallelLinear(M, hidden, K),
+        )
+        self.decoder = nn.Sequential(
+            ParallelLinear(M, K, hidden),
+            nn.ReLU(),
+            ParallelLinear(M, hidden, hidden),
+            nn.ReLU(),
+            ParallelLinear(M, hidden, G),
+        )
+
+    def forward(self, x):
+        latent = self.encoder(x)
+        output = self.decoder(latent)
         return output

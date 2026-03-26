@@ -1,10 +1,9 @@
 import numpy as np
-import torch
 import matplotlib.pyplot as plt
 import pandas as pd
-from tqdm import tqdm
 from scipy.stats import kstest
 from data_manager import SpatialDataSimulator
+from isodepth import choose_device, ensure_results_dir
 
 # Import the three different test methods
 from gaston_mix_frozen_encoder import closed_form_permutation_test as gaston_mix_test
@@ -18,7 +17,7 @@ def run_comparison_qq(methods=['gaston_frozen', 'gaston_mix_frozen', 'full_retra
     Runs a Q-Q plot analysis for a specified subset of GASTON permutation test methods.
     Checks for p-value calibration under the null hypothesis (Gaussian Noise).
     """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = choose_device(prefer_mps=False)
     simulator = SpatialDataSimulator(N, G, device=device)
     
     print(f"--- PREPARING BASE DATA (Gaussian Noise) ---")
@@ -96,8 +95,7 @@ def run_comparison_qq(methods=['gaston_frozen', 'gaston_mix_frozen', 'full_retra
     plt.grid(True, which='both', linestyle='--', alpha=0.5)
 
     plt.tight_layout()
-    import os
-    os.makedirs("results", exist_ok=True)
+    ensure_results_dir("results")
     plt.savefig("results/comparison_qq_plot.png")
     print("\nSaved comparison Q-Q plot to 'results/comparison_qq_plot.png'")
     

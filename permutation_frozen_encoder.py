@@ -1,47 +1,32 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sns
 from data_manager import SpatialDataSimulator
+from isodepth import (
+    choose_device,
+    empirical_p_value,
+    ensure_results_dir,
+    gaussian_nll_from_mse,
+    reset_parameters,
+    set_global_seed,
+    train_with_early_stopping,
+)
 
 # 1. Setup
-#np.random.seed(0)
-#torch.manual_seed(0)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = choose_device(prefer_mps=False)
 
 # 2. Network Architecture
 from models import IsoDepthNet
 
 # 3. Specialized Training Functions
 def train_full_model(S, A, epochs=5000, patience=50):
-    torch.manual_seed(42)
+    set_global_seed(42)
     model = IsoDepthNet(A.shape[1]).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    criterion = nn.MSELoss()
     S_t, A_t = torch.tensor(S).to(device), torch.tensor(A).to(device)
-    
-    best_loss = float('inf')
-    patience_counter = 0
-    
-    for _ in range(epochs):
-        optimizer.zero_grad()
-        loss = criterion(model(S_t), A_t)
-        loss.backward()
-        optimizer.step()
-        
-        current_loss = loss.item()
-        if current_loss < best_loss - 1e-5:
-            best_loss = current_loss
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            
-        if patience_counter >= patience:
-            break
-            
+    train_with_early_stopping(model, S_t, A_t, epochs=epochs, lr=1e-3, patience=patience)
     return model
 
 def train_frozen_decoder(model, S, A, epochs=5000, patience=50):
@@ -50,37 +35,23 @@ def train_frozen_decoder(model, S, A, epochs=5000, patience=50):
         param.requires_grad = False
 
     # Reset decoder weights for fresh start on permuted data
-    for layer in model.decoder:
-        if hasattr(layer, 'reset_parameters'):
-            layer.reset_parameters()
-
-    optimizer = optim.Adam(model.decoder.parameters(), lr=1e-3)
+    reset_parameters(model.decoder)
     criterion = nn.MSELoss()
     S_t, A_t = torch.tensor(S).to(device), torch.tensor(A).to(device)
-
-    best_loss = float('inf')
-    patience_counter = 0
-
-    for _ in range(epochs):
-        optimizer.zero_grad()
-        loss = criterion(model(S_t), A_t)
-        loss.backward()
-        optimizer.step()
-        
-        current_loss = loss.item()
-        if current_loss < best_loss - 1e-5:
-            best_loss = current_loss
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            
-        if patience_counter >= patience:
-            break
+    train_with_early_stopping(
+        model,
+        S_t,
+        A_t,
+        epochs=epochs,
+        lr=1e-3,
+        patience=patience,
+        params=list(model.decoder.parameters()),
+    )
 
     with torch.no_grad():
         mse = criterion(model(S_t), A_t).item()
     n_total = A.shape[0] * A.shape[1]
-    nll = (n_total / 2) * np.log(2 * np.pi * mse + 1e-12) + (n_total / 2)
+    nll = gaussian_nll_from_mse(mse, n_total)
     return nll
 
 # 4. Specialized Permutation Test
@@ -91,7 +62,7 @@ def frozen_permutation_test(S, A, M=20):
     with torch.no_grad():
         mse = nn.MSELoss()(model(torch.tensor(S).to(device)), torch.tensor(A).to(device)).item()
     n_total = A.shape[0] * A.shape[1]
-    L_true = (n_total / 2) * np.log(2 * np.pi * mse + 1e-12) + (n_total / 2)
+    L_true = gaussian_nll_from_mse(mse, n_total)
 
     perm_losses = []
     print(f"Step 2: Running {M} permutations with GASTON encoder...")
@@ -102,7 +73,7 @@ def frozen_permutation_test(S, A, M=20):
         L_perm = train_frozen_decoder(model, S_perm, A)
         perm_losses.append(L_perm)
 
-    p_value = (1 + np.sum(np.array(perm_losses) <= L_true)) / (M + 1)
+    p_value = empirical_p_value(np.array(perm_losses), L_true)
     return p_value, L_true, np.array(perm_losses), model
 
 # 5. Visualization
@@ -122,13 +93,12 @@ def visualize_results(S, A, model, L_true, L_perm, title=""):
 
     ax2 = plt.subplot(1, 2, 2)
     sns.histplot(L_perm, ax=ax2, color="salmon", kde=False)
-    p_val = (1 + np.sum(L_perm <= L_true)) / (len(L_perm) + 1)
+    p_val = empirical_p_value(L_perm, L_true)
     ax2.axvline(L_true, color="red", linestyle="--", label=f"True NLL (p={p_val:.3f})")
     ax2.set_title("GASTON Permutation Results")
     ax2.legend()
     plt.tight_layout()
-    import os
-    os.makedirs("results", exist_ok=True)
+    ensure_results_dir("results")
     plt.savefig(f"results/gaston_{title.lower()}_results.png")
     plt.close()
 
@@ -146,8 +116,7 @@ def visualize_gene_data(S, A, gene_indices=range(10), title=""):
                 plt.colorbar(im, ax=ax, shrink=0.8)
     plt.suptitle(f"{title}: Spatial Expression of Genes 0-9")
     plt.tight_layout()
-    import os
-    os.makedirs("results", exist_ok=True)
+    ensure_results_dir("results")
     plt.savefig(f"results/gaston_{title.lower()}_genes.png")
     plt.close()
 

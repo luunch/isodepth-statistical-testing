@@ -1,51 +1,18 @@
-import os
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
 import matplotlib.pyplot as plt
 import seaborn as sns
-from tqdm import tqdm
 from data_manager import SpatialDataSimulator
 from models import IsoDepthNet
-
-def calculate_laplacian_smoothness(Z):
-    """
-    Calculates the Dirichlet energy (Laplacian smoothness) of a 2D grid.
-    Z: 2D numpy array of shape (gridsize, gridsize)
-    Returns: The sum of squared differences between adjacent pixels.
-    """
-    diff_x = Z[1:, :] - Z[:-1, :]
-    diff_y = Z[:, 1:] - Z[:, :-1]
-    energy = np.sum(diff_x**2) + np.sum(diff_y**2)
-    return energy
+from isodepth import choose_device, ensure_results_dir, laplacian_smoothness, train_with_early_stopping
 
 def train_and_get_isodepth(S, A, device, epochs=5000, patience=50):
     model = IsoDepthNet(A.shape[1]).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    criterion = nn.MSELoss()
     
     S_t = torch.tensor(S, dtype=torch.float32).to(device)
     A_t = torch.tensor(A, dtype=torch.float32).to(device)
     
-    best_loss = float('inf')
-    patience_counter = 0
-
-    for _ in range(epochs):
-        optimizer.zero_grad()
-        loss = criterion(model(S_t), A_t)
-        loss.backward()
-        optimizer.step()
-        
-        current_loss = loss.item()
-        if current_loss < best_loss - 1e-5:
-            best_loss = current_loss
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            
-        if patience_counter >= patience:
-            break
+    train_with_early_stopping(model, S_t, A_t, epochs=epochs, lr=1e-3, patience=patience)
         
     model.eval()
     with torch.no_grad():
@@ -60,7 +27,7 @@ def train_and_get_isodepth(S, A, device, epochs=5000, patience=50):
     return Z
 
 def run_smoothness_trials(n_trials=20, N=400, G=10, epochs=5000):
-    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
+    device = choose_device(prefer_mps=True)
     print(f"Using device: {device}")
     
     simulator = SpatialDataSimulator(N=N, G=G, device=device)
@@ -74,7 +41,7 @@ def run_smoothness_trials(n_trials=20, N=400, G=10, epochs=5000):
         for mode in modes:
             S, A = simulator.generate(mode=mode)
             Z = train_and_get_isodepth(S, A, device, epochs=epochs)
-            smoothness = calculate_laplacian_smoothness(Z)
+            smoothness = laplacian_smoothness(Z)
             results[mode].append(smoothness)
             print(f"  {mode.capitalize()} Smoothness: {smoothness:.4f}")
             
@@ -94,7 +61,7 @@ def run_smoothness_trials(n_trials=20, N=400, G=10, epochs=5000):
     plt.ylabel("Smoothness Score (Lower is Smoother)")
     plt.xlabel("Underlying Dataset Structure")
     
-    os.makedirs("results", exist_ok=True)
+    ensure_results_dir("results")
     save_path = "results/laplacian_smoothness_comparison.png"
     plt.tight_layout()
     plt.savefig(save_path)

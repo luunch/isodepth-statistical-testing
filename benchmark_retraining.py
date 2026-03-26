@@ -1,20 +1,14 @@
 import time
-import torch
-import numpy as np
 import pandas as pd
 from data_manager import SpatialDataSimulator
+from isodepth import choose_device
 
 # Import both methods
 from full_retraining_gaston import full_retraining_permutation_test as sequential_test
 from parallel_full_retraining import run_parallel_permutation_test as parallel_test
 
 def benchmark_retraining(M=20, N=400, G=10, epochs=5000, mode="both"):
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
+    device = choose_device(prefer_mps=True)
     print(f"--- BENCHMARKING RETRAINING METHODS (M={M}, N={N}, G={G}, Epochs={epochs}, Mode={mode}) ---")
 
     print(f"Running on: {device}")

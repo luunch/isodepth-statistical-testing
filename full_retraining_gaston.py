@@ -1,19 +1,20 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import seaborn as sns
 from data_manager import SpatialDataSimulator
+from isodepth import (
+    choose_device,
+    empirical_p_value,
+    ensure_results_dir,
+    gaussian_nll_from_mse,
+    train_with_early_stopping,
+)
 
 # 1. Setup
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-elif torch.backends.mps.is_available():
-    device = torch.device("mps")
-else:
-    device = torch.device("cpu")
+device = choose_device(prefer_mps=True)
 
 # 2. Network Architecture
 from models import IsoDepthNet
@@ -22,37 +23,18 @@ from models import IsoDepthNet
 def train_model(S, A, epochs=5000, lr=1e-3, patience=50):
     """Trains the full GASTON model (encoder + decoder) from scratch."""
     model = IsoDepthNet(A.shape[1]).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.MSELoss()
     
     S_t = torch.tensor(S, dtype=torch.float32).to(device)
     A_t = torch.tensor(A, dtype=torch.float32).to(device)
     
-    best_loss = float('inf')
-    patience_counter = 0
-    
-    for _ in range(epochs):
-        optimizer.zero_grad()
-        loss = criterion(model(S_t), A_t)
-        loss.backward()
-        optimizer.step()
-        
-        current_loss = loss.item()
-        if current_loss < best_loss - 1e-5:
-            best_loss = current_loss
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            
-        if patience_counter >= patience:
-            break
-            
+    train_with_early_stopping(model, S_t, A_t, epochs=epochs, lr=lr, patience=patience)
+
     with torch.no_grad():
         mse = criterion(model(S_t), A_t).item()
-        
-    # Calculate Negative Log-Likelihood (NLL) as the test statistic
+
     n_total = A.shape[0] * A.shape[1]
-    nll = (n_total / 2) * np.log(2 * np.pi * mse + 1e-12) + (n_total / 2)
+    nll = gaussian_nll_from_mse(mse, n_total)
     return nll, model
 
 # 4. Full Retraining Permutation Test
@@ -71,7 +53,7 @@ def full_retraining_permutation_test(S, A, M=20, epochs=5000):
         L_perm, _ = train_model(S_perm, A, epochs=epochs)
         perm_losses.append(L_perm)
         
-    p_value = (1 + np.sum(np.array(perm_losses) <= L_true)) / (M + 1)
+    p_value = empirical_p_value(np.array(perm_losses), L_true)
     return p_value, L_true, np.array(perm_losses), true_model
 
 # 5. Visualization
@@ -96,13 +78,12 @@ def visualize_results(S, A, model, L_true, L_perm, title=""):
     # 2. Visualize Null Distribution
     ax2 = plt.subplot(1, 2, 2)
     sns.histplot(L_perm, ax=ax2, color="skyblue", kde=True)
-    ax2.axvline(L_true, color="red", linestyle="--", label=f"True NLL (p={ (1 + np.sum(L_perm <= L_true)) / (len(L_perm) + 1):.3f})")
+    ax2.axvline(L_true, color="red", linestyle="--", label=f"True NLL (p={empirical_p_value(L_perm, L_true):.3f})")
     ax2.set_title("Null Distribution (Full Retraining)")
     ax2.legend()
     
     plt.tight_layout()
-    import os
-    os.makedirs("results", exist_ok=True)
+    ensure_results_dir("results")
     plt.savefig(f"results/full_retrain_{title.lower()}_results.png")
     plt.close()
 

@@ -1,20 +1,14 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import matplotlib.pyplot as plt
-import pandas as pd
 from tqdm import tqdm
 from scipy.stats import kstest
 from data_manager import SpatialDataSimulator
+from isodepth import choose_device, empirical_p_value, ensure_results_dir, gaussian_nll_from_mse
 
 # 1. Setup
-if torch.cuda.is_available():
-    device = torch.device("cuda")
-elif torch.backends.mps.is_available():
-    device = torch.device("mps")
-else:
-    device = torch.device("cpu")
+device = choose_device(prefer_mps=True)
 print(f"Using device: {device}")
 
 # 2. Parallel Linear Layer
@@ -49,7 +43,7 @@ def run_parallel_permutation_test(S, A, M=100, epochs=5000, lr=1e-3, patience=50
     # Use foreach=True for a significant speedup in optimizer updates
     # (Generally safe on CPU/CUDA, but can be problematic on MPS)
     use_foreach = (device.type != 'mps')
-    optimizer = optim.Adam(model.parameters(), lr=lr, foreach=use_foreach)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, foreach=use_foreach)
     criterion = nn.MSELoss(reduction='none') # Don't reduce so we can get loss per model
     
     best_loss = float('inf')
@@ -83,12 +77,12 @@ def run_parallel_permutation_test(S, A, M=100, epochs=5000, lr=1e-3, patience=50
         
     # Calculate NLL (Negative Log-Likelihood) for each model
     n_total = N * G
-    nll = (n_total / 2) * np.log(2 * np.pi * final_mse + 1e-12) + (n_total / 2)
+    nll = gaussian_nll_from_mse(final_mse, n_total)
     
     L_true = nll[0]
     L_perm = nll[1:]
     
-    p_value = (1 + np.sum(L_perm <= L_true)) / M
+    p_value = empirical_p_value(L_perm, L_true)
     return p_value, L_true, L_perm, model
 
 # 5. Q-Q Plot Analysis
@@ -129,8 +123,7 @@ def run_parallel_qq_analysis(n_trials=20, n_perms=100, N=400, G=10):
     plt.grid(True)
     
     plt.tight_layout()
-    import os
-    os.makedirs("results", exist_ok=True)
+    ensure_results_dir("results")
     plt.savefig("results/parallel_qq_plot.png")
     print(f"\nAnalysis complete. Plot saved to 'results/parallel_qq_plot.png'")
     print(f"Final Calibration Summary:")

@@ -1,44 +1,28 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
 from tqdm import tqdm
 from data_manager import SpatialDataSimulator
+from isodepth import choose_device, empirical_p_value, ensure_results_dir, set_global_seed, train_with_early_stopping
 
 # 1. Setup
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = choose_device(prefer_mps=False)
 
 # 2. Network Architecture: GASTON-MIX
 from models import GastonMixNet
 
 # 3. Phase 2: Train the Deep Learning Mapmaker
 def train_full_model(S, A, P=3, epochs=10000, patience=100):
-    torch.manual_seed(42)
+    set_global_seed(42)
     model = GastonMixNet(A.shape[1], P=P).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=1e-3)
-    criterion = nn.MSELoss()
-    
     S_t, A_t = torch.tensor(S).to(device), torch.tensor(A).to(device)
-    
-    best_loss = float('inf')
-    patience_counter = 0
-    
-    for _ in range(epochs):
-        optimizer.zero_grad()
-        output, _, _ = model(S_t)
-        loss = criterion(output, A_t)
-        loss.backward()
-        optimizer.step()
-        
-        current_loss = loss.item()
-        if current_loss < best_loss - 1e-5:
-            best_loss = current_loss
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            
-        if patience_counter >= patience:
-            break
+    criterion = nn.MSELoss()
+
+    def _mix_loss(inner_model, inner_s, inner_a):
+        output, _, _ = inner_model(inner_s)
+        return criterion(output, inner_a)
+
+    train_with_early_stopping(model, S_t, A_t, epochs=epochs, lr=1e-3, patience=patience, loss_fn=_mix_loss)
             
     return model
 
@@ -98,7 +82,7 @@ def closed_form_permutation_test(S, A, P=3, M=1000):
         L_perm = torch.sum(residuals_perm ** 2).item()
         perm_losses[m] = L_perm
         
-    p_value = (1 + np.sum(perm_losses <= L_true)) / (M + 1)
+    p_value = empirical_p_value(perm_losses, L_true)
     return p_value, L_true, perm_losses, model
 
 # 5. Execution
@@ -113,8 +97,7 @@ if __name__ == "__main__":
         
         S, A = simulator.generate(mode=mode)
         
-        import os
-        os.makedirs("results", exist_ok=True)
+        ensure_results_dir("results")
         # Visualize Input Data
         simulator.visualize_genes(S, A, title=f"{control} Control", save_path=f"results/gaston_mix_{control.lower()}_genes.png")
 
