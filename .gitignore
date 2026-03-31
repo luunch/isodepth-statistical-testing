@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.env/
+.venv/
+
+# Data (DO NOT COMMIT)
+data/h5ad
+*.h5ad
+
+# Results / outputs
+results/
+*.log
+*.out
+
+# Misc
+.DS_Store
+.vscode/
+old/

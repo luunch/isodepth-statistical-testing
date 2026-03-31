@@ -1,0 +1,29 @@
+{
+  "data": {
+    "source": "synthetic",
+    "mode": "noise",
+    "n_cells": 900,
+    "n_genes": 20,
+    "sigma": 0.1,
+    "seed": 42
+  },
+  "test": {
+    "method": "parallel_permutation",
+    "metric": "nll_gaussian_mse",
+    "n_perms": 50,
+    "epochs": 500,
+    "lr": 0.001,
+    "patience": 50,
+    "seed": 42,
+    "device": "cuda",
+    "batch_size": null,
+    "n_experts": 1,
+    "verbose": true
+  },
+  "output": {
+    "out_dir": "results",
+    "run_name": "radial_existence",
+    "save_preds": false,
+    "save_perm_stats": true
+  }
+}
