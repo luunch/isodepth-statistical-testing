@@ -13,13 +13,22 @@ CANONICAL_METRICS = {
     "spearman_corr_mean",
 }
 
+SUPPORTED_SYNTHETIC_MODES = {
+    "checkerboard",
+    "fourier",
+    "noise",
+    "radial",
+}
+
 SUPPORTED_PERMUTATION_METHODS = {
     "parallel_permutation",
     "full_retraining",
     "frozen_encoder",
     "gaston_mix_closed_form",
-    "perturbation_robustness",
-    "subset_selection_robustness",
+    "comparison_perturbation_test",
+    "perturbation_test",
+    "comparison_subsampling_test",
+    "subsampling_test",
 }
 
 
@@ -68,6 +77,7 @@ class DataConfig:
     use_raw: bool = False
     min_cells_per_gene: int = 0
     standardize: bool = True
+    q: Optional[int] = None
     max_cells: Optional[int] = None
     seed: int = 0
     source: str = "h5ad"
@@ -75,6 +85,11 @@ class DataConfig:
     n_cells: int = 900
     n_genes: int = 20
     sigma: float = 0.1
+    k: Optional[int] = None
+    k_min: Optional[int] = None
+    k_max: Optional[int] = None
+    dependent_xy: bool = True
+    poly_degree: int = 3
 
     def validate(self) -> "DataConfig":
         if self.source not in {"h5ad", "synthetic"}:
@@ -83,10 +98,54 @@ class DataConfig:
             raise ValueError("data.h5ad is required when data.source='h5ad'")
         if self.min_cells_per_gene < 0:
             raise ValueError("data.min_cells_per_gene must be >= 0")
+        if self.q is not None and self.q <= 0:
+            raise ValueError("data.q must be > 0 when provided")
+        if self.source == "synthetic" and self.q is not None:
+            raise ValueError("data.q is only supported when data.source='h5ad'")
+        if self.k is not None and self.k <= 0:
+            raise ValueError("data.k must be > 0 when provided")
+        if self.k_min is not None and self.k_min <= 0:
+            raise ValueError("data.k_min must be > 0 when provided")
+        if self.k_max is not None and self.k_max <= 0:
+            raise ValueError("data.k_max must be > 0 when provided")
+        if self.poly_degree < 0:
+            raise ValueError("data.poly_degree must be >= 0")
+        if self.source != "synthetic" and self.k is not None:
+            raise ValueError("data.k is only supported when data.source='synthetic'")
+        if self.source != "synthetic" and self.k_min is not None:
+            raise ValueError("data.k_min is only supported when data.source='synthetic'")
+        if self.source != "synthetic" and self.k_max is not None:
+            raise ValueError("data.k_max is only supported when data.source='synthetic'")
+        if self.source != "synthetic" and self.dependent_xy is not True:
+            raise ValueError("data.dependent_xy is only supported when data.source='synthetic'")
+        if self.source != "synthetic" and self.poly_degree != 3:
+            raise ValueError("data.poly_degree is only supported when data.source='synthetic'")
         if self.max_cells is not None and self.max_cells <= 0:
             raise ValueError("data.max_cells must be > 0 when provided")
         if self.n_cells <= 0 or self.n_genes <= 0:
             raise ValueError("Synthetic data requires positive n_cells and n_genes")
+        if self.source == "synthetic":
+            if self.mode not in SUPPORTED_SYNTHETIC_MODES:
+                raise ValueError(
+                    f"Unsupported synthetic data mode '{self.mode}'. Expected one of {sorted(SUPPORTED_SYNTHETIC_MODES)}"
+                )
+            if self.mode == "fourier":
+                if self.k is not None:
+                    if self.k_min is not None or self.k_max is not None:
+                        raise ValueError("data.k cannot be combined with data.k_min or data.k_max")
+                    self.k_min = 1
+                    self.k_max = int(self.k)
+                if self.k_min is None or self.k_max is None:
+                    raise ValueError(
+                        "data.k_min and data.k_max are required when data.source='synthetic' and data.mode='fourier'"
+                    )
+                if self.k_min > self.k_max:
+                    raise ValueError("data.k_min must be <= data.k_max")
+            else:
+                if self.k is not None or self.k_min is not None or self.k_max is not None:
+                    raise ValueError("data.k, data.k_min, and data.k_max are only supported when data.mode='fourier'")
+                if self.dependent_xy is not True:
+                    raise ValueError("data.dependent_xy is only supported when data.mode='fourier'")
         return self
 
 
@@ -102,8 +161,8 @@ class TestConfig:
     seed: int = 0
     device: str = "auto"
     batch_size: Optional[int] = None
-    n_experts: int = 2
-    delta: float = 0.05
+    n_experts: int = 1
+    delta: list[float] = field(default_factory=lambda: [0.05])
     perturb_target: str = "coordinates"
     subset_fractions: list[float] = field(default_factory=lambda: [0.5, 0.7, 0.9])
     n_subsets: int = 10
@@ -130,8 +189,11 @@ class TestConfig:
             raise ValueError("test.batch_size must be > 0 when provided")
         if self.n_experts <= 0:
             raise ValueError("test.n_experts must be > 0")
-        if self.delta <= 0:
-            raise ValueError("test.delta must be > 0")
+        self.delta = [float(value) for value in self.delta]
+        if not self.delta:
+            raise ValueError("test.delta must contain at least one value")
+        if any(delta <= 0.0 for delta in self.delta):
+            raise ValueError("test.delta entries must be > 0")
         if self.perturb_target != "coordinates":
             raise ValueError("test.perturb_target currently only supports 'coordinates'")
         if self.n_subsets <= 0:
@@ -148,16 +210,32 @@ class TestConfig:
             "full_retraining",
             "frozen_encoder",
             "gaston_mix_closed_form",
-            "perturbation_robustness",
+            "comparison_perturbation_test",
+            "perturbation_test",
+            "subsampling_test",
         } and self.n_perms <= 0:
             raise ValueError("test.n_perms must be > 0")
 
-        if self.method == "subset_selection_robustness" and self.metric not in {
+        if self.method == "comparison_subsampling_test" and self.metric not in {
             "nll_gaussian_mse",
             "mse",
         }:
             raise ValueError(
-                "test.metric for subset_selection_robustness must be one of ['mse', 'nll_gaussian_mse']"
+                "test.metric for comparison_subsampling_test must be one of ['mse', 'nll_gaussian_mse']"
+            )
+        if self.method == "perturbation_test" and self.metric not in {
+            "nll_gaussian_mse",
+            "mse",
+        }:
+            raise ValueError(
+                "test.metric for perturbation_test must be one of ['mse', 'nll_gaussian_mse']"
+            )
+        if self.method == "subsampling_test" and self.metric not in {
+            "nll_gaussian_mse",
+            "mse",
+        }:
+            raise ValueError(
+                "test.metric for subsampling_test must be one of ['mse', 'nll_gaussian_mse']"
             )
         return self
 
@@ -258,6 +336,7 @@ __all__ = [
     "DatasetBundle",
     "OutputConfig",
     "RunConfig",
+    "SUPPORTED_SYNTHETIC_MODES",
     "SUPPORTED_PERMUTATION_METHODS",
     "TestConfig",
     "TestResult",

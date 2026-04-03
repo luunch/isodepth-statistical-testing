@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -13,6 +15,8 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from data.schemas import DatasetBundle, TestConfig
+from experiments.configuration import save_standardized_outputs
+from data.schemas import DataConfig, OutputConfig, RunConfig
 
 
 HAS_TORCH = importlib.util.find_spec("torch") is not None
@@ -21,7 +25,8 @@ if HAS_TORCH:
     from methods.perturbation import (
         normalize_depth,
         perturb_coordinates,
-        run_perturbation_robustness_method,
+        run_comparison_perturbation_test,
+        run_perturbation_test,
         score_depth_similarity,
     )
     from methods.trainers import train_parallel_isodepth_model
@@ -74,7 +79,7 @@ class TestPerturbationHelpers(unittest.TestCase):
             axis=0,
         )
         config = TestConfig(
-            method="perturbation_robustness",
+            method="comparison_perturbation_test",
             metric="mse",
             n_perms=2,
             n_nulls=2,
@@ -83,7 +88,7 @@ class TestPerturbationHelpers(unittest.TestCase):
             lr=1e-2,
             seed=1,
             device="cpu",
-            delta=0.1,
+            delta=[0.1],
             verbose=False,
         ).validate()
         _, predictions = train_parallel_isodepth_model(
@@ -113,7 +118,7 @@ class TestPerturbationHelpers(unittest.TestCase):
             axis=0,
         ).astype(np.float32)
         config = TestConfig(
-            method="perturbation_robustness",
+            method="comparison_perturbation_test",
             metric="mse",
             n_perms=1,
             n_nulls=2,
@@ -122,7 +127,7 @@ class TestPerturbationHelpers(unittest.TestCase):
             lr=1e-2,
             seed=1,
             device="cpu",
-            delta=0.1,
+            delta=[0.1],
             verbose=False,
         ).validate()
         _, predictions = train_parallel_isodepth_model(
@@ -139,6 +144,81 @@ class TestPerturbationHelpers(unittest.TestCase):
 
 @unittest.skipUnless(HAS_TORCH, "torch is required for perturbation method tests")
 class TestPerturbationMethodIntegration(unittest.TestCase):
+    def test_perturbation_runs_and_returns_expected_artifacts(self) -> None:
+        s = np.asarray(
+            [
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 1.0],
+                [0.5, 0.25],
+                [0.25, 0.5],
+            ],
+            dtype=np.float32,
+        )
+        depth = s[:, 0] + s[:, 1]
+        a = np.stack([depth, depth**2], axis=1).astype(np.float32)
+        dataset = DatasetBundle(S=s, A=a).validate()
+        config = TestConfig(
+            method="perturbation_test",
+            metric="mse",
+            n_perms=5,
+            n_nulls=3,
+            batch_size=2,
+            epochs=2,
+            patience=2,
+            lr=1e-2,
+            seed=3,
+            device="cpu",
+            delta=[0.05, 0.1],
+            verbose=False,
+        ).validate()
+
+        result = run_perturbation_test(dataset, config)
+
+        self.assertEqual(result.method_name, "perturbation_test")
+        self.assertEqual(result.stat_perm.shape, (5,))
+        self.assertIn("delta_summaries", result.artifacts)
+        self.assertIn("primary_delta", result.artifacts)
+        self.assertIn("observed_scores", result.artifacts)
+        self.assertEqual(len(result.artifacts["observed_scores"]), 10)
+        self.assertEqual(len(result.artifacts["delta_plot_rows"]), 2)
+        for summary in result.artifacts["delta_summaries"].values():
+            self.assertEqual(len(summary["null_distribution"]), 5)
+            self.assertEqual(summary["observed_distribution"], [float(result.stat_true)])
+
+        primary_key = f"{float(result.artifacts['primary_delta']):.6g}"
+        primary_summary = result.artifacts["delta_summaries"][primary_key]
+        np.testing.assert_allclose(result.stat_perm, np.asarray(primary_summary["null_distribution"], dtype=np.float64))
+        self.assertAlmostEqual(float(result.stat_true), float(primary_summary["score_mean"]))
+        self.assertAlmostEqual(float(result.p_value), float(primary_summary["p_value"]))
+
+    def test_perturbation_repeated_runs_with_same_seed_match(self) -> None:
+        s = np.asarray(
+            [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+            dtype=np.float32,
+        )
+        depth = s[:, 0] + s[:, 1]
+        a = np.stack([depth, depth**2], axis=1).astype(np.float32)
+        dataset = DatasetBundle(S=s, A=a).validate()
+        config = TestConfig(
+            method="perturbation_test",
+            metric="mse",
+            n_perms=3,
+            epochs=2,
+            patience=2,
+            lr=1e-2,
+            seed=5,
+            device="cpu",
+            delta=[0.05],
+            verbose=False,
+        ).validate()
+
+        result_a = run_perturbation_test(dataset, config)
+        result_b = run_perturbation_test(dataset, config)
+        np.testing.assert_allclose(result_a.stat_perm, result_b.stat_perm)
+        np.testing.assert_allclose(result_a.artifacts["observed_scores"], result_b.artifacts["observed_scores"])
+
     def test_runs_and_returns_expected_artifacts(self) -> None:
         s = np.asarray(
             [
@@ -155,7 +235,7 @@ class TestPerturbationMethodIntegration(unittest.TestCase):
         a = np.stack([depth, depth**2], axis=1).astype(np.float32)
         dataset = DatasetBundle(S=s, A=a).validate()
         config = TestConfig(
-            method="perturbation_robustness",
+            method="comparison_perturbation_test",
             metric="mse",
             n_perms=5,
             n_nulls=3,
@@ -165,23 +245,135 @@ class TestPerturbationMethodIntegration(unittest.TestCase):
             lr=1e-2,
             seed=3,
             device="cpu",
-            delta=0.05,
+            delta=[0.05, 0.1],
             verbose=False,
         ).validate()
 
-        result = run_perturbation_robustness_method(dataset, config)
+        result = run_comparison_perturbation_test(dataset, config)
 
-        self.assertEqual(result.method_name, "perturbation_robustness")
+        self.assertEqual(result.method_name, "comparison_perturbation_test")
         self.assertEqual(result.stat_perm.shape, (3,))
         self.assertGreaterEqual(float(result.stat_true), 0.0)
         self.assertIn("observed_scores", result.artifacts)
-        self.assertEqual(len(result.artifacts["observed_scores"]), 5)
+        self.assertEqual(len(result.artifacts["observed_scores"]), 10)
         self.assertIn("perturbed_S", result.artifacts)
         self.assertIn("perturbed_isodepth", result.artifacts)
         self.assertIn("lowest_S", result.artifacts)
         self.assertIn("highest_S", result.artifacts)
+        self.assertIn("delta_summaries", result.artifacts)
+        self.assertIn("primary_delta", result.artifacts)
+        self.assertIn("delta_plot_rows", result.artifacts)
+        self.assertEqual(len(result.artifacts["delta_plot_rows"]), 2)
         self.assertEqual(result.artifacts["perturbed_S"].shape, s.shape)
         self.assertEqual(result.artifacts["perturbed_isodepth"].shape[0], s.shape[0])
+        primary_key = f"{float(result.artifacts['primary_delta']):.6g}"
+        primary_summary = result.artifacts["delta_summaries"][primary_key]
+        np.testing.assert_allclose(result.stat_perm, np.asarray(primary_summary["null_distribution"], dtype=np.float64))
+        self.assertAlmostEqual(float(result.stat_true), float(primary_summary["score_mean"]))
+        self.assertAlmostEqual(float(result.p_value), float(primary_summary["p_value"]))
+        for summary in result.artifacts["delta_summaries"].values():
+            self.assertIn("p_value", summary)
+            self.assertIn("null_distribution", summary)
+
+    def test_standardized_outputs_include_delta_plot(self) -> None:
+        s = np.asarray(
+            [
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 1.0],
+                [0.5, 0.25],
+                [0.25, 0.5],
+            ],
+            dtype=np.float32,
+        )
+        depth = s[:, 0] + s[:, 1]
+        a = np.stack([depth, depth**2], axis=1).astype(np.float32)
+        dataset = DatasetBundle(S=s, A=a).validate()
+        config = TestConfig(
+            method="comparison_perturbation_test",
+            metric="mse",
+            n_perms=3,
+            n_nulls=2,
+            batch_size=2,
+            epochs=2,
+            patience=2,
+            lr=1e-2,
+            seed=3,
+            device="cpu",
+            delta=[0.05, 0.1],
+            verbose=False,
+        ).validate()
+        result = run_comparison_perturbation_test(dataset, config)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_config = RunConfig(
+                data=DataConfig(source="synthetic", n_cells=6, n_genes=2),
+                test=config,
+                output=OutputConfig(out_dir=tmpdir, run_name="comparison_perturbation_test"),
+            ).validate()
+
+            payload, result_path = save_standardized_outputs(dataset, result, run_config)
+
+            self.assertTrue(result_path.exists())
+            self.assertTrue((result_path.parent / "comparison_perturbation_test_dataset.png").exists())
+            self.assertTrue((result_path.parent / "comparison_perturbation_test_isodepth.png").exists())
+            self.assertTrue((result_path.parent / "comparison_perturbation_test_delta_pvalues.png").exists())
+            self.assertTrue((result_path.parent / "delta_0.05_perm_stats.npy").exists())
+            self.assertTrue((result_path.parent / "delta_0.1_perm_stats.npy").exists())
+            self.assertEqual(payload["method_name"], "comparison_perturbation_test")
+
+            with open(result_path, "r", encoding="utf-8") as handle:
+                saved_payload = json.load(handle)
+            self.assertIn("delta_summaries", saved_payload["artifacts"])
+
+    def test_perturbation_standardized_outputs_include_delta_plot(self) -> None:
+        s = np.asarray(
+            [
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 1.0],
+                [0.5, 0.25],
+                [0.25, 0.5],
+            ],
+            dtype=np.float32,
+        )
+        depth = s[:, 0] + s[:, 1]
+        a = np.stack([depth, depth**2], axis=1).astype(np.float32)
+        dataset = DatasetBundle(S=s, A=a).validate()
+        config = TestConfig(
+            method="perturbation_test",
+            metric="mse",
+            n_perms=3,
+            n_nulls=2,
+            batch_size=2,
+            epochs=2,
+            patience=2,
+            lr=1e-2,
+            seed=3,
+            device="cpu",
+            delta=[0.05, 0.1],
+            verbose=False,
+        ).validate()
+        result = run_perturbation_test(dataset, config)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_config = RunConfig(
+                data=DataConfig(source="synthetic", n_cells=6, n_genes=2),
+                test=config,
+                output=OutputConfig(out_dir=tmpdir, run_name="perturbation_test"),
+            ).validate()
+
+            payload, result_path = save_standardized_outputs(dataset, result, run_config)
+
+            self.assertTrue(result_path.exists())
+            self.assertTrue((result_path.parent / "perturbation_test_dataset.png").exists())
+            self.assertTrue((result_path.parent / "perturbation_test_isodepth.png").exists())
+            self.assertTrue((result_path.parent / "perturbation_test_delta_pvalues.png").exists())
+            self.assertTrue((result_path.parent / "delta_0.05_perm_stats.npy").exists())
+            self.assertTrue((result_path.parent / "delta_0.1_perm_stats.npy").exists())
+            self.assertEqual(payload["method_name"], "perturbation_test")
 
 
 if __name__ == "__main__":

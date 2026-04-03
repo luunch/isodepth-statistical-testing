@@ -231,6 +231,47 @@ def _prepare_loss_mask(
     return torch.tensor(loss_mask_np, dtype=torch.float32, device=device)
 
 
+def _snapshot_parallel_model_state(model: nn.Module, n_models: int) -> dict[str, torch.Tensor]:
+    state: dict[str, torch.Tensor] = {}
+    for name, tensor in model.state_dict().items():
+        detached = tensor.detach().cpu().clone()
+        if detached.ndim > 0 and detached.shape[0] == n_models:
+            state[name] = detached
+    return state
+
+
+def _update_parallel_model_snapshot(
+    snapshot: dict[str, torch.Tensor],
+    model: nn.Module,
+    improved_mask: np.ndarray,
+    n_models: int,
+) -> None:
+    if not np.any(improved_mask):
+        return
+
+    improved_indices = np.flatnonzero(improved_mask)
+    for name, tensor in model.state_dict().items():
+        detached = tensor.detach().cpu()
+        if detached.ndim == 0 or detached.shape[0] != n_models:
+            continue
+        snapshot[name][improved_indices] = detached[improved_indices]
+
+
+def _restore_parallel_model_snapshot(
+    model: nn.Module,
+    snapshot: dict[str, torch.Tensor],
+    device: torch.device,
+) -> None:
+    current_state = model.state_dict()
+    restored_state = {}
+    for name, tensor in current_state.items():
+        if name in snapshot:
+            restored_state[name] = snapshot[name].to(device=device)
+        else:
+            restored_state[name] = tensor
+    model.load_state_dict(restored_state)
+
+
 def train_batched_isodepth_model(
     s_batched: np.ndarray,
     A: np.ndarray,
@@ -283,8 +324,10 @@ def train_batched_isodepth_model(
     optimizer = optim.Adam(model.parameters(), lr=config.lr, foreach=False)
     criterion = nn.MSELoss(reduction="none")
 
-    best_loss = float("inf")
-    patience_counter = 0
+    best_loss_per_model = np.full(n_models, np.inf, dtype=np.float64)
+    patience_counter_per_model = np.zeros(n_models, dtype=np.int64)
+    active_mask_np = np.ones(n_models, dtype=bool)
+    best_state = _snapshot_parallel_model_state(model, n_models)
     iterator = tqdm(range(config.epochs), disable=not config.verbose)
     for epoch in iterator:
         optimizer.zero_grad()
@@ -296,25 +339,32 @@ def train_batched_isodepth_model(
             loss_per_model = loss.sum(dim=(1, 2)) / active_counts
         else:
             loss_per_model = loss.mean(dim=(1, 2))
-        total_loss = loss_per_model.sum()
+        active_mask_t = torch.tensor(active_mask_np, dtype=loss_per_model.dtype, device=device)
+        active_count = float(active_mask_np.sum())
+        total_loss = (loss_per_model * active_mask_t).sum() / max(active_count, 1.0)
         total_loss.backward()
         optimizer.step()
 
-        current_loss = float(total_loss.item())
-        if current_loss < best_loss - 1e-5:
-            best_loss = current_loss
-            patience_counter = 0
-        else:
-            patience_counter += 1
+        loss_values = loss_per_model.detach().cpu().numpy().astype(np.float64)
+        improved_mask = active_mask_np & (loss_values < (best_loss_per_model - 1e-5))
+        if np.any(improved_mask):
+            best_loss_per_model[improved_mask] = loss_values[improved_mask]
+            patience_counter_per_model[improved_mask] = 0
+            _update_parallel_model_snapshot(best_state, model, improved_mask, n_models)
 
-        if patience_counter >= config.patience:
+        stalled_mask = active_mask_np & ~improved_mask
+        patience_counter_per_model[stalled_mask] += 1
+        active_mask_np = patience_counter_per_model < config.patience
+
+        if not np.any(active_mask_np):
             if config.verbose:
                 print(
                     f"[early-stop] {model_label} stopped at epoch {epoch + 1} "
-                    f"(best_loss={best_loss:.6g}, patience={config.patience})"
+                    f"(all {n_models} batched models exhausted patience={config.patience})"
                 )
             break
 
+    _restore_parallel_model_snapshot(model, best_state, device)
     with torch.no_grad():
         predictions = model(s_batched_t).detach().cpu().numpy()
 

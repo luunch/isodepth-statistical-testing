@@ -86,6 +86,7 @@ def load_h5ad_dataset(
     use_raw: bool = False,
     min_cells_per_gene: int = 0,
     standardize: bool = True,
+    q: Optional[int] = None,
     max_cells: Optional[int] = None,
     seed: int = 0,
 ) -> DatasetBundle:
@@ -109,11 +110,21 @@ def load_h5ad_dataset(
         s = s[idx]
         a = a[idx]
 
-    a = apply_expression_transforms(
+    a, transform_meta = apply_expression_transforms(
         a,
         min_cells_per_gene=min_cells_per_gene,
         standardize=standardize,
+        q=q,
+        seed=seed,
+        return_metadata=True,
     )
+
+    raw_var_names = np.asarray(adata.var_names, dtype=object)
+    keep_mask = np.asarray(transform_meta["gene_keep_mask"], dtype=bool)
+    if "feature_names" in transform_meta:
+        feature_names = [str(name) for name in transform_meta["feature_names"]]
+    else:
+        feature_names = [str(name) for name in raw_var_names[keep_mask]]
 
     meta = {
         "source": "h5ad",
@@ -125,9 +136,11 @@ def load_h5ad_dataset(
         "use_raw": use_raw,
         "min_cells_per_gene": int(min_cells_per_gene),
         "standardize": bool(standardize),
+        "q": None if q is None else int(q),
         "max_cells": None if max_cells is None else int(max_cells),
         "seed": int(seed),
-        "var_names": list(map(str, adata.var_names[: a.shape[1]])),
+        "feature_space": str(transform_meta["representation"]),
+        "var_names": feature_names,
     }
     return DatasetBundle(S=s, A=a, meta=meta).validate()
 
@@ -150,6 +163,7 @@ def load_dataset_from_config(config: DataConfig) -> DatasetBundle:
         use_raw=config.use_raw,
         min_cells_per_gene=config.min_cells_per_gene,
         standardize=config.standardize,
+        q=config.q,
         max_cells=config.max_cells,
         seed=config.seed,
     )

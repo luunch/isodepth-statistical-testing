@@ -9,21 +9,22 @@
     "seed": 42
   },
   "test": {
-    "method": "parallel_permutation",
+    "method": "comparison_subsampling_test",
     "metric": "nll_gaussian_mse",
-    "n_perms": 50,
+    "n_nulls": 50,
     "epochs": 500,
     "lr": 0.001,
     "patience": 50,
     "seed": 42,
     "device": "cuda",
     "batch_size": null,
-    "n_experts": 1,
+    "subset_fractions": [0.1, 0.3, 0.7, 0.9],
+    "n_subsets": 10,
     "verbose": true
   },
   "output": {
     "out_dir": "results",
-    "run_name": "noise_existence",
+    "run_name": "noise_comparison_subsampling",
     "save_preds": false,
     "save_perm_stats": true
   }

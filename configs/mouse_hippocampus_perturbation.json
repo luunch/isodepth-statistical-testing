@@ -9,14 +9,14 @@
     "use_raw": false,
     "min_cells_per_gene": 1,
     "standardize": true,
+    "q": 10,
     "max_cells": null,
-    "seed": 42
+    "seed": 0
   },
   "test": {
-    "method": "perturbation_robustness",
+    "method": "perturbation_test",
     "metric": "nll_gaussian_mse",
-    "n_perms": 200,
-    "n_nulls": 50,
+    "n_perms": 100,
     "epochs": 5000,
     "lr": 0.001,
     "patience": 50,
@@ -24,7 +24,7 @@
     "device": "cuda",
     "batch_size": null,
     "n_experts": 1,
-    "delta": 0.05,
+    "delta": [0.01],
     "perturb_target": "coordinates",
     "verbose": true
   },

@@ -11,19 +11,34 @@ from data.schemas import DataConfig, DatasetBundle
 
 
 class SpatialDataSimulator:
-    def __init__(self, N: int = 900, G: int = 20, sigma: float = 0.1, device: str = "cpu"):
+    def __init__(
+        self,
+        N: int = 900,
+        G: int = 20,
+        sigma: float = 0.1,
+        device: str = "cpu",
+        poly_degree: int = 3,
+    ):
         self.N_requested = N
         self.gridsize = int(np.sqrt(N))
         self.N = self.gridsize**2
         self.G = G
         self.sigma = sigma
         self.device = device
+        self.poly_degree = poly_degree
 
         coords = np.linspace(0, 1, self.gridsize)
         x, y = np.meshgrid(coords, coords)
         self.S = np.stack([x.ravel(), y.ravel()], axis=1).astype(np.float32)
 
-    def generate(self, mode: str = "radial", seed: Optional[int] = None) -> tuple[np.ndarray, np.ndarray]:
+    def generate(
+        self,
+        mode: str = "radial",
+        seed: Optional[int] = None,
+        k_min: Optional[int] = None,
+        k_max: Optional[int] = None,
+        dependent_xy: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray]:
         if seed is not None:
             np.random.seed(seed)
 
@@ -40,16 +55,51 @@ class SpatialDataSimulator:
                 d[i] = xi if (row + col) % 2 == 0 else yi
             H = self._apply_expression_manifold(d)
             A = H + self.sigma * np.random.randn(self.N, self.G)
-        else:
+        elif mode == "fourier":
+            if k_min is None or k_max is None:
+                raise ValueError("k_min and k_max must be provided when mode='fourier'")
+            d = self._generate_fourier_latent(k_min, k_max, dependent_xy=dependent_xy)
+            H = self._apply_expression_manifold(d)
+            A = H + self.sigma * np.random.randn(self.N, self.G)
+        elif mode == "noise":
             A = np.random.randn(self.N, self.G)
+        else:
+            raise ValueError(f"Unsupported synthetic data mode '{mode}'")
 
         A = (A - A.mean(axis=0)) / (A.std(axis=0) + 1e-8)
         return self.S, A.astype(np.float32)
 
+    def _generate_fourier_latent(self, k_min: int, k_max: int, *, dependent_xy: bool = True) -> np.ndarray:
+        x = self.S[:, 0]
+        y = self.S[:, 1]
+        d_raw = np.zeros(self.N, dtype=np.float64)
+
+        if dependent_xy:
+            for k1 in range(k_min, k_max + 1):
+                for k2 in range(k_min, k_max + 1):
+                    coeffs = np.random.randn(2)
+                    angle = 2.0 * np.pi * (k1 * x + k2 * y)
+                    d_raw += coeffs[0] * np.cos(angle)
+                    d_raw += coeffs[1] * np.sin(angle)
+        else:
+            for frequency in range(k_min, k_max + 1):
+                coeffs = np.random.randn(4)
+                angle = 2.0 * np.pi * frequency
+                d_raw += coeffs[0] * np.sin(angle * x)
+                d_raw += coeffs[1] * np.cos(angle * x)
+                d_raw += coeffs[2] * np.sin(angle * y)
+                d_raw += coeffs[3] * np.cos(angle * y)
+
+        d_min = float(d_raw.min())
+        d_max = float(d_raw.max())
+        if d_max - d_min <= 1e-12:
+            return np.zeros(self.N, dtype=np.float64)
+        return (d_raw - d_min) / (d_max - d_min)
+
     def _apply_expression_manifold(self, d: np.ndarray) -> np.ndarray:
         H = np.zeros((self.N, self.G))
         for g in range(self.G):
-            coeffs = np.random.randn(4)
+            coeffs = np.random.randn(self.poly_degree + 1)
             H[:, g] = np.polyval(coeffs, d)
         return H
 
@@ -129,15 +179,28 @@ def generate_synthetic_dataset(config: DataConfig) -> DatasetBundle:
         G=config.n_genes,
         sigma=config.sigma,
         device="cpu",
+        poly_degree=config.poly_degree,
     )
-    s, a = simulator.generate(mode=config.mode, seed=config.seed)
+    s, a = simulator.generate(
+        mode=config.mode,
+        seed=config.seed,
+        k_min=config.k_min,
+        k_max=config.k_max,
+        dependent_xy=config.dependent_xy,
+    )
     meta = {
         "source": "synthetic",
         "mode": config.mode,
         "seed": int(config.seed),
         "sigma": float(config.sigma),
+        "poly_degree": int(config.poly_degree),
         "n_cells_requested": int(config.n_cells),
         "n_cells_generated": int(s.shape[0]),
         "n_genes": int(a.shape[1]),
     }
+    if config.mode == "fourier":
+        meta["k_min"] = int(config.k_min)
+        meta["k_max"] = int(config.k_max)
+        meta["dependent_xy"] = bool(config.dependent_xy)
+        meta["fourier_basis"] = "interaction_xy" if config.dependent_xy else "independent_xy"
     return DatasetBundle(S=s, A=a, meta=meta).validate()

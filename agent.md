@@ -1,5 +1,12 @@
 # AGENT.md
 
+
+## Environment Setup
+Commands to activate testing enviroment:
+```bash
+conda activate isodepth_env
+```
+
 ## 1. Purpose
 This folder is a research workflow to define a statistical test for determining when spatial transcriptomic genetic variation has arisen via random chance or due to some intrinsic quality of the data. We also aim to establish a biological gradient of this genetic variation. Core literature on this method of encoding an isodepth is GASTON and GASTON-mix. We replicate the architectures of these neural networks to define an isodepth on our data.
 
@@ -29,9 +36,3 @@ This folder is a research workflow to define a statistical test for determining 
 Explain key directories and what lives where.
 
 ## 8. Common Tasks
-
-## 9. Environment Setup
-Commands to activate testing enviroment:
-```bash
-conda activate isodepth_env
-```

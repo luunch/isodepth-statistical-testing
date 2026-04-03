@@ -1,10 +1,11 @@
 {
   "data": {
     "source": "synthetic",
-    "mode": "noise",
+    "mode": "radial",
     "n_cells": 900,
     "n_genes": 20,
     "sigma": 0.1,
+    "poly_degree": 1,
     "seed": 42
   },
   "test": {

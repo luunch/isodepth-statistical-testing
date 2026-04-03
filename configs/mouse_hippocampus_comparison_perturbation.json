@@ -14,9 +14,10 @@
     "seed": 0
   },
   "test": {
-    "method": "parallel_permutation",
+    "method": "comparison_perturbation_test",
     "metric": "nll_gaussian_mse",
-    "n_perms": 100,
+    "n_perms": 30,
+    "n_nulls": 50,
     "epochs": 5000,
     "lr": 0.001,
     "patience": 50,
@@ -24,11 +25,13 @@
     "device": "cuda",
     "batch_size": null,
     "n_experts": 1,
+    "delta": [0.01, 0.05, 0.1, 0.2, 0.25],
+    "perturb_target": "coordinates",
     "verbose": true
   },
   "output": {
     "out_dir": "results",
-    "run_name": "mouse_hippocampus_existence_glm_pcs",
+    "run_name": "mouse_hippocampus_comparison_perturbation_glm_pc",
     "save_preds": false,
     "save_perm_stats": true
   }

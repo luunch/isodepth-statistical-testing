@@ -13,7 +13,8 @@ from methods.metrics import (
     metric_prefers_lower,
     permutation_p_value,
 )
-from methods.perturbation import run_perturbation_robustness_method
+from methods.perturbation import run_comparison_perturbation_test, run_perturbation_test
+from methods.subsampling import run_comparison_subsampling_test, run_subsampling_test
 from methods.trainers import (
     resolve_device,
     train_gaston_mix_model,
@@ -339,8 +340,14 @@ def run_permutation_method(dataset: DatasetBundle, config: TestConfig) -> TestRe
     device = resolve_device(config.device)
     print(f"device: {device}")
 
-    if config.method == "perturbation_robustness":
-        return run_perturbation_robustness_method(dataset, config, device=device)
+    if config.method == "comparison_perturbation_test":
+        return run_comparison_perturbation_test(dataset, config, device=device)
+    if config.method == "perturbation_test":
+        return run_perturbation_test(dataset, config, device=device)
+    if config.method == "comparison_subsampling_test":
+        return run_comparison_subsampling_test(dataset, config, device=device)
+    if config.method == "subsampling_test":
+        return run_subsampling_test(dataset, config, device=device)
     if config.method == "parallel_permutation":
         return run_parallel_permutation_method(dataset, config, device=device)
     if config.method == "full_retraining":

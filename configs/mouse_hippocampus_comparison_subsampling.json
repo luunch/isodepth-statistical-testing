@@ -14,21 +14,22 @@
     "seed": 0
   },
   "test": {
-    "method": "parallel_permutation",
+    "method": "comparison_subsampling_test",
     "metric": "nll_gaussian_mse",
-    "n_perms": 100,
+    "n_nulls": 50,
     "epochs": 5000,
     "lr": 0.001,
     "patience": 50,
     "seed": 42,
     "device": "cuda",
     "batch_size": null,
-    "n_experts": 1,
+    "subset_fractions": [0.01, 0.03, 0.07, 0.1],
+    "n_subsets": 10,
     "verbose": true
   },
   "output": {
     "out_dir": "results",
-    "run_name": "mouse_hippocampus_existence_glm_pcs",
+    "run_name": "mouse_hippocampus_comparison_subsampling_glm_pc",
     "save_preds": false,
     "save_perm_stats": true
   }

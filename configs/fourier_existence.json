@@ -1,10 +1,13 @@
 {
   "data": {
     "source": "synthetic",
-    "mode": "noise",
+    "mode": "fourier",
     "n_cells": 900,
     "n_genes": 20,
     "sigma": 0.1,
+    "k_min": 1,
+    "k_max": 8,
+    "dependent_xy": false,
     "poly_degree": 1,
     "seed": 42
   },
@@ -12,7 +15,7 @@
     "method": "parallel_permutation",
     "metric": "nll_gaussian_mse",
     "n_perms": 50,
-    "epochs": 500,
+    "epochs": 1500,
     "lr": 0.001,
     "patience": 50,
     "seed": 42,
@@ -23,7 +26,7 @@
   },
   "output": {
     "out_dir": "results",
-    "run_name": "noise_existence",
+    "run_name": "fourier_existence",
     "save_preds": false,
     "save_perm_stats": true
   }

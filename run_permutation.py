@@ -8,6 +8,16 @@ from experiments.configuration import build_run_config, save_standardized_output
 from methods.permutation import run_permutation_method
 
 
+def _parse_csv_floats(value: str) -> list[float]:
+    values = [item.strip() for item in value.split(",") if item.strip()]
+    if not values:
+        raise argparse.ArgumentTypeError("Expected at least one comma-separated float")
+    try:
+        return [float(item) for item in values]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Expected comma-separated floats") from exc
+
+
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run a configured isodepth statistical test from a config-defined dataset."
@@ -26,11 +36,15 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-cells-per-gene", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--standardize", dest="standardize", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--no-standardize", dest="standardize", action="store_false", default=argparse.SUPPRESS)
+    parser.add_argument("--q", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--max-cells", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--mode", default=argparse.SUPPRESS)
     parser.add_argument("--n-cells", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--n-genes", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--sigma", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--k", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--k-min", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--k-max", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--seed", type=int, default=argparse.SUPPRESS)
 
     parser.add_argument("--method", default=argparse.SUPPRESS)
@@ -43,8 +57,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default=argparse.SUPPRESS)
     parser.add_argument("--batch-size", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--n-experts", type=int, default=argparse.SUPPRESS)
-    parser.add_argument("--delta", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--delta", type=_parse_csv_floats, default=argparse.SUPPRESS)
     parser.add_argument("--perturb-target", default=argparse.SUPPRESS)
+    parser.add_argument("--subset-fractions", type=_parse_csv_floats, default=argparse.SUPPRESS)
+    parser.add_argument("--n-subsets", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--verbose", dest="verbose", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--quiet", dest="verbose", action="store_false", default=argparse.SUPPRESS)
 
@@ -82,11 +98,15 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict:
         "use_raw": "use_raw",
         "min_cells_per_gene": "min_cells_per_gene",
         "standardize": "standardize",
+        "q": "q",
         "max_cells": "max_cells",
         "mode": "mode",
         "n_cells": "n_cells",
         "n_genes": "n_genes",
         "sigma": "sigma",
+        "k": "k",
+        "k_min": "k_min",
+        "k_max": "k_max",
     }.items():
         if hasattr(args, arg_name):
             data_overrides[config_key] = getattr(args, arg_name)
@@ -104,6 +124,8 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict:
         "n_experts": "n_experts",
         "delta": "delta",
         "perturb_target": "perturb_target",
+        "subset_fractions": "subset_fractions",
+        "n_subsets": "n_subsets",
         "verbose": "verbose",
     }.items():
         if hasattr(args, arg_name):

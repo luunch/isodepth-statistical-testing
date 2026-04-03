@@ -6,7 +6,13 @@ import numpy as np
 import torch
 
 from data.schemas import DatasetBundle, TestConfig, TestResult
-from methods.metrics import canonicalize_metric_name, compute_metric, metric_prefers_lower, permutation_p_value
+from methods.metrics import (
+    canonicalize_metric_name,
+    compute_metric,
+    compute_metric_batch,
+    metric_prefers_lower,
+    permutation_p_value,
+)
 from methods.trainers import resolve_device, train_parallel_isodepth_model
 
 
@@ -42,13 +48,43 @@ def score_depth_similarity(metric: str, d_true: np.ndarray, d_perturbed: np.ndar
     return float(score)
 
 
-def _build_perturbation_batch(S: np.ndarray, config: TestConfig, *, seed_base: int) -> np.ndarray:
+def _summarize_scores(scores: np.ndarray) -> dict[str, float]:
+    scores = np.asarray(scores, dtype=np.float64)
+    return {
+        "mean": float(np.mean(scores)),
+        "median": float(np.median(scores)),
+        "std": float(np.std(scores)),
+        "min": float(np.min(scores)),
+        "max": float(np.max(scores)),
+    }
+
+
+def _delta_schedule(config: TestConfig) -> list[float]:
+    return [float(value) for value in config.delta]
+
+
+def _build_perturbation_batch(
+    S: np.ndarray,
+    config: TestConfig,
+    *,
+    seed_base: int,
+) -> tuple[np.ndarray, np.ndarray]:
     s = np.asarray(S, dtype=np.float32)
-    s_batched = np.zeros((config.n_perms + 1, s.shape[0], 2), dtype=np.float32)
+    delta_values = _delta_schedule(config)
+    total_perturbations = len(delta_values) * config.n_perms
+    s_batched = np.zeros((total_perturbations + 1, s.shape[0], 2), dtype=np.float32)
+    delta_per_score = np.zeros(total_perturbations, dtype=np.float32)
     s_batched[0] = s
-    for i in range(config.n_perms):
-        s_batched[i + 1] = perturb_coordinates(s, config.delta, seed_base + i)
-    return s_batched
+    delta_stride = config.n_perms + 17
+
+    model_index = 1
+    for delta_index, delta in enumerate(delta_values):
+        local_seed_base = seed_base + delta_index * delta_stride
+        for perm_index in range(config.n_perms):
+            s_batched[model_index] = perturb_coordinates(s, delta, local_seed_base + perm_index)
+            delta_per_score[model_index - 1] = float(delta)
+            model_index += 1
+    return s_batched, delta_per_score
 
 
 def _extract_isodepth_batch(model, s_batched: np.ndarray, device: torch.device) -> np.ndarray:
@@ -67,8 +103,8 @@ def _run_perturbation_batch(
     seed_base: int,
     model_label: str,
     a_batched: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
-    s_batched = _build_perturbation_batch(S, config, seed_base=seed_base)
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    s_batched, delta_per_score = _build_perturbation_batch(S, config, seed_base=seed_base)
     model, _ = train_parallel_isodepth_model(
         S,
         A,
@@ -79,7 +115,7 @@ def _run_perturbation_batch(
         model_label=model_label,
     )
     isodepth_batched = _extract_isodepth_batch(model, s_batched, device)
-    return s_batched, isodepth_batched
+    return s_batched, isodepth_batched, delta_per_score
 
 
 def _compute_perturbation_scores(metric: str, isodepth_batched: np.ndarray) -> np.ndarray:
@@ -88,17 +124,6 @@ def _compute_perturbation_scores(metric: str, isodepth_batched: np.ndarray) -> n
     for i in range(scores.shape[0]):
         scores[i] = score_depth_similarity(metric, true_isodepth, isodepth_batched[i + 1])
     return scores
-
-
-def _summarize_scores(scores: np.ndarray) -> dict[str, float]:
-    scores = np.asarray(scores, dtype=np.float64)
-    return {
-        "mean": float(np.mean(scores)),
-        "median": float(np.median(scores)),
-        "std": float(np.std(scores)),
-        "min": float(np.min(scores)),
-        "max": float(np.max(scores)),
-    }
 
 
 def _null_group_size(config: TestConfig) -> int:
@@ -114,12 +139,14 @@ def _run_grouped_null_batches(
     *,
     device: torch.device,
     metric: str,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     rng = np.random.default_rng(config.seed + 100_000)
-    models_per_null = config.n_perms + 1
+    delta_values = _delta_schedule(config)
+    models_per_null = 1 + len(delta_values) * config.n_perms
     group_size = _null_group_size(config)
     stat_perm = np.zeros(config.n_nulls, dtype=np.float64)
-    seed_stride = config.n_perms + 7
+    null_scores_per_perturbation = np.zeros((config.n_nulls, models_per_null - 1), dtype=np.float64)
+    seed_stride = models_per_null + 17
 
     for group_start in range(0, config.n_nulls, group_size):
         group_stop = min(group_start + group_size, config.n_nulls)
@@ -130,7 +157,7 @@ def _run_grouped_null_batches(
         for offset, null_index in enumerate(range(group_start, group_stop)):
             block_start = offset * models_per_null
             block_stop = block_start + models_per_null
-            s_group[block_start:block_stop] = _build_perturbation_batch(
+            s_group[block_start:block_stop], _ = _build_perturbation_batch(
                 S,
                 config,
                 seed_base=config.seed + (null_index + 1) * seed_stride,
@@ -154,12 +181,202 @@ def _run_grouped_null_batches(
         grouped_isodepth = grouped_isodepth.reshape(active_nulls, models_per_null, S.shape[0])
         for offset, null_index in enumerate(range(group_start, group_stop)):
             null_scores = _compute_perturbation_scores(metric=metric, isodepth_batched=grouped_isodepth[offset])
+            null_scores_per_perturbation[null_index] = null_scores
             stat_perm[null_index] = float(np.mean(null_scores))
 
-    return stat_perm
+    return stat_perm, null_scores_per_perturbation
 
 
-def run_perturbation_robustness_method(
+def _delta_summaries(
+    observed_scores: np.ndarray,
+    null_scores_per_perturbation: np.ndarray,
+    delta_per_score: np.ndarray,
+    metric: str,
+) -> dict[str, dict[str, float | list[float]]]:
+    summaries: dict[str, dict[str, float | list[float]]] = {}
+    unique_deltas = np.unique(delta_per_score)
+    for delta in unique_deltas:
+        mask = np.isclose(delta_per_score, delta)
+        stat_true = float(np.mean(observed_scores[mask]))
+        stat_perm = np.asarray(null_scores_per_perturbation[:, mask].mean(axis=1), dtype=np.float64)
+        summaries[f"{float(delta):.6g}"] = {
+            "delta": float(delta),
+            "n_perturbations": int(mask.sum()),
+            "score_mean": stat_true,
+            "score_std": float(np.std(observed_scores[mask])),
+            "p_value": float(permutation_p_value(metric, stat_true, stat_perm)),
+            "null_mean": float(np.mean(stat_perm)),
+            "null_std": float(np.std(stat_perm)),
+            "observed_distribution": [float(x) for x in np.asarray(observed_scores[mask], dtype=np.float64).tolist()],
+            "null_distribution": [float(x) for x in stat_perm.tolist()],
+        }
+    return summaries
+
+
+def _primary_delta_summary(
+    delta_summaries: dict[str, dict[str, float | list[float]]],
+    delta_schedule: list[float],
+) -> tuple[float, dict[str, float | list[float]]]:
+    for delta in delta_schedule:
+        key = f"{float(delta):.6g}"
+        summary = delta_summaries.get(key)
+        if summary is not None:
+            return float(delta), summary
+    raise ValueError("delta_summaries must contain at least one configured delta")
+
+
+def _delta_plot_rows(
+    observed_s_batched: np.ndarray,
+    observed_isodepth_batched: np.ndarray,
+    observed_scores: np.ndarray,
+    delta_per_score: np.ndarray,
+) -> list[dict[str, np.ndarray | float | int]]:
+    rows: list[dict[str, np.ndarray | float | int]] = []
+    unique_deltas = np.unique(delta_per_score)
+    for delta in unique_deltas:
+        indices = np.flatnonzero(np.isclose(delta_per_score, delta))
+        delta_scores = observed_scores[indices]
+        low_local = int(np.argmin(delta_scores))
+        high_local = int(np.argmax(delta_scores))
+        low_index = int(indices[low_local])
+        high_index = int(indices[high_local])
+        rows.append(
+            {
+                "delta": float(delta),
+                "lowest_index": low_index,
+                "lowest_isodepth": np.asarray(observed_isodepth_batched[low_index + 1], dtype=np.float32),
+                "lowest_S": np.asarray(observed_s_batched[low_index + 1], dtype=np.float32),
+                "lowest_stat": float(observed_scores[low_index]),
+                "highest_index": high_index,
+                "highest_isodepth": np.asarray(observed_isodepth_batched[high_index + 1], dtype=np.float32),
+                "highest_S": np.asarray(observed_s_batched[high_index + 1], dtype=np.float32),
+                "highest_stat": float(observed_scores[high_index]),
+            }
+        )
+    return rows
+
+
+def _delta_loss_summaries(
+    observed_stat: float,
+    null_losses: np.ndarray,
+    delta_per_score: np.ndarray,
+    metric: str,
+) -> dict[str, dict[str, float | list[float]]]:
+    summaries: dict[str, dict[str, float | list[float]]] = {}
+    unique_deltas = np.unique(delta_per_score)
+    for delta in unique_deltas:
+        mask = np.isclose(delta_per_score, delta)
+        stat_perm = np.asarray(null_losses[mask], dtype=np.float64)
+        summaries[f"{float(delta):.6g}"] = {
+            "delta": float(delta),
+            "n_perturbations": int(mask.sum()),
+            "score_mean": float(observed_stat),
+            "score_std": 0.0,
+            "p_value": float(permutation_p_value(metric, observed_stat, stat_perm)),
+            "null_mean": float(np.mean(stat_perm)),
+            "null_std": float(np.std(stat_perm)),
+            "observed_distribution": [float(observed_stat)],
+            "null_distribution": [float(x) for x in stat_perm.tolist()],
+        }
+    return summaries
+
+
+def run_perturbation_test(
+    dataset: DatasetBundle, config: TestConfig, device: torch.device | None = None
+) -> TestResult:
+    dataset.validate()
+    config.validate()
+    metric = canonicalize_metric_name(config.metric)
+    device = device or resolve_device(config.device)
+
+    start = time.time()
+    observed_s_batched, delta_per_score = _build_perturbation_batch(
+        dataset.S,
+        config,
+        seed_base=config.seed,
+    )
+    observed_model, observed_predictions = train_parallel_isodepth_model(
+        dataset.S,
+        dataset.A,
+        config,
+        s_batched=observed_s_batched,
+        device=device,
+        model_label=f"perturbation batch (observed + {config.n_perms} perturbed models)",
+    )
+    observed_model_losses = compute_metric_batch(metric, dataset.A, observed_predictions)
+    observed_stat = float(observed_model_losses[0])
+    null_losses = np.asarray(observed_model_losses[1:], dtype=np.float64)
+    observed_isodepth_batched = _extract_isodepth_batch(
+        observed_model,
+        observed_s_batched,
+        device,
+    )
+    delta_summaries = _delta_loss_summaries(
+        observed_stat,
+        null_losses,
+        delta_per_score,
+        metric,
+    )
+    primary_delta, primary_summary = _primary_delta_summary(delta_summaries, _delta_schedule(config))
+    stat_true = float(primary_summary["score_mean"])
+    stat_perm = np.asarray(primary_summary["null_distribution"], dtype=np.float64)
+    runtime_sec = time.time() - start
+    delta_plot_rows = _delta_plot_rows(
+        observed_s_batched,
+        observed_isodepth_batched,
+        null_losses,
+        delta_per_score,
+    )
+    if metric_prefers_lower(metric):
+        extreme_index = int(np.argmin(null_losses))
+        opposite_index = int(np.argmax(null_losses))
+    else:
+        extreme_index = int(np.argmax(null_losses))
+        opposite_index = int(np.argmin(null_losses))
+
+    return TestResult(
+        method_name="perturbation_test",
+        metric=metric,
+        p_value=permutation_p_value(metric, stat_true, stat_perm),
+        stat_true=stat_true,
+        stat_perm=stat_perm,
+        runtime_sec=runtime_sec,
+        n_cells=dataset.n_cells,
+        n_genes=dataset.n_genes,
+        config={"test": config.__dict__.copy()},
+        artifacts={
+            "true_isodepth": np.asarray(observed_isodepth_batched[0], dtype=np.float32),
+            "perturbed_isodepth": np.asarray(observed_isodepth_batched[1], dtype=np.float32),
+            "perturbed_S": np.asarray(observed_s_batched[1], dtype=np.float32),
+            "lowest_isodepth": np.asarray(observed_isodepth_batched[extreme_index + 1], dtype=np.float32),
+            "lowest_S": np.asarray(observed_s_batched[extreme_index + 1], dtype=np.float32),
+            "lowest_stat": float(null_losses[extreme_index]),
+            "lowest_perm_index": int(extreme_index),
+            "highest_isodepth": np.asarray(observed_isodepth_batched[opposite_index + 1], dtype=np.float32),
+            "highest_S": np.asarray(observed_s_batched[opposite_index + 1], dtype=np.float32),
+            "highest_stat": float(null_losses[opposite_index]),
+            "highest_perm_index": int(opposite_index),
+            "delta": _delta_schedule(config),
+            "delta_summaries": delta_summaries,
+            "primary_delta": primary_delta,
+            "delta_plot_rows": delta_plot_rows,
+            "perturb_target": config.perturb_target,
+            "observed_scores": np.asarray(null_losses, dtype=np.float64),
+            "observed_summary": {
+                "mean": float(observed_stat),
+                "median": float(observed_stat),
+                "std": 0.0,
+                "min": float(observed_stat),
+                "max": float(observed_stat),
+            },
+            "null_summary": _summarize_scores(stat_perm),
+            "summary_statistic": "reconstruction_loss",
+            "n_nulls": int(config.n_perms),
+        },
+    ).validate()
+
+
+def run_comparison_perturbation_test(
     dataset: DatasetBundle, config: TestConfig, device: torch.device | None = None
 ) -> TestResult:
     dataset.validate()
@@ -169,7 +386,7 @@ def run_perturbation_robustness_method(
 
     start = time.time()
 
-    observed_s_batched, observed_isodepth_batched = _run_perturbation_batch(
+    observed_s_batched, observed_isodepth_batched, delta_per_score = _run_perturbation_batch(
         dataset.S,
         dataset.A,
         config,
@@ -178,7 +395,6 @@ def run_perturbation_robustness_method(
         model_label=f"parallel perturbation batch (observed + {config.n_perms} perturbed models)",
     )
     observed_scores = _compute_perturbation_scores(metric, observed_isodepth_batched)
-    stat_true = float(np.mean(observed_scores))
 
     if metric_prefers_lower(metric):
         extreme_index = int(np.argmin(observed_scores))
@@ -187,14 +403,35 @@ def run_perturbation_robustness_method(
         extreme_index = int(np.argmax(observed_scores))
         opposite_index = int(np.argmin(observed_scores))
 
-    stat_perm = _run_grouped_null_batches(dataset.S, dataset.A, config, device=device, metric=metric)
+    _, null_scores_per_perturbation = _run_grouped_null_batches(
+        dataset.S,
+        dataset.A,
+        config,
+        device=device,
+        metric=metric,
+    )
 
     runtime_sec = time.time() - start
     observed_summary = _summarize_scores(observed_scores)
+    delta_summaries = _delta_summaries(
+        observed_scores,
+        null_scores_per_perturbation,
+        delta_per_score,
+        metric,
+    )
+    primary_delta, primary_summary = _primary_delta_summary(delta_summaries, _delta_schedule(config))
+    stat_true = float(primary_summary["score_mean"])
+    stat_perm = np.asarray(primary_summary["null_distribution"], dtype=np.float64)
     null_summary = _summarize_scores(stat_perm)
+    delta_plot_rows = _delta_plot_rows(
+        observed_s_batched,
+        observed_isodepth_batched,
+        observed_scores,
+        delta_per_score,
+    )
 
     return TestResult(
-        method_name="perturbation_robustness",
+        method_name="comparison_perturbation_test",
         metric=metric,
         p_value=permutation_p_value(metric, stat_true, stat_perm),
         stat_true=stat_true,
@@ -215,7 +452,10 @@ def run_perturbation_robustness_method(
             "highest_S": np.asarray(observed_s_batched[opposite_index + 1], dtype=np.float32),
             "highest_stat": float(observed_scores[opposite_index]),
             "highest_perm_index": int(opposite_index),
-            "delta": float(config.delta),
+            "delta": _delta_schedule(config),
+            "delta_summaries": delta_summaries,
+            "primary_delta": primary_delta,
+            "delta_plot_rows": delta_plot_rows,
             "perturb_target": config.perturb_target,
             "observed_scores": np.asarray(observed_scores, dtype=np.float64),
             "observed_summary": observed_summary,
@@ -229,6 +469,7 @@ def run_perturbation_robustness_method(
 __all__ = [
     "normalize_depth",
     "perturb_coordinates",
-    "run_perturbation_robustness_method",
+    "run_comparison_perturbation_test",
+    "run_perturbation_test",
     "score_depth_similarity",
 ]
