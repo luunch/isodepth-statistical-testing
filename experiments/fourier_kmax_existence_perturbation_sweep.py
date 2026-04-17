@@ -5,34 +5,36 @@ import json
 
 from data import load_dataset
 from experiments.configuration import build_run_config, save_standardized_outputs
-from experiments.existence_sigma import (
-    ExistenceSigmaStudySpec,
+from experiments.fourier_kmax_existence_perturbation import (
+    FourierKmaxExistencePerturbationStudySpec,
     analysis_dir_for_spec,
-    build_condition_run_config,
-    expand_existence_sigma_conditions,
-    load_existence_sigma_spec,
+    build_fourier_kmax_study_run_config,
+    expand_fourier_kmax_study_conditions,
+    load_fourier_kmax_existence_perturbation_spec,
     manifest_path_for_spec,
-    prepare_dataset_for_condition,
 )
 
 
-def run_existence_sigma_sweep(
-    spec: ExistenceSigmaStudySpec,
+def run_fourier_kmax_existence_perturbation_sweep(
+    spec: FourierKmaxExistencePerturbationStudySpec,
     *,
     dry_run: bool = False,
     max_runs: int | None = None,
 ) -> dict[str, object]:
-    base_run_config = build_run_config(str(spec.base_config), {})
-    conditions = expand_existence_sigma_conditions(spec)
+    existence_base_run_config = build_run_config(str(spec.existence_base_config), {})
+    perturbation_base_run_config = build_run_config(str(spec.perturbation_base_config), {})
+    conditions = expand_fourier_kmax_study_conditions(spec)
     if max_runs is not None:
         conditions = conditions[:max_runs]
 
     manifest_payload: dict[str, object] = {
         "experiment_name": spec.experiment_name,
-        "base_config_path": str(spec.base_config),
+        "existence_base_config_path": str(spec.existence_base_config),
+        "perturbation_base_config_path": str(spec.perturbation_base_config),
         "output_root": str(spec.output_root),
         "analysis_dir": str(analysis_dir_for_spec(spec)),
-        "alpha": float(spec.alpha),
+        "k_min": int(spec.k_min),
+        "delta_values": [float(value) for value in spec.delta_values],
         "runs": [],
     }
 
@@ -41,12 +43,10 @@ def run_existence_sigma_sweep(
         manifest_payload["planned_runs_preview"] = [
             {
                 "run_name": condition.run_name,
-                "truth_label": condition.truth_label,
-                "mode": condition.mode,
-                "sigma": condition.sigma,
-                "seed": condition.seed,
-                "k": "" if condition.k is None else int(condition.k),
-                "null_family": "" if condition.null_family is None else str(condition.null_family),
+                "test_kind": condition.test_kind,
+                "seed": int(condition.seed),
+                "k_min": int(condition.k_min),
+                "k_max": int(condition.k_max),
             }
             for condition in conditions[:10]
         ]
@@ -60,20 +60,22 @@ def run_existence_sigma_sweep(
 
     for index, condition in enumerate(conditions, start=1):
         print(f"[{index}/{len(conditions)}] {condition.run_name}")
-        run_config = build_condition_run_config(base_run_config, spec, condition)
+        run_config = build_fourier_kmax_study_run_config(
+            existence_base_run_config,
+            perturbation_base_run_config,
+            spec,
+            condition,
+        )
         dataset = load_dataset(run_config.data)
-        prepared_dataset = prepare_dataset_for_condition(dataset, condition)
-        result = run_permutation_method(prepared_dataset, run_config.test)
-        _, result_path = save_standardized_outputs(prepared_dataset, result, run_config)
+        result = run_permutation_method(dataset, run_config.test)
+        _, result_path = save_standardized_outputs(dataset, result, run_config)
         manifest_payload["runs"].append(
             {
                 "run_name": condition.run_name,
-                "truth_label": condition.truth_label,
-                "mode": condition.mode,
-                "sigma": float(condition.sigma),
+                "test_kind": condition.test_kind,
                 "seed": int(condition.seed),
-                "k": "" if condition.k is None else int(condition.k),
-                "null_family": "" if condition.null_family is None else str(condition.null_family),
+                "k_min": int(condition.k_min),
+                "k_max": int(condition.k_max),
                 "result_json_path": str(result_path.resolve()),
             }
         )
@@ -86,7 +88,7 @@ def run_existence_sigma_sweep(
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run an existence sigma sweep experiment.")
+    parser = argparse.ArgumentParser(description="Run a Fourier k_max existence and perturbation study.")
     parser.add_argument("--spec", required=True, help="Path to the experiment spec JSON")
     parser.add_argument("--dry-run", action="store_true", help="Print the planned runs without executing them")
     parser.add_argument("--max-runs", type=int, default=None, help="Optional cap on the number of planned runs")
@@ -95,8 +97,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _build_arg_parser().parse_args()
-    spec = load_existence_sigma_spec(args.spec)
-    payload = run_existence_sigma_sweep(spec, dry_run=args.dry_run, max_runs=args.max_runs)
+    spec = load_fourier_kmax_existence_perturbation_spec(args.spec)
+    payload = run_fourier_kmax_existence_perturbation_sweep(spec, dry_run=args.dry_run, max_runs=args.max_runs)
     print(json.dumps(payload, indent=2))
 
 

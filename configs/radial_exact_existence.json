@@ -9,12 +9,12 @@
     "seed": 42
   },
   "test": {
-    "method": "parallel_permutation",
+    "method": "exact_existence",
     "metric": "nll_gaussian_mse",
-    "n_perms": 50,
+    "n_perms": 100,
+    "max_spatial_dims": 5,
+    "alpha": 0.05,
     "epochs": 500,
-    "n_reruns": 10,
-    "sgd_batch_size": 0,
     "lr": 0.001,
     "patience": 50,
     "seed": 42,
@@ -24,7 +24,7 @@
   },
   "output": {
     "out_dir": "results",
-    "run_name": "radial_existence",
+    "run_name": "radial_exact_existence",
     "save_preds": false,
     "save_perm_stats": true
   }

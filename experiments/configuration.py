@@ -11,6 +11,7 @@ from analysis.plots import (
     save_isodepth_triptych,
     save_metric_distribution_plot,
     save_perturbation_delta_pvalue_plot,
+    save_synthetic_true_curve_plot,
     save_subset_fraction_pvalue_plot,
 )
 from data.schemas import DatasetBundle, RunConfig, TestResult, run_config_from_mapping
@@ -79,11 +80,26 @@ def _compact_dataset_meta(meta: Mapping[str, Any]) -> dict[str, Any]:
     if var_names is not None:
         compact["n_var_names"] = int(len(var_names))
         compact["var_names_preview"] = [str(x) for x in list(var_names)[:10]]
+    synthetic_true_curve = compact.pop("synthetic_true_curve", None)
+    if synthetic_true_curve is not None:
+        compact["has_synthetic_true_curve"] = True
     return compact
 
 
 def _filter_mapping(mapping: Mapping[str, Any], allowed_keys: set[str]) -> dict[str, Any]:
     return {key: mapping[key] for key in allowed_keys if key in mapping}
+
+
+def _json_compatible(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Mapping):
+        return {str(key): _json_compatible(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_compatible(item) for item in value]
+    return value
 
 
 def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
@@ -118,23 +134,34 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
     if data.get("mode") == "fourier":
         data_keys |= {"k_min", "k_max"}
 
-    test_keys = {"method", "metric", "epochs", "lr", "patience", "seed", "device", "verbose"}
+    test_keys = {
+        "method",
+        "metric",
+        "epochs",
+        "lr",
+        "patience",
+        "seed",
+        "device",
+        "verbose",
+        "n_reruns",
+        "sgd_batch_size",
+    }
     if method in {
         "parallel_permutation",
+        "exact_existence",
         "full_retraining",
-        "frozen_encoder",
-        "gaston_mix_closed_form",
         "comparison_perturbation_test",
         "perturbation_test",
+        "comparison_subsampling_test",
         "subsampling_test",
     }:
         test_keys.add("n_perms")
+    if method == "exact_existence":
+        test_keys |= {"max_spatial_dims", "alpha"}
     if method in {"comparison_perturbation_test", "perturbation_test"}:
-        test_keys |= {"n_nulls", "batch_size", "n_experts", "delta", "perturb_target"}
-    elif method == "gaston_mix_closed_form":
-        test_keys.add("n_experts")
+        test_keys |= {"n_nulls", "batch_size", "delta", "perturb_target"}
     elif method in {"comparison_subsampling_test", "subsampling_test"}:
-        test_keys |= {"n_nulls", "subset_fractions", "n_subsets"}
+        test_keys |= {"n_nulls", "subset_fractions"}
 
     output_keys = {"out_dir", "run_name", "save_preds", "save_perm_stats"}
 
@@ -147,16 +174,40 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
 
 
 def _method_artifact_keys(method_name: str) -> set[str]:
-    shared = {"perm_summary", "dataset_meta", "lowest_stat", "highest_stat"}
+    shared = {
+        "perm_summary",
+        "dataset_meta",
+        "lowest_stat",
+        "highest_stat",
+        "rerun_summary",
+        "true_rerun_index",
+        "true_train_loss",
+        "lowest_rerun_index",
+        "lowest_train_loss",
+        "highest_rerun_index",
+        "highest_train_loss",
+    }
     if method_name in {
         "parallel_permutation",
+        "exact_existence",
         "full_retraining",
-        "frozen_encoder",
-        "gaston_mix_closed_form",
-        "perturbation_test",
         "subsampling_test",
     }:
-        return shared | {"null_summary"}
+        extra = {"null_summary", "true_isodepth"}
+        if method_name == "exact_existence":
+            extra |= {"selected_spatial_dims", "tested_spatial_dims", "step_summaries", "alpha", "max_spatial_dims"}
+        return shared | extra
+    if method_name == "perturbation_test":
+        return shared | {
+            "delta",
+            "delta_summaries",
+            "primary_delta",
+            "perturb_target",
+            "observed_summary",
+            "null_summary",
+            "summary_statistic",
+            "n_nulls",
+        }
     if method_name == "comparison_perturbation_test":
         return shared | {
             "delta",
@@ -177,7 +228,7 @@ def _method_artifact_keys(method_name: str) -> set[str]:
             "primary_fraction",
             "summary_statistic",
             "n_nulls",
-            "n_subsets",
+            "n_perms",
             "subset_fractions",
             "lowest_subset_fraction",
             "highest_subset_fraction",
@@ -204,62 +255,12 @@ def save_standardized_outputs(
     if dataset_triptych_path is not None:
         artifact_paths["dataset_triptych_plot"] = str(dataset_triptych_path)
 
-    if run_config.output.save_perm_stats:
-        perm_path = out_dir / "perm_stats.npy"
-        np.save(perm_path, result.stat_perm)
-        artifact_paths["perm_stats"] = str(perm_path)
-
-        delta_summaries = result.artifacts.get("delta_summaries")
-        if isinstance(delta_summaries, Mapping):
-            for key, summary in delta_summaries.items():
-                if not isinstance(summary, Mapping) or "null_distribution" not in summary:
-                    continue
-                delta_perm_path = out_dir / f"delta_{key}_perm_stats.npy"
-                np.save(delta_perm_path, np.asarray(summary["null_distribution"], dtype=np.float64))
-                artifact_paths[f"delta_{key}_perm_stats"] = str(delta_perm_path)
-
-        fraction_summaries = result.artifacts.get("fraction_summaries")
-        if isinstance(fraction_summaries, Mapping):
-            for key, summary in fraction_summaries.items():
-                if not isinstance(summary, Mapping) or "null_distribution" not in summary:
-                    continue
-                fraction_perm_path = out_dir / f"subset_fraction_{key}_perm_stats.npy"
-                np.save(fraction_perm_path, np.asarray(summary["null_distribution"], dtype=np.float64))
-                artifact_paths[f"subset_fraction_{key}_perm_stats"] = str(fraction_perm_path)
-
-    if "observed_scores" in result.artifacts:
-        observed_scores_path = out_dir / "observed_scores.npy"
-        np.save(observed_scores_path, np.asarray(result.artifacts["observed_scores"], dtype=np.float64))
-        artifact_paths["observed_scores"] = str(observed_scores_path)
-
-    if "observed_correlations" in result.artifacts:
-        observed_correlations_path = out_dir / "observed_correlations.npy"
-        np.save(
-            observed_correlations_path,
-            np.asarray(result.artifacts["observed_correlations"], dtype=np.float64),
-        )
-        artifact_paths["observed_correlations"] = str(observed_correlations_path)
-
-    if "subset_fraction_per_subset" in result.artifacts:
-        subset_fraction_path = out_dir / "subset_fraction_per_subset.npy"
-        np.save(
-            subset_fraction_path,
-            np.asarray(result.artifacts["subset_fraction_per_subset"], dtype=np.float32),
-        )
-        artifact_paths["subset_fraction_per_subset"] = str(subset_fraction_path)
-
-    if "subset_size_per_subset" in result.artifacts:
-        subset_size_path = out_dir / "subset_size_per_subset.npy"
-        np.save(
-            subset_size_path,
-            np.asarray(result.artifacts["subset_size_per_subset"], dtype=np.int64),
-        )
-        artifact_paths["subset_size_per_subset"] = str(subset_size_path)
-
-    if run_config.output.save_preds and "pred_true" in result.artifacts:
-        pred_true_path = out_dir / "pred_true.npy"
-        np.save(pred_true_path, np.asarray(result.artifacts["pred_true"], dtype=np.float32))
-        artifact_paths["pred_true"] = str(pred_true_path)
+    synthetic_true_curve_path = save_synthetic_true_curve_plot(
+        dataset,
+        out_dir / f"{run_config.output.run_name}_true_curve.png",
+    )
+    if synthetic_true_curve_path is not None:
+        artifact_paths["synthetic_true_curve_plot"] = str(synthetic_true_curve_path)
 
     isodepth_plot_path = save_isodepth_triptych(
         dataset,
@@ -291,16 +292,18 @@ def save_standardized_outputs(
 
     payload = result.to_json_dict(
         config=_compact_run_config(run_config),
-        artifacts={
-            **artifact_paths,
-            **{
-                key: result.artifacts[key]
-                for key in _method_artifact_keys(result.method_name)
-                if key in result.artifacts
-            },
-            "perm_summary": summarize_metric_distribution(result.stat_perm),
-            "dataset_meta": _compact_dataset_meta(dataset.meta),
-        },
+        artifacts=_json_compatible(
+            {
+                **artifact_paths,
+                **{
+                    key: result.artifacts[key]
+                    for key in _method_artifact_keys(result.method_name)
+                    if key in result.artifacts
+                },
+                "perm_summary": summarize_metric_distribution(result.stat_perm),
+                "dataset_meta": _compact_dataset_meta(dataset.meta),
+            }
+        ),
     )
 
     result_path = out_dir / f"{run_config.output.run_name}_result.json"

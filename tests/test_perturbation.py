@@ -82,6 +82,7 @@ class TestPerturbationHelpers(unittest.TestCase):
             method="comparison_perturbation_test",
             metric="mse",
             n_perms=2,
+            n_reruns=1,
             n_nulls=2,
             epochs=2,
             patience=2,
@@ -121,6 +122,7 @@ class TestPerturbationHelpers(unittest.TestCase):
             method="comparison_perturbation_test",
             metric="mse",
             n_perms=1,
+            n_reruns=1,
             n_nulls=2,
             epochs=2,
             patience=2,
@@ -163,6 +165,7 @@ class TestPerturbationMethodIntegration(unittest.TestCase):
             method="perturbation_test",
             metric="mse",
             n_perms=5,
+            n_reruns=1,
             n_nulls=3,
             batch_size=2,
             epochs=2,
@@ -181,6 +184,8 @@ class TestPerturbationMethodIntegration(unittest.TestCase):
         self.assertIn("delta_summaries", result.artifacts)
         self.assertIn("primary_delta", result.artifacts)
         self.assertIn("observed_scores", result.artifacts)
+        self.assertIn("rerun_summary", result.artifacts)
+        self.assertEqual(result.artifacts["true_rerun_index"], 0)
         self.assertEqual(len(result.artifacts["observed_scores"]), 10)
         self.assertEqual(len(result.artifacts["delta_plot_rows"]), 2)
         for summary in result.artifacts["delta_summaries"].values():
@@ -205,6 +210,7 @@ class TestPerturbationMethodIntegration(unittest.TestCase):
             method="perturbation_test",
             metric="mse",
             n_perms=3,
+            n_reruns=1,
             epochs=2,
             patience=2,
             lr=1e-2,
@@ -238,6 +244,7 @@ class TestPerturbationMethodIntegration(unittest.TestCase):
             method="comparison_perturbation_test",
             metric="mse",
             n_perms=5,
+            n_reruns=1,
             n_nulls=3,
             batch_size=2,
             epochs=2,
@@ -258,6 +265,8 @@ class TestPerturbationMethodIntegration(unittest.TestCase):
         self.assertEqual(len(result.artifacts["observed_scores"]), 10)
         self.assertIn("perturbed_S", result.artifacts)
         self.assertIn("perturbed_isodepth", result.artifacts)
+        self.assertIn("rerun_summary", result.artifacts)
+        self.assertEqual(result.artifacts["true_rerun_index"], 0)
         self.assertIn("lowest_S", result.artifacts)
         self.assertIn("highest_S", result.artifacts)
         self.assertIn("delta_summaries", result.artifacts)
@@ -294,6 +303,7 @@ class TestPerturbationMethodIntegration(unittest.TestCase):
             method="comparison_perturbation_test",
             metric="mse",
             n_perms=3,
+            n_reruns=1,
             n_nulls=2,
             batch_size=2,
             epochs=2,
@@ -319,13 +329,15 @@ class TestPerturbationMethodIntegration(unittest.TestCase):
             self.assertTrue((result_path.parent / "comparison_perturbation_test_dataset.png").exists())
             self.assertTrue((result_path.parent / "comparison_perturbation_test_isodepth.png").exists())
             self.assertTrue((result_path.parent / "comparison_perturbation_test_delta_pvalues.png").exists())
-            self.assertTrue((result_path.parent / "delta_0.05_perm_stats.npy").exists())
-            self.assertTrue((result_path.parent / "delta_0.1_perm_stats.npy").exists())
+            self.assertFalse((result_path.parent / "delta_0.05_perm_stats.npy").exists())
+            self.assertFalse((result_path.parent / "delta_0.1_perm_stats.npy").exists())
             self.assertEqual(payload["method_name"], "comparison_perturbation_test")
 
             with open(result_path, "r", encoding="utf-8") as handle:
                 saved_payload = json.load(handle)
             self.assertIn("delta_summaries", saved_payload["artifacts"])
+            self.assertEqual(saved_payload["config"]["test"]["n_reruns"], 1)
+            self.assertIn("rerun_summary", saved_payload["artifacts"])
 
     def test_perturbation_standardized_outputs_include_delta_plot(self) -> None:
         s = np.asarray(
@@ -346,6 +358,7 @@ class TestPerturbationMethodIntegration(unittest.TestCase):
             method="perturbation_test",
             metric="mse",
             n_perms=3,
+            n_reruns=1,
             n_nulls=2,
             batch_size=2,
             epochs=2,
@@ -371,9 +384,11 @@ class TestPerturbationMethodIntegration(unittest.TestCase):
             self.assertTrue((result_path.parent / "perturbation_test_dataset.png").exists())
             self.assertTrue((result_path.parent / "perturbation_test_isodepth.png").exists())
             self.assertTrue((result_path.parent / "perturbation_test_delta_pvalues.png").exists())
-            self.assertTrue((result_path.parent / "delta_0.05_perm_stats.npy").exists())
-            self.assertTrue((result_path.parent / "delta_0.1_perm_stats.npy").exists())
+            self.assertFalse((result_path.parent / "delta_0.05_perm_stats.npy").exists())
+            self.assertFalse((result_path.parent / "delta_0.1_perm_stats.npy").exists())
             self.assertEqual(payload["method_name"], "perturbation_test")
+            self.assertEqual(payload["config"]["test"]["n_reruns"], 1)
+            self.assertIn("rerun_summary", payload["artifacts"])
 
 
 if __name__ == "__main__":

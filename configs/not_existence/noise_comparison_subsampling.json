@@ -9,24 +9,22 @@
     "seed": 42
   },
   "test": {
-    "method": "comparison_perturbation_test",
+    "method": "comparison_subsampling_test",
     "metric": "nll_gaussian_mse",
-    "n_perms": 50,
+    "n_perms": 10,
     "n_nulls": 50,
-    "epochs": 1000,
+    "epochs": 500,
     "lr": 0.001,
     "patience": 50,
     "seed": 42,
     "device": "cuda",
     "batch_size": null,
-    "n_experts": 1,
-    "delta": [0.05, 0.1, 0.5, 1.0],
-    "perturb_target": "coordinates",
+    "subset_fractions": [0.1, 0.3, 0.7, 0.9],
     "verbose": true
   },
   "output": {
     "out_dir": "results",
-    "run_name": "noise_comparison_perturbation",
+    "run_name": "noise_comparison_subsampling",
     "save_preds": false,
     "save_perm_stats": true
   }

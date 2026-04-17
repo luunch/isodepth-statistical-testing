@@ -80,6 +80,7 @@ class TestSyntheticGeneration(unittest.TestCase):
         self.assertEqual(dataset.meta["poly_degree"], 2)
         self.assertTrue(dataset.meta["dependent_xy"])
         self.assertEqual(dataset.meta["fourier_basis"], "interaction_xy")
+        self.assertEqual(np.asarray(dataset.meta["synthetic_true_curve"]).shape, (16,))
 
     def test_fourier_dataset_can_use_independent_xy_basis(self) -> None:
         dataset = generate_synthetic_dataset(
@@ -98,6 +99,16 @@ class TestSyntheticGeneration(unittest.TestCase):
 
         self.assertFalse(dataset.meta["dependent_xy"])
         self.assertEqual(dataset.meta["fourier_basis"], "independent_xy")
+
+    def test_noise_dataset_records_flat_true_curve(self) -> None:
+        dataset = generate_synthetic_dataset(
+            DataConfig(source="synthetic", mode="noise", n_cells=16, n_genes=3, sigma=0.1, seed=7)
+        )
+
+        np.testing.assert_allclose(
+            np.asarray(dataset.meta["synthetic_true_curve"], dtype=np.float32),
+            np.zeros(16, dtype=np.float32),
+        )
 
     def test_expression_manifold_respects_configured_polynomial_degree(self) -> None:
         simulator = SpatialDataSimulator(N=16, G=2, sigma=0.0, poly_degree=1)
@@ -186,6 +197,52 @@ class TestSyntheticGeneration(unittest.TestCase):
         self.assertNotIn("perturb_target", payload["artifacts"])
         self.assertNotIn("subset_fractions", payload["artifacts"])
         self.assertNotIn("delta", payload["artifacts"])
+        self.assertIn("true_isodepth", payload["artifacts"])
+        self.assertEqual(len(payload["artifacts"]["true_isodepth"]), dataset.n_cells)
+        self.assertIn("synthetic_true_curve_plot", payload["artifacts"])
+        self.assertNotIn("synthetic_true_curve", payload["artifacts"]["dataset_meta"])
+        self.assertTrue(payload["artifacts"]["dataset_meta"]["has_synthetic_true_curve"])
+
+    def test_standardized_outputs_save_synthetic_true_curve_plot(self) -> None:
+        dataset = generate_synthetic_dataset(
+            DataConfig(source="synthetic", mode="radial", n_cells=16, n_genes=3, sigma=0.1, seed=7)
+        )
+        result = TestResult(
+            method_name="parallel_permutation",
+            metric="mse",
+            p_value=0.25,
+            stat_true=0.1,
+            stat_perm=np.asarray([0.2, 0.3], dtype=np.float64),
+            runtime_sec=0.01,
+            n_cells=dataset.n_cells,
+            n_genes=dataset.n_genes,
+            config={},
+            artifacts={
+                "true_isodepth": np.linspace(0.0, 1.0, dataset.n_cells, dtype=np.float32),
+                "lowest_isodepth": np.linspace(0.0, 1.0, dataset.n_cells, dtype=np.float32),
+                "lowest_S": np.asarray(dataset.S, dtype=np.float32),
+                "lowest_stat": 0.2,
+                "highest_isodepth": np.linspace(1.0, 0.0, dataset.n_cells, dtype=np.float32),
+                "highest_S": np.asarray(dataset.S, dtype=np.float32),
+                "highest_stat": 0.3,
+                "null_summary": {"mean": 0.25},
+            },
+        ).validate()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_config = RunConfig(
+                data=DataConfig(source="synthetic", mode="radial", n_cells=16, n_genes=3, sigma=0.1, seed=7),
+                output=OutputConfig(out_dir=tmpdir, run_name="synthetic_true_curve_test"),
+            ).validate()
+
+            payload, result_path = save_standardized_outputs(dataset, result, run_config)
+
+            self.assertTrue(result_path.exists())
+            self.assertTrue((result_path.parent / "synthetic_true_curve_test_true_curve.png").exists())
+            self.assertEqual(
+                payload["artifacts"]["synthetic_true_curve_plot"],
+                str(result_path.parent / "synthetic_true_curve_test_true_curve.png"),
+            )
 
 
 if __name__ == "__main__":

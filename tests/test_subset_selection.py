@@ -83,7 +83,8 @@ class TestSubsetSelectionHelpers(unittest.TestCase):
         config = TestConfig(
             method="comparison_subsampling_test",
             metric="mse",
-            n_perms=0,
+            n_perms=2,
+            n_reruns=1,
             n_nulls=2,
             epochs=2,
             patience=2,
@@ -127,11 +128,11 @@ class TestSubsetSelectionIntegration(unittest.TestCase):
         return TestConfig(
             method="comparison_subsampling_test",
             metric="mse",
-            n_perms=0,
+            n_perms=2,
+            n_reruns=1,
             n_nulls=3,
             batch_size=2,
             subset_fractions=[0.5, 0.75],
-            n_subsets=2,
             epochs=2,
             patience=2,
             lr=1e-2,
@@ -144,11 +145,11 @@ class TestSubsetSelectionIntegration(unittest.TestCase):
         return TestConfig(
             method="subsampling_test",
             metric="mse",
-            n_perms=3,
+            n_perms=2,
+            n_reruns=1,
             n_nulls=3,
             batch_size=2,
             subset_fractions=[0.5, 0.75],
-            n_subsets=2,
             epochs=2,
             patience=2,
             lr=1e-2,
@@ -167,6 +168,8 @@ class TestSubsetSelectionIntegration(unittest.TestCase):
         self.assertIn("fraction_summaries", result.artifacts)
         self.assertIn("primary_fraction", result.artifacts)
         self.assertIn("fraction_plot_rows", result.artifacts)
+        self.assertIn("rerun_summary", result.artifacts)
+        self.assertEqual(result.artifacts["true_rerun_index"], 0)
         self.assertEqual(len(result.artifacts["observed_scores"]), 4)
         self.assertEqual(len(result.artifacts["observed_correlations"]), 4)
         self.assertEqual(len(result.artifacts["fraction_plot_rows"]), 2)
@@ -205,6 +208,8 @@ class TestSubsetSelectionIntegration(unittest.TestCase):
         self.assertIn("fraction_plot_rows", result.artifacts)
         self.assertIn("lowest_subset_mask", result.artifacts)
         self.assertIn("highest_subset_mask", result.artifacts)
+        self.assertIn("rerun_summary", result.artifacts)
+        self.assertEqual(result.artifacts["true_rerun_index"], 0)
         self.assertEqual(len(result.artifacts["observed_scores"]), 4)
         self.assertEqual(len(result.artifacts["observed_correlations"]), 4)
         self.assertEqual(len(result.artifacts["fraction_plot_rows"]), 2)
@@ -241,17 +246,19 @@ class TestSubsetSelectionIntegration(unittest.TestCase):
 
             self.assertTrue(result_path.exists())
             self.assertTrue((result_path.parent / "comparison_subsampling_test_dataset.png").exists())
-            self.assertTrue((result_path.parent / "observed_scores.npy").exists())
-            self.assertTrue((result_path.parent / "observed_correlations.npy").exists())
+            self.assertFalse((result_path.parent / "observed_scores.npy").exists())
+            self.assertFalse((result_path.parent / "observed_correlations.npy").exists())
             self.assertTrue((result_path.parent / "comparison_subsampling_test_isodepth.png").exists())
             self.assertTrue((result_path.parent / "comparison_subsampling_test_subset_fraction_pvalues.png").exists())
-            self.assertTrue((result_path.parent / "subset_fraction_0.500_perm_stats.npy").exists())
-            self.assertTrue((result_path.parent / "subset_fraction_0.750_perm_stats.npy").exists())
+            self.assertFalse((result_path.parent / "subset_fraction_0.500_perm_stats.npy").exists())
+            self.assertFalse((result_path.parent / "subset_fraction_0.750_perm_stats.npy").exists())
             self.assertEqual(payload["method_name"], "comparison_subsampling_test")
 
             with open(result_path, "r", encoding="utf-8") as handle:
                 saved_payload = json.load(handle)
             self.assertIn("fraction_summaries", saved_payload["artifacts"])
+            self.assertEqual(saved_payload["config"]["test"]["n_reruns"], 1)
+            self.assertIn("rerun_summary", saved_payload["artifacts"])
 
     def test_direct_standardized_outputs_are_saved(self) -> None:
         result = run_subsampling_test(self.dataset, self._direct_config())
@@ -266,13 +273,15 @@ class TestSubsetSelectionIntegration(unittest.TestCase):
 
             self.assertTrue(result_path.exists())
             self.assertTrue((result_path.parent / "subsampling_test_dataset.png").exists())
-            self.assertTrue((result_path.parent / "observed_scores.npy").exists())
-            self.assertTrue((result_path.parent / "observed_correlations.npy").exists())
+            self.assertFalse((result_path.parent / "observed_scores.npy").exists())
+            self.assertFalse((result_path.parent / "observed_correlations.npy").exists())
             self.assertTrue((result_path.parent / "subsampling_test_isodepth.png").exists())
             self.assertTrue((result_path.parent / "subsampling_test_subset_fraction_pvalues.png").exists())
-            self.assertTrue((result_path.parent / "subset_fraction_0.500_perm_stats.npy").exists())
-            self.assertTrue((result_path.parent / "subset_fraction_0.750_perm_stats.npy").exists())
+            self.assertFalse((result_path.parent / "subset_fraction_0.500_perm_stats.npy").exists())
+            self.assertFalse((result_path.parent / "subset_fraction_0.750_perm_stats.npy").exists())
             self.assertEqual(payload["method_name"], "subsampling_test")
+            self.assertEqual(payload["config"]["test"]["n_reruns"], 1)
+            self.assertIn("rerun_summary", payload["artifacts"])
 
 
 if __name__ == "__main__":

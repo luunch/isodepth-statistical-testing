@@ -9,22 +9,21 @@
     "seed": 42
   },
   "test": {
-    "method": "parallel_permutation",
+    "method": "subsampling_test",
     "metric": "nll_gaussian_mse",
     "n_perms": 50,
     "epochs": 500,
-    "n_reruns": 10,
-    "sgd_batch_size": 0,
     "lr": 0.001,
     "patience": 50,
     "seed": 42,
     "device": "cuda",
     "batch_size": null,
+    "subset_fractions": [0.1, 0.3, 0.7, 0.9],
     "verbose": true
   },
   "output": {
     "out_dir": "results",
-    "run_name": "radial_existence",
+    "run_name": "radial_subsampling",
     "save_preds": false,
     "save_perm_stats": true
   }

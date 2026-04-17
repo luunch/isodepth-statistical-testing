@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import copy
 import json
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Mapping, Optional
+
+import numpy as np
 
 from data.schemas import RunConfig, run_config_from_mapping
 from experiments.configuration import build_run_config
@@ -93,15 +94,14 @@ def expand_fourier_kmax_conditions(spec: FourierKmaxStudySpec) -> list[FourierKm
     conditions: list[FourierKmaxCondition] = []
     for k_max in spec.k_max_values:
         for seed in spec.seeds:
-            run_name = (
-                f"{spec.experiment_name}__kmin-{int(spec.k_min):02d}__kmax-{int(k_max):02d}__seed-{int(seed):03d}"
-            )
             conditions.append(
                 FourierKmaxCondition(
                     seed=int(seed),
                     k_min=int(spec.k_min),
                     k_max=int(k_max),
-                    run_name=run_name,
+                    run_name=(
+                        f"{spec.experiment_name}__kmin-{int(spec.k_min):02d}__kmax-{int(k_max):02d}__seed-{int(seed):03d}"
+                    ),
                 )
             )
     return conditions
@@ -207,9 +207,7 @@ def extract_kmax_record(
                 "warning_type": "config_mismatch",
                 "result_json_path": str(path),
                 "run_name": str(config.get("output", {}).get("run_name", path.stem.replace("_result", ""))),
-                "message": (
-                    "Skipping result because sigma/dependent_xy/poly_degree do not match the sweep base config"
-                ),
+                "message": "Skipping result because sigma/dependent_xy/poly_degree do not match the sweep base config",
             }
         )
         return None, warnings
@@ -238,43 +236,25 @@ def extract_kmax_record(
     return record, warnings
 
 
-def summarize_kmax_rows(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    grouped: dict[int, list[Mapping[str, Any]]] = {}
+def summarize_kmax_rows(rows: list[Mapping[str, object]]) -> list[dict[str, object]]:
+    grouped: dict[int, list[Mapping[str, object]]] = {}
     for row in rows:
         grouped.setdefault(int(row["k_max"]), []).append(row)
 
-    summaries: list[dict[str, Any]] = []
-    for k_max, group in sorted(grouped.items()):
-        p_values = [float(item["p_value"]) for item in group]
-        stat_true = [float(item["stat_true"]) for item in group]
-        n_runs = len(group)
-        p_mean = float(sum(p_values) / n_runs)
-        p_std = float(math.sqrt(sum((value - p_mean) ** 2 for value in p_values) / n_runs)) if n_runs else math.nan
+    summaries: list[dict[str, object]] = []
+    for k_max in sorted(grouped):
+        group_rows = grouped[k_max]
+        p_values = np.asarray([float(row["p_value"]) for row in group_rows], dtype=np.float64)
+        stat_true = np.asarray([float(row["stat_true"]) for row in group_rows], dtype=np.float64)
         summaries.append(
             {
                 "k_max": int(k_max),
-                "n_runs": int(n_runs),
-                "p_value_mean": p_mean,
-                "p_value_std": p_std,
-                "p_value_min": float(min(p_values)),
-                "p_value_max": float(max(p_values)),
-                "stat_true_mean": float(sum(stat_true) / n_runs),
+                "n_runs": int(len(group_rows)),
+                "p_value_mean": float(np.mean(p_values)),
+                "p_value_std": float(np.std(p_values)),
+                "p_value_min": float(np.min(p_values)),
+                "p_value_max": float(np.max(p_values)),
+                "stat_true_mean": float(np.mean(stat_true)),
             }
         )
     return summaries
-
-
-__all__ = [
-    "FourierKmaxCondition",
-    "FourierKmaxStudySpec",
-    "analysis_dir_for_spec",
-    "build_fourier_kmax_run_config",
-    "expand_fourier_kmax_conditions",
-    "extract_kmax_record",
-    "load_fourier_kmax_spec",
-    "load_manifest_entries",
-    "manifest_path_for_spec",
-    "scan_result_json_paths",
-    "summarize_kmax_rows",
-    "write_csv",
-]

@@ -156,10 +156,7 @@ def expand_existence_sigma_conditions(spec: ExistenceSigmaStudySpec) -> list[Swe
                     )
                     conditions.append(
                         SweepCondition(
-                            **{
-                                **asdict(condition),
-                                "run_name": _build_run_name(spec, condition),
-                            }
+                            **{**asdict(condition), "run_name": _build_run_name(spec, condition)}
                         )
                     )
 
@@ -177,16 +174,15 @@ def expand_existence_sigma_conditions(spec: ExistenceSigmaStudySpec) -> list[Swe
                     )
                     conditions.append(
                         SweepCondition(
-                            **{
-                                **asdict(condition),
-                                "run_name": _build_run_name(spec, condition),
-                            }
+                            **{**asdict(condition), "run_name": _build_run_name(spec, condition)}
                         )
                     )
     return conditions
 
 
-def build_condition_run_config(base_run_config: RunConfig, spec: ExistenceSigmaStudySpec, condition: SweepCondition) -> RunConfig:
+def build_condition_run_config(
+    base_run_config: RunConfig, spec: ExistenceSigmaStudySpec, condition: SweepCondition
+) -> RunConfig:
     mapping = copy.deepcopy(base_run_config.to_dict())
     mapping.setdefault("data", {})
     mapping.setdefault("test", {})
@@ -261,11 +257,16 @@ def analysis_dir_for_spec(spec: ExistenceSigmaStudySpec) -> Path:
     return spec.output_root / "analysis"
 
 
+def load_result_payload(path: str | Path) -> dict[str, Any]:
+    with open(Path(path), "r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 def scan_result_json_paths(root: str | Path) -> list[Path]:
     root_path = Path(root)
     if not root_path.exists():
         return []
-    return sorted(path.resolve() for path in root_path.rglob("*_result.json"))
+    return sorted(path.resolve() for path in root_path.rglob("*_result.json") if path.is_file())
 
 
 def load_manifest_entries(path: str | Path) -> dict[Path, dict[str, Any]]:
@@ -276,129 +277,25 @@ def load_manifest_entries(path: str | Path) -> dict[Path, dict[str, Any]]:
         payload = json.load(handle)
     entries: dict[Path, dict[str, Any]] = {}
     for entry in payload.get("runs", []):
-        result_path = Path(entry["result_json_path"]).resolve()
-        entries[result_path] = dict(entry)
+        entries[Path(entry["result_json_path"]).resolve()] = dict(entry)
     return entries
 
 
-def load_result_payload(path: str | Path) -> dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
+def write_csv(path: str | Path, rows: Iterable[Mapping[str, object]], *, fieldnames: list[str]) -> Path:
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: row.get(name, "") for name in fieldnames})
+    return out_path
 
 
-def infer_mode_from_payload(payload: Mapping[str, Any]) -> Optional[str]:
-    config = payload.get("config", {})
-    if isinstance(config, Mapping):
-        data = config.get("data", {})
-        if isinstance(data, Mapping):
-            mode = data.get("mode")
-            if isinstance(mode, str) and mode:
-                return mode
-    artifacts = payload.get("artifacts", {})
-    if isinstance(artifacts, Mapping):
-        dataset_meta = artifacts.get("dataset_meta", {})
-        if isinstance(dataset_meta, Mapping):
-            mode = dataset_meta.get("mode")
-            if isinstance(mode, str) and mode:
-                return mode
-    return None
-
-
-def infer_sigma_from_payload(payload: Mapping[str, Any]) -> Optional[float]:
-    config = payload.get("config", {})
-    if isinstance(config, Mapping):
-        data = config.get("data", {})
-        if isinstance(data, Mapping) and data.get("sigma") is not None:
-            return float(data["sigma"])
-    artifacts = payload.get("artifacts", {})
-    if isinstance(artifacts, Mapping):
-        dataset_meta = artifacts.get("dataset_meta", {})
-        if isinstance(dataset_meta, Mapping) and dataset_meta.get("sigma") is not None:
-            return float(dataset_meta["sigma"])
-    return None
-
-
-def infer_k_from_payload(payload: Mapping[str, Any]) -> Optional[int]:
-    config = payload.get("config", {})
-    if isinstance(config, Mapping):
-        data = config.get("data", {})
-        if isinstance(data, Mapping):
-            if data.get("k") is not None:
-                return int(data["k"])
-            if data.get("k_max") is not None:
-                return int(data["k_max"])
-    artifacts = payload.get("artifacts", {})
-    if isinstance(artifacts, Mapping):
-        dataset_meta = artifacts.get("dataset_meta", {})
-        if isinstance(dataset_meta, Mapping):
-            if dataset_meta.get("k") is not None:
-                return int(dataset_meta["k"])
-            if dataset_meta.get("k_max") is not None:
-                return int(dataset_meta["k_max"])
-    return None
-
-
-def infer_seed_from_payload(payload: Mapping[str, Any]) -> Optional[int]:
-    config = payload.get("config", {})
-    if isinstance(config, Mapping):
-        data = config.get("data", {})
-        if isinstance(data, Mapping) and data.get("seed") is not None:
-            return int(data["seed"])
-    return None
-
-
-def infer_truth_label_from_payload(payload: Mapping[str, Any]) -> Optional[str]:
-    artifacts = payload.get("artifacts", {})
-    if isinstance(artifacts, Mapping):
-        dataset_meta = artifacts.get("dataset_meta", {})
-        if isinstance(dataset_meta, Mapping):
-            truth_label = dataset_meta.get("truth_label")
-            if isinstance(truth_label, str) and truth_label:
-                return truth_label
-    mode = infer_mode_from_payload(payload)
-    if mode == "noise":
-        return "null"
-    if mode in {"radial", "fourier", "checkerboard"}:
-        return "alternative"
-    return None
-
-
-def infer_null_family_from_payload(payload: Mapping[str, Any]) -> Optional[str]:
-    artifacts = payload.get("artifacts", {})
-    if isinstance(artifacts, Mapping):
-        dataset_meta = artifacts.get("dataset_meta", {})
-        if isinstance(dataset_meta, Mapping):
-            null_family = dataset_meta.get("null_family")
-            if isinstance(null_family, str) and null_family:
-                return null_family
-    mode = infer_mode_from_payload(payload)
-    if mode == "noise":
-        return "mode_noise"
-    return None
-
-
-def infer_family_label(mode: Optional[str], k: Optional[int]) -> Optional[str]:
-    if mode is None:
-        return None
-    if mode == "fourier":
-        return f"fourier_k={int(k)}" if k is not None else "fourier_k=unknown"
-    return mode
-
-
-def infer_run_name_mode(run_name: str) -> Optional[str]:
-    match = RUN_NAME_MODE_PATTERN.search(run_name)
-    if match is None:
-        return None
-    return str(match.group(1))
-
-
-def build_warning_record(*, warning_type: str, result_json_path: Path, run_name: str, message: str) -> dict[str, Any]:
-    return {
-        "warning_type": warning_type,
-        "result_json_path": str(result_json_path),
-        "run_name": run_name,
-        "message": message,
-    }
+def _record_family_label(mode: str, k_value: object) -> str:
+    if str(mode) == "fourier" and k_value not in {"", None}:
+        return f"fourier_k={int(k_value)}"
+    return str(mode)
 
 
 def extract_result_record(
@@ -410,114 +307,105 @@ def extract_result_record(
     payload = load_result_payload(path)
     warnings: list[dict[str, Any]] = []
 
-    method_name = payload.get("method_name")
-    if method_name != "parallel_permutation":
+    if payload.get("method_name") != "parallel_permutation":
         return None, warnings
 
     config = payload.get("config", {})
     data_cfg = config.get("data", {}) if isinstance(config, Mapping) else {}
-    if not isinstance(data_cfg, Mapping) or data_cfg.get("source") != "synthetic":
-        return None, warnings
+    if not isinstance(data_cfg, Mapping):
+        data_cfg = {}
+    output_cfg = config.get("output", {}) if isinstance(config, Mapping) else {}
+    if not isinstance(output_cfg, Mapping):
+        output_cfg = {}
+    artifacts = payload.get("artifacts", {})
+    dataset_meta = artifacts.get("dataset_meta", {}) if isinstance(artifacts, Mapping) else {}
+    if not isinstance(dataset_meta, Mapping):
+        dataset_meta = {}
 
-    run_name = str(payload.get("config", {}).get("output", {}).get("run_name", path.stem.replace("_result", "")))
-    mode = infer_mode_from_payload(payload)
-    sigma = infer_sigma_from_payload(payload)
-    k = infer_k_from_payload(payload)
-    seed = infer_seed_from_payload(payload)
-    truth_label = infer_truth_label_from_payload(payload)
-    null_family = infer_null_family_from_payload(payload)
+    mode = str(data_cfg.get("mode", dataset_meta.get("generating_mode", dataset_meta.get("mode", ""))))
+    sigma = float(data_cfg.get("sigma", dataset_meta.get("sigma", 0.0)))
+    seed = int(data_cfg.get("seed", dataset_meta.get("seed", -1)))
+    k_value = data_cfg.get("k", dataset_meta.get("k"))
+    if k_value in {None, ""}:
+        k_value = data_cfg.get("k_max", dataset_meta.get("k_max", ""))
+    if k_value in {None, ""}:
+        k_value = ""
+    else:
+        k_value = int(k_value)
 
-    if manifest_entry is not None:
-        truth_label = str(manifest_entry["truth_label"])
-        null_family = manifest_entry.get("null_family")
+    run_name = str(output_cfg.get("run_name", path.stem.replace("_result", "")))
+    truth_label = str(dataset_meta.get("truth_label", manifest_entry.get("truth_label") if manifest_entry else "null"))
+    null_family = dataset_meta.get("null_family", manifest_entry.get("null_family") if manifest_entry else None)
+    if null_family in {None, ""}:
+        null_family = ""
 
-    mode_from_name = infer_run_name_mode(run_name)
-    if mode_from_name is not None and mode is not None and mode_from_name != mode:
+    mode_match = RUN_NAME_MODE_PATTERN.search(run_name)
+    if mode_match is not None and mode and mode_match.group(1) != mode:
         warnings.append(
-            build_warning_record(
-                warning_type="run_name_mode_mismatch",
-                result_json_path=path,
-                run_name=run_name,
-                message=f"Run name suggests mode '{mode_from_name}' but metadata mode is '{mode}'",
-            )
+            {
+                "warning_type": "run_name_mode_mismatch",
+                "result_json_path": str(path),
+                "run_name": run_name,
+                "message": f"Run name implies mode '{mode_match.group(1)}' but payload reports '{mode}'",
+            }
         )
 
-    if truth_label is None or mode is None or sigma is None:
-        warnings.append(
-            build_warning_record(
-                warning_type="missing_metadata",
-                result_json_path=path,
-                run_name=run_name,
-                message="Skipping result because mode, sigma, or truth label could not be inferred",
-            )
-        )
-        return None, warnings
-
-    family_label = infer_family_label(mode, k)
     record = {
         "result_json_path": str(path),
         "run_name": run_name,
-        "method_name": str(method_name),
+        "method_name": str(payload.get("method_name")),
         "metric": str(payload.get("metric")),
-        "mode": str(mode),
-        "k": "" if k is None else int(k),
-        "sigma": float(sigma),
-        "seed": "" if seed is None else int(seed),
-        "truth_label": str(truth_label),
-        "null_family": "" if null_family is None else str(null_family),
-        "family_label": "" if family_label is None else str(family_label),
+        "mode": mode,
+        "k": k_value,
+        "sigma": sigma,
+        "seed": seed,
+        "truth_label": truth_label,
+        "null_family": null_family,
+        "family_label": _record_family_label(mode, k_value),
         "p_value": float(payload.get("p_value")),
-        "reject": int(float(payload.get("p_value")) < 0.05),
         "stat_true": float(payload.get("stat_true")),
         "runtime_sec": float(payload.get("runtime_sec")),
     }
     return record, warnings
 
 
-def summarize_condition_rows(rows: Iterable[Mapping[str, Any]], *, alpha: float) -> list[dict[str, Any]]:
-    grouped: dict[tuple[str, str, str, float, str], list[Mapping[str, Any]]] = {}
+def summarize_condition_rows(rows: Iterable[Mapping[str, object]], *, alpha: float) -> list[dict[str, object]]:
+    grouped: dict[tuple[str, str, str, float, object], list[Mapping[str, object]]] = {}
     for row in rows:
         key = (
             str(row["truth_label"]),
             str(row["mode"]),
             str(row["family_label"]),
             float(row["sigma"]),
-            "" if row["k"] == "" else str(row["k"]),
+            row.get("k", ""),
         )
         grouped.setdefault(key, []).append(row)
 
-    summaries: list[dict[str, Any]] = []
-    for (truth_label, mode, family_label, sigma, k), group in sorted(grouped.items()):
-        rejects = np.asarray([int(item["reject"]) for item in group], dtype=np.float64)
+    summaries: list[dict[str, object]] = []
+    for (truth_label, mode, family_label, sigma, k_value), group_rows in sorted(
+        grouped.items(),
+        key=lambda item: (item[0][0], item[0][1], item[0][3], "" if item[0][4] == "" else int(item[0][4])),
+    ):
+        rejects = np.asarray([int(row.get("reject", 0)) for row in group_rows], dtype=np.float64)
         n_runs = int(rejects.size)
-        rate = float(rejects.mean()) if n_runs else math.nan
-        standard_error = float(math.sqrt(rate * max(0.0, 1.0 - rate) / max(n_runs, 1))) if n_runs else math.nan
-        ci_delta = 1.96 * standard_error if n_runs else math.nan
+        rate = float(np.mean(rejects))
+        standard_error = float(math.sqrt(max(rate * (1.0 - rate) / max(n_runs, 1), 0.0)))
+        ci_half_width = 1.96 * standard_error
         summaries.append(
             {
                 "summary_metric": "power" if truth_label == "alternative" else "null_rejection_rate",
                 "truth_label": truth_label,
                 "mode": mode,
                 "family_label": family_label,
-                "sigma": float(sigma),
-                "k": k,
+                "sigma": sigma,
+                "k": k_value,
                 "alpha": float(alpha),
                 "n_runs": n_runs,
-                "n_reject": int(rejects.sum()),
+                "n_reject": int(np.sum(rejects)),
                 "rate": rate,
                 "standard_error": standard_error,
-                "ci_lower": max(0.0, rate - ci_delta) if n_runs else math.nan,
-                "ci_upper": min(1.0, rate + ci_delta) if n_runs else math.nan,
+                "ci_lower": max(0.0, rate - ci_half_width),
+                "ci_upper": min(1.0, rate + ci_half_width),
             }
         )
     return summaries
-
-
-def write_csv(path: str | Path, rows: Iterable[Mapping[str, Any]], *, fieldnames: list[str]) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow({key: row.get(key, "") for key in fieldnames})

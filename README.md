@@ -87,7 +87,7 @@ Create a config file like this and save it as `configs/my_run.json`:
     "seed": 0,
     "device": "auto",
     "batch_size": null,
-    "n_experts": 2,
+    "sgd_batch_size": 0,
     "delta": [0.05],
     "perturb_target": "coordinates",
     "verbose": true
@@ -106,9 +106,8 @@ There are ready-made perturbation examples at [noise_perturbation.json](/home/aj
 Supported `test.method` values:
 
 - `parallel_permutation`
+- `exact_existence`
 - `full_retraining`
-- `frozen_encoder`
-- `gaston_mix_closed_form`
 - `comparison_perturbation_test`
 - `perturbation_test`
 - `comparison_subsampling_test`
@@ -127,7 +126,7 @@ Run the bundled example config:
 
 ```bash
 python run_permutation.py \
-  --config configs/noise_comparison_perturbation.json
+  --config configs/noise_exact_existence.json
 ```
 
 Run a config with CLI overrides:
@@ -136,7 +135,7 @@ Run a config with CLI overrides:
 python run_permutation.py \
   --config configs/my_run.json \
   --h5ad data/h5ad/hippocampal_pyramidal.h5ad \
-  --method frozen_encoder \
+  --method parallel_permutation \
   --n-perms 200 \
   --out-dir results/hippocampal_run \
   --run-name hippocampal_parallel \
@@ -196,27 +195,29 @@ This option is intended for `h5ad` count-valued inputs and is not supported for 
 - `--k`: legacy shorthand for the Fourier frequency band when `--mode fourier`. It maps to `k_min = 1` and `k_max = k`, and the generator samples a coupled 2D Fourier basis over terms of the form `cos(2π(k1 x + k2 y))` and `sin(2π(k1 x + k2 y))`.
 - `data.dependent_xy`: Fourier-only boolean flag. `true` uses the coupled basis `k1 x + k2 y`; `false` uses independent `x`-only and `y`-only sine/cosine terms.
 
-- `--method`: test method. Supported values are `parallel_permutation`, `full_retraining`, `frozen_encoder`, `gaston_mix_closed_form`, `comparison_perturbation_test`, `perturbation_test`, `comparison_subsampling_test`, `subsampling_test`.
+- `--method`: test method. Supported values are `parallel_permutation`, `exact_existence`, `full_retraining`, `comparison_perturbation_test`, `perturbation_test`, `comparison_subsampling_test`, `subsampling_test`.
 - `--metric`: one of `nll_gaussian_mse`, `mse`, `pearson_corr_mean`, `spearman_corr_mean`.
-- `--n-perms`: number of perturbations for `comparison_perturbation_test` and `perturbation_test`, number of transformed trials for `subsampling_test`, or number of permutations for existence-style methods.
+- `--n-perms`: number of perturbations for `comparison_perturbation_test` and `perturbation_test`, number of random subset draws per fraction for `subsampling_test` and `comparison_subsampling_test`, or number of permutations for existence-style methods.
+- `--n-reruns`: number of parallel reruns trained per dataset instance inside the batched GASTON model. The minimum training reconstruction loss is selected independently for the observed dataset and every transformed/null dataset. Default is `30`.
+- `--max-spatial-dims`: maximum latent spatial dimension tested by `exact_existence`.
+- `--alpha`: one-sided permutation significance threshold for `exact_existence`. Default is `0.05`.
 - `--n-nulls`: number of null datasets for `comparison_perturbation_test` and `comparison_subsampling_test`. This field is ignored by the direct transformed-data methods.
 - `--epochs`: training epochs for learned-model methods.
 - `--lr`: learning rate.
 - `--patience`: early stopping patience.
 - `--device`: compute device such as `cpu`, `cuda`, `mps`, or `auto`.
 - `--batch-size`: optional grouping cap for `comparison_perturbation_test` null datasets. Each grouped null batch packs up to `batch_size * (n_perms + 1)` models into one parallel trainer call. Leave unset to batch all null datasets together.
-- `--n-experts`: number of GASTON-MIX experts. Only used by `gaston_mix_closed_form`.
+- `--sgd-batch-size`: optional minibatch size for stochastic gradient descent over cells during model fitting. Leave unset or set to `0` to keep the current full-batch training behavior.
 - `--delta`: comma-separated perturbation scales for perturbation methods. Noise is sampled as a fraction of each spatial axis range.
 - `--perturb-target`: perturbation target for perturbation methods. The current implementation only supports `coordinates`.
 - `--subset-fractions`: comma-separated subset fractions for subsampling methods. The default schedule is `0.5,0.7,0.9`.
-- `--n-subsets`: number of repeated subsets drawn at each subset fraction for `comparison_subsampling_test` and `subsampling_test`.
 
 - `--out-dir`: parent output directory.
 - `--run-name`: run-specific subdirectory name under `out_dir`, and the filename prefix for saved artifacts.
-- `--save-preds`: save prediction arrays when the selected method exposes them.
-- `--no-save-preds`: disable prediction array saving.
-- `--save-perm-stats`: save `perm_stats.npy`.
-- `--no-save-perm-stats`: disable `perm_stats.npy` saving.
+- `--save-preds`: legacy compatibility flag. Prediction arrays are not written to `results/`.
+- `--no-save-preds`: legacy compatibility flag. Prediction arrays are not written to `results/`.
+- `--save-perm-stats`: legacy compatibility flag. Permutation arrays are not written to `results/`.
+- `--no-save-perm-stats`: legacy compatibility flag. Permutation arrays are not written to `results/`.
 - `--verbose`: enable training/progress output.
 - `--quiet`: disable training/progress output.
 
@@ -225,12 +226,9 @@ This option is intended for `h5ad` count-valued inputs and is not supported for 
 Each run writes:
 
 - standardized result JSON
-- `S.npy`
-- `A.npy`
-- `perm_stats.npy` when enabled
 - `<run_name>_isodepth_triptych.png`
 - `<run_name>_metric_distribution.png`
-- optional predictions when enabled
+- `<run_name>_true_curve.png` for synthetic `radial`, `fourier`, and `noise` datasets
 - the full merged effective config embedded in the result JSON
 
 Typical output directory contents:
@@ -238,9 +236,7 @@ Typical output directory contents:
 ```text
 results/
   <run_name>/
-    S.npy
-    A.npy
-    perm_stats.npy
+    <run_name>_true_curve.png
     <run_name>_isodepth_triptych.png
     <run_name>_metric_distribution.png
     <run_name>_result.json
@@ -261,11 +257,40 @@ The result JSON includes these standard fields:
 - `config`
 - `artifacts`
 
+## Exact Existence Test
+
+`exact_existence` estimates the exact number of spatial dimensions supported by the data.
+
+- Start from `k = 0`, where the baseline model has no spatial bottleneck and predicts expression from a decoder-only constant representation.
+- For each step `k -> k + 1`, fit paired batched models on the observed dataset and the same coordinate permutations using latent dimensions `k` and `k + 1`.
+- Compute the observed loss improvement `L_k - L_{k+1}` and compare it to the permutation null distribution of paired improvements.
+- Continue while the one-sided p-value is below `alpha`; stop at the first non-significant step.
+
+Key config fields for `exact_existence`:
+
+- `test.max_spatial_dims`
+- `test.alpha`
+- `test.n_perms`
+- `test.n_reruns`
+- `test.metric`, restricted to `mse` or `nll_gaussian_mse`
+
+Saved artifacts include:
+
+- `selected_spatial_dims`
+- `tested_spatial_dims`
+- `step_summaries`
+
+Plots for `exact_existence`:
+
+- The metric distribution figure contains one histogram row per tested dimension.
+- The isodepth figure contains one row per tested dimension and shows all latent coordinates for the true fit, the least-improving permutation, and the most-improving permutation.
+
 ## Comparison Perturbation Test
 
 `comparison_perturbation_test` measures whether the learned isodepth is stable after perturbing the spatial coordinates and retraining the model.
 
 - On the observed dataset, fit one original model plus `n_perms` perturbed-coordinate refits at each delta in the `delta` list and compute the perturbation score for each refit.
+- Each fitted dataset instance is internally trained with `n_reruns` parallel reruns, and the rerun with the minimum training reconstruction loss is kept before computing downstream statistics.
 - For each delta, summarize the observed perturbation scores at that delta by their mean. Each delta gets its own `stat_true`, null distribution, and p-value.
 - Build a null distribution by destroying the spatial-expression pairing with random permutations of `A`.
 - For each null dataset, rerun the same perturb-and-refit pipeline and keep a separate delta-specific null mean for every delta.
@@ -330,7 +355,7 @@ Example config:
 `comparison_subsampling_test` measures whether the full-data isodepth can be recovered from repeated subsets of spots.
 
 - Fit a baseline model on the full dataset and extract the reference isodepth `d`.
-- Draw repeated subsets at one or more subset fractions.
+- Draw `n_perms` random subsets at each configured subset fraction.
 - Refit isodepth models in parallel while restricting each model's training loss to its selected subset.
 - Compute the masked reconstruction loss for each subset refit and summarize those observed losses by their mean within each subset fraction. Each fraction gets its own `stat_true`, null distribution, and p-value.
 - Build a null distribution by permuting the expression rows, reusing the same subset masks, and recomputing the fraction-specific mean masked loss for each null replicate.
@@ -345,8 +370,8 @@ Metric semantics for `comparison_subsampling_test`:
 Recommended default schedule:
 
 - `subset_fractions = [0.5, 0.7, 0.9]`
-- `n_subsets = 10`
-- total observed subset refits per run = `30`
+- `n_perms = 10`
+- total observed subset refits per run = `len(subset_fractions) * n_perms`
 
 Plots for `comparison_subsampling_test`:
 
@@ -359,7 +384,7 @@ Plots for `comparison_subsampling_test`:
 `subsampling_test` measures how unusual the full-data reconstruction loss is relative to refits on directly subsampled coordinate sets.
 
 - Fit one baseline model on the full dataset and use its full-data reconstruction loss as `stat_true`.
-- Draw repeated subsets at each configured subset fraction.
+- Treat each random subset draw as one permutation, with `n_perms` draws at each configured subset fraction.
 - Refit the model with training loss restricted to each sampled subset.
 - Evaluate each subset refit on its selected spots, scale the subset loss by dividing by the subset fraction, and use those scaled losses as the fraction-specific null distribution.
 - Report one p-value per subset fraction and expose the first configured fraction as the top-level `stat_true`, `stat_perm`, and `p_value`.
@@ -377,8 +402,7 @@ Example config:
     "method": "subsampling_test",
     "metric": "mse",
     "n_perms": 50,
-    "subset_fractions": [0.5, 0.7, 0.9],
-    "n_subsets": 10
+    "subset_fractions": [0.5, 0.7, 0.9]
   }
 }
 ```
@@ -390,9 +414,9 @@ Example config:
   "test": {
     "method": "comparison_subsampling_test",
     "metric": "mse",
+    "n_perms": 10,
     "n_nulls": 50,
-    "subset_fractions": [0.5, 0.7, 0.9],
-    "n_subsets": 10
+    "subset_fractions": [0.5, 0.7, 0.9]
   }
 }
 ```
@@ -414,6 +438,28 @@ The Fourier `k_max` sweep uses:
 - `python -m experiments.fourier_kmax_sweep --spec configs/experiments/fourier_kmax_study.json` to launch the study
 - `python -m experiments.fourier_kmax_analysis --spec configs/experiments/fourier_kmax_study.json` to aggregate saved result JSONs into `per_run_results.csv`, `summary_by_kmax.csv`, and `pvalue_vs_kmax.png`
 
+The combined Fourier existence + perturbation study uses:
+
+- [configs/fourier_existence.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/fourier_existence.json) as the existence base config
+- [configs/fourier_perturbation.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/fourier_perturbation.json) as the perturbation base config
+- [configs/experiments/fourier_kmax_existence_perturbation_study.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/experiments/fourier_kmax_existence_perturbation_study.json) as the sweep spec
+- `python -m experiments.fourier_kmax_existence_perturbation_sweep --spec configs/experiments/fourier_kmax_existence_perturbation_study.json` to launch the study
+- `python -m experiments.fourier_kmax_existence_perturbation_analysis --spec configs/experiments/fourier_kmax_existence_perturbation_study.json` to aggregate saved result JSONs into separate existence/perturbation CSVs, line plots, and one box plot per `k_max`
+
+The real-data existence consistency study uses:
+
+- [configs/mouse_hippocampus_existence.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/mouse_hippocampus_existence.json) as the base real-data existence config
+- [configs/experiments/mouse_hippocampus_existence_consistency_study.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/experiments/mouse_hippocampus_existence_consistency_study.json) as the sweep spec
+- `python -m experiments.real_data_existence_consistency_sweep --spec configs/experiments/mouse_hippocampus_existence_consistency_study.json` to launch the 20-repeat study
+- `python -m experiments.real_data_existence_consistency_analysis --spec configs/experiments/mouse_hippocampus_existence_consistency_study.json` to aggregate saved result JSONs into repeat-level CSVs and plots for p-values, true losses, null loss distributions, and the true-isodepth Spearman matrix
+
+This study keeps the real dataset fixed, reruns the same `parallel_permutation` existence test with different seeds, and records:
+
+- one p-value per repeat
+- one true-data loss per repeat
+- the full null loss distribution for each repeat
+- the pairwise Spearman agreement across all saved true-data isodepth vectors
+
 Sweep outputs are written under:
 
 ```text
@@ -427,6 +473,12 @@ results/experiments/<experiment_name>/
     null_rejection_vs_sigma.png
     fourier_power_heatmap.png
     fourier_null_rejection_heatmap.png
+    pvalue_by_repeat.png
+    true_loss_by_repeat.png
+    null_loss_distributions_by_repeat.png
+    null_loss_density_overlay.png
+    true_isodepth_spearman_matrix.png
+    isodepth_spearman_histogram.png
 ```
 
 ## Notes

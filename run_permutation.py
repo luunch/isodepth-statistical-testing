@@ -50,17 +50,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--method", default=argparse.SUPPRESS)
     parser.add_argument("--metric", default=argparse.SUPPRESS)
     parser.add_argument("--n-perms", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--n-reruns", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--max-spatial-dims", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--alpha", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--n-nulls", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--epochs", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--lr", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--patience", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--device", default=argparse.SUPPRESS)
     parser.add_argument("--batch-size", type=int, default=argparse.SUPPRESS)
-    parser.add_argument("--n-experts", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--sgd-batch-size", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--delta", type=_parse_csv_floats, default=argparse.SUPPRESS)
     parser.add_argument("--perturb-target", default=argparse.SUPPRESS)
     parser.add_argument("--subset-fractions", type=_parse_csv_floats, default=argparse.SUPPRESS)
-    parser.add_argument("--n-subsets", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--verbose", dest="verbose", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--quiet", dest="verbose", action="store_false", default=argparse.SUPPRESS)
 
@@ -115,17 +117,19 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict:
         "method": "method",
         "metric": "metric",
         "n_perms": "n_perms",
+        "n_reruns": "n_reruns",
+        "max_spatial_dims": "max_spatial_dims",
+        "alpha": "alpha",
         "n_nulls": "n_nulls",
         "epochs": "epochs",
         "lr": "lr",
         "patience": "patience",
         "device": "device",
         "batch_size": "batch_size",
-        "n_experts": "n_experts",
+        "sgd_batch_size": "sgd_batch_size",
         "delta": "delta",
         "perturb_target": "perturb_target",
         "subset_fractions": "subset_fractions",
-        "n_subsets": "n_subsets",
         "verbose": "verbose",
     }.items():
         if hasattr(args, arg_name):

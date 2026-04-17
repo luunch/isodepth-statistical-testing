@@ -1,30 +1,33 @@
 {
   "data": {
     "source": "synthetic",
-    "mode": "radial",
+    "mode": "fourier",
     "n_cells": 900,
     "n_genes": 20,
     "sigma": 0.1,
+    "k_min": 1,
+    "k_max": 2,
+    "dependent_xy": true,
     "poly_degree": 1,
     "seed": 42
   },
   "test": {
-    "method": "parallel_permutation",
+    "method": "subsampling_test",
     "metric": "nll_gaussian_mse",
     "n_perms": 50,
+    "n_nulls": 50,
     "epochs": 500,
-    "n_reruns": 10,
-    "sgd_batch_size": 0,
     "lr": 0.001,
     "patience": 50,
     "seed": 42,
     "device": "cuda",
     "batch_size": null,
+    "subset_fractions": [0.1, 0.3, 0.7, 0.9],
     "verbose": true
   },
   "output": {
     "out_dir": "results",
-    "run_name": "radial_existence",
+    "run_name": "fourier_subsampling",
     "save_preds": false,
     "save_perm_stats": true
   }

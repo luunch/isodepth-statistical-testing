@@ -13,7 +13,7 @@ from methods.metrics import (
     metric_prefers_lower,
     permutation_p_value,
 )
-from methods.trainers import resolve_device, train_parallel_isodepth_model
+from methods.trainers import get_training_metadata, resolve_device, train_parallel_isodepth_model
 
 
 def perturb_coordinates(S: np.ndarray, delta: float, seed: int) -> np.ndarray:
@@ -94,6 +94,22 @@ def _extract_isodepth_batch(model, s_batched: np.ndarray, device: torch.device) 
     return np.asarray(isodepth_batched, dtype=np.float32)
 
 
+def _rerun_summary(model) -> dict[str, object]:
+    metadata = get_training_metadata(model)
+    return {
+        "n_reruns": int(metadata["n_reruns"]),
+        "selection_loss": str(metadata["selection_loss"]),
+    }
+
+
+def _rerun_index_and_loss(model, index: int) -> tuple[int, float]:
+    metadata = get_training_metadata(model)
+    return (
+        int(metadata["best_rerun_index_per_model"][index]),
+        float(metadata["best_train_loss_per_model"][index]),
+    )
+
+
 def _run_perturbation_batch(
     S: np.ndarray,
     A: np.ndarray,
@@ -103,7 +119,7 @@ def _run_perturbation_batch(
     seed_base: int,
     model_label: str,
     a_batched: np.ndarray | None = None,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[object, np.ndarray, np.ndarray, np.ndarray]:
     s_batched, delta_per_score = _build_perturbation_batch(S, config, seed_base=seed_base)
     model, _ = train_parallel_isodepth_model(
         S,
@@ -115,7 +131,7 @@ def _run_perturbation_batch(
         model_label=model_label,
     )
     isodepth_batched = _extract_isodepth_batch(model, s_batched, device)
-    return s_batched, isodepth_batched, delta_per_score
+    return model, s_batched, isodepth_batched, delta_per_score
 
 
 def _compute_perturbation_scores(metric: str, isodepth_batched: np.ndarray) -> np.ndarray:
@@ -333,6 +349,9 @@ def run_perturbation_test(
     else:
         extreme_index = int(np.argmax(null_losses))
         opposite_index = int(np.argmin(null_losses))
+    true_rerun_index, true_train_loss = _rerun_index_and_loss(observed_model, 0)
+    lowest_rerun_index, lowest_train_loss = _rerun_index_and_loss(observed_model, extreme_index + 1)
+    highest_rerun_index, highest_train_loss = _rerun_index_and_loss(observed_model, opposite_index + 1)
 
     return TestResult(
         method_name="perturbation_test",
@@ -346,16 +365,23 @@ def run_perturbation_test(
         config={"test": config.__dict__.copy()},
         artifacts={
             "true_isodepth": np.asarray(observed_isodepth_batched[0], dtype=np.float32),
+            "rerun_summary": _rerun_summary(observed_model),
+            "true_rerun_index": int(true_rerun_index),
+            "true_train_loss": float(true_train_loss),
             "perturbed_isodepth": np.asarray(observed_isodepth_batched[1], dtype=np.float32),
             "perturbed_S": np.asarray(observed_s_batched[1], dtype=np.float32),
             "lowest_isodepth": np.asarray(observed_isodepth_batched[extreme_index + 1], dtype=np.float32),
             "lowest_S": np.asarray(observed_s_batched[extreme_index + 1], dtype=np.float32),
             "lowest_stat": float(null_losses[extreme_index]),
             "lowest_perm_index": int(extreme_index),
+            "lowest_rerun_index": int(lowest_rerun_index),
+            "lowest_train_loss": float(lowest_train_loss),
             "highest_isodepth": np.asarray(observed_isodepth_batched[opposite_index + 1], dtype=np.float32),
             "highest_S": np.asarray(observed_s_batched[opposite_index + 1], dtype=np.float32),
             "highest_stat": float(null_losses[opposite_index]),
             "highest_perm_index": int(opposite_index),
+            "highest_rerun_index": int(highest_rerun_index),
+            "highest_train_loss": float(highest_train_loss),
             "delta": _delta_schedule(config),
             "delta_summaries": delta_summaries,
             "primary_delta": primary_delta,
@@ -386,7 +412,7 @@ def run_comparison_perturbation_test(
 
     start = time.time()
 
-    observed_s_batched, observed_isodepth_batched, delta_per_score = _run_perturbation_batch(
+    observed_model, observed_s_batched, observed_isodepth_batched, delta_per_score = _run_perturbation_batch(
         dataset.S,
         dataset.A,
         config,
@@ -402,6 +428,9 @@ def run_comparison_perturbation_test(
     else:
         extreme_index = int(np.argmax(observed_scores))
         opposite_index = int(np.argmin(observed_scores))
+    true_rerun_index, true_train_loss = _rerun_index_and_loss(observed_model, 0)
+    lowest_rerun_index, lowest_train_loss = _rerun_index_and_loss(observed_model, extreme_index + 1)
+    highest_rerun_index, highest_train_loss = _rerun_index_and_loss(observed_model, opposite_index + 1)
 
     _, null_scores_per_perturbation = _run_grouped_null_batches(
         dataset.S,
@@ -442,16 +471,23 @@ def run_comparison_perturbation_test(
         config={"test": config.__dict__.copy()},
         artifacts={
             "true_isodepth": np.asarray(observed_isodepth_batched[0], dtype=np.float32),
+            "rerun_summary": _rerun_summary(observed_model),
+            "true_rerun_index": int(true_rerun_index),
+            "true_train_loss": float(true_train_loss),
             "perturbed_isodepth": np.asarray(observed_isodepth_batched[1], dtype=np.float32),
             "perturbed_S": np.asarray(observed_s_batched[1], dtype=np.float32),
             "lowest_isodepth": np.asarray(observed_isodepth_batched[extreme_index + 1], dtype=np.float32),
             "lowest_S": np.asarray(observed_s_batched[extreme_index + 1], dtype=np.float32),
             "lowest_stat": float(observed_scores[extreme_index]),
             "lowest_perm_index": int(extreme_index),
+            "lowest_rerun_index": int(lowest_rerun_index),
+            "lowest_train_loss": float(lowest_train_loss),
             "highest_isodepth": np.asarray(observed_isodepth_batched[opposite_index + 1], dtype=np.float32),
             "highest_S": np.asarray(observed_s_batched[opposite_index + 1], dtype=np.float32),
             "highest_stat": float(observed_scores[opposite_index]),
             "highest_perm_index": int(opposite_index),
+            "highest_rerun_index": int(highest_rerun_index),
+            "highest_train_loss": float(highest_train_loss),
             "delta": _delta_schedule(config),
             "delta_summaries": delta_summaries,
             "primary_delta": primary_delta,

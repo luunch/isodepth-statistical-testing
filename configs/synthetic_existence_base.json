@@ -1,31 +1,27 @@
 {
   "data": {
     "source": "synthetic",
-    "mode": "noise",
+    "mode": "radial",
     "n_cells": 900,
     "n_genes": 20,
     "sigma": 0.1,
-    "poly_degree": 1,
-    "seed": 42
+    "seed": 0
   },
   "test": {
-    "method": "perturbation_test",
+    "method": "parallel_permutation",
     "metric": "nll_gaussian_mse",
     "n_perms": 50,
     "epochs": 500,
     "lr": 0.001,
     "patience": 50,
-    "seed": 42,
+    "seed": 0,
     "device": "cuda",
     "batch_size": null,
-    "n_experts": 1,
-    "delta": [0.01, 0.05, 0.1, 0.2, 0.25],
-    "perturb_target": "coordinates",
     "verbose": true
   },
   "output": {
     "out_dir": "results",
-    "run_name": "noise_perturbation",
+    "run_name": "synthetic_existence",
     "save_preds": false,
     "save_perm_stats": true
   }

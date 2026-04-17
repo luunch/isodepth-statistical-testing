@@ -38,7 +38,7 @@ class SpatialDataSimulator:
         k_min: Optional[int] = None,
         k_max: Optional[int] = None,
         dependent_xy: bool = True,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if seed is not None:
             np.random.seed(seed)
 
@@ -62,12 +62,13 @@ class SpatialDataSimulator:
             H = self._apply_expression_manifold(d)
             A = H + self.sigma * np.random.randn(self.N, self.G)
         elif mode == "noise":
+            d = np.zeros(self.N, dtype=np.float64)
             A = np.random.randn(self.N, self.G)
         else:
             raise ValueError(f"Unsupported synthetic data mode '{mode}'")
 
         A = (A - A.mean(axis=0)) / (A.std(axis=0) + 1e-8)
-        return self.S, A.astype(np.float32)
+        return self.S, A.astype(np.float32), d.astype(np.float32)
 
     def _generate_fourier_latent(self, k_min: int, k_max: int, *, dependent_xy: bool = True) -> np.ndarray:
         x = self.S[:, 0]
@@ -181,7 +182,7 @@ def generate_synthetic_dataset(config: DataConfig) -> DatasetBundle:
         device="cpu",
         poly_degree=config.poly_degree,
     )
-    s, a = simulator.generate(
+    s, a, true_curve = simulator.generate(
         mode=config.mode,
         seed=config.seed,
         k_min=config.k_min,
@@ -197,6 +198,7 @@ def generate_synthetic_dataset(config: DataConfig) -> DatasetBundle:
         "n_cells_requested": int(config.n_cells),
         "n_cells_generated": int(s.shape[0]),
         "n_genes": int(a.shape[1]),
+        "synthetic_true_curve": np.asarray(true_curve, dtype=np.float32),
     }
     if config.mode == "fourier":
         meta["k_min"] = int(config.k_min)

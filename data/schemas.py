@@ -22,9 +22,8 @@ SUPPORTED_SYNTHETIC_MODES = {
 
 SUPPORTED_PERMUTATION_METHODS = {
     "parallel_permutation",
+    "exact_existence",
     "full_retraining",
-    "frozen_encoder",
-    "gaston_mix_closed_form",
     "comparison_perturbation_test",
     "perturbation_test",
     "comparison_subsampling_test",
@@ -154,6 +153,9 @@ class TestConfig:
     method: str = "parallel_permutation"
     metric: str = "nll_gaussian_mse"
     n_perms: int = 100
+    n_reruns: int = 30
+    max_spatial_dims: int = 3
+    alpha: float = 0.05
     n_nulls: int = 50
     epochs: int = 5000
     lr: float = 1e-3
@@ -161,11 +163,10 @@ class TestConfig:
     seed: int = 0
     device: str = "auto"
     batch_size: Optional[int] = None
-    n_experts: int = 1
+    sgd_batch_size: Optional[int] = None
     delta: list[float] = field(default_factory=lambda: [0.05])
     perturb_target: str = "coordinates"
     subset_fractions: list[float] = field(default_factory=lambda: [0.5, 0.7, 0.9])
-    n_subsets: int = 10
     verbose: bool = True
 
     def validate(self) -> "TestConfig":
@@ -179,6 +180,12 @@ class TestConfig:
             )
         if self.n_nulls <= 0:
             raise ValueError("test.n_nulls must be > 0")
+        if self.n_reruns <= 0:
+            raise ValueError("test.n_reruns must be > 0")
+        if self.max_spatial_dims <= 0:
+            raise ValueError("test.max_spatial_dims must be > 0")
+        if self.alpha <= 0.0 or self.alpha >= 1.0:
+            raise ValueError("test.alpha must lie strictly between 0 and 1")
         if self.epochs <= 0:
             raise ValueError("test.epochs must be > 0")
         if self.lr <= 0:
@@ -187,8 +194,8 @@ class TestConfig:
             raise ValueError("test.patience must be > 0")
         if self.batch_size is not None and self.batch_size <= 0:
             raise ValueError("test.batch_size must be > 0 when provided")
-        if self.n_experts <= 0:
-            raise ValueError("test.n_experts must be > 0")
+        if self.sgd_batch_size is not None and self.sgd_batch_size < 0:
+            raise ValueError("test.sgd_batch_size must be >= 0 when provided")
         self.delta = [float(value) for value in self.delta]
         if not self.delta:
             raise ValueError("test.delta must contain at least one value")
@@ -196,8 +203,6 @@ class TestConfig:
             raise ValueError("test.delta entries must be > 0")
         if self.perturb_target != "coordinates":
             raise ValueError("test.perturb_target currently only supports 'coordinates'")
-        if self.n_subsets <= 0:
-            raise ValueError("test.n_subsets must be > 0")
 
         self.subset_fractions = [float(value) for value in self.subset_fractions]
         if not self.subset_fractions:
@@ -207,11 +212,11 @@ class TestConfig:
 
         if self.method in {
             "parallel_permutation",
+            "exact_existence",
             "full_retraining",
-            "frozen_encoder",
-            "gaston_mix_closed_form",
             "comparison_perturbation_test",
             "perturbation_test",
+            "comparison_subsampling_test",
             "subsampling_test",
         } and self.n_perms <= 0:
             raise ValueError("test.n_perms must be > 0")
@@ -236,6 +241,13 @@ class TestConfig:
         }:
             raise ValueError(
                 "test.metric for subsampling_test must be one of ['mse', 'nll_gaussian_mse']"
+            )
+        if self.method == "exact_existence" and self.metric not in {
+            "nll_gaussian_mse",
+            "mse",
+        }:
+            raise ValueError(
+                "test.metric for exact_existence must be one of ['mse', 'nll_gaussian_mse']"
             )
         return self
 

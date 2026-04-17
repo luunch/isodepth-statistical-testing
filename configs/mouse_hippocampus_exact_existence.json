@@ -9,16 +9,17 @@
     "use_raw": false,
     "min_cells_per_gene": 1,
     "standardize": true,
+    "q": 10,
     "max_cells": null,
     "seed": 0
   },
   "test": {
-    "method": "parallel_permutation",
+    "method": "exact_existence",
     "metric": "nll_gaussian_mse",
     "n_perms": 100,
-    "epochs": 5000,
-    "n_reruns": 1,
-    "sgd_batch_size": 0,
+    "max_spatial_dims": 5,
+    "alpha": 0.05,
+    "epochs": 10000,
     "lr": 0.001,
     "patience": 50,
     "seed": 42,
@@ -28,7 +29,7 @@
   },
   "output": {
     "out_dir": "results",
-    "run_name": "mouse_hippocampus_existence",
+    "run_name": "mouse_hippocampus_exact_existence",
     "save_preds": false,
     "save_perm_stats": true
   }

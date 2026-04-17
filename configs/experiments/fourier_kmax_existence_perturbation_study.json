@@ -1,0 +1,11 @@
+{
+  "experiment_name": "fourier_kmax_existence_perturbation_study",
+  "existence_base_config": "configs/fourier_existence.json",
+  "perturbation_base_config": "configs/fourier_perturbation.json",
+  "output_root": "results/experiments/fourier_kmax_existence_perturbation_study",
+  "k_min": 1,
+  "k_max_values": [1, 2, 3, 4, 5, 10, 20, 30, 50, 100],
+  "seeds": [42, 43, 44, 45, 46, 47, 48, 49, 50, 51],
+  "delta_values": [0.01, 0.03, 0.05, 0.1, 0.2],
+  "reuse_result_roots": []
+}

@@ -82,6 +82,15 @@ def _plot_spatial_isodepth(ax, S: np.ndarray, depth: np.ndarray, title: str) -> 
     plt.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04, label="Normalized isodepth")
 
 
+def _as_dimension_matrix(values: np.ndarray) -> np.ndarray:
+    array = np.asarray(values, dtype=np.float32)
+    if array.ndim == 1:
+        return array.reshape(-1, 1)
+    if array.ndim == 2:
+        return array
+    raise ValueError(f"Expected isodepth array with 1 or 2 dimensions, got shape {array.shape}")
+
+
 def _overlay_subsampling(ax, S: np.ndarray, subset_mask: np.ndarray | None) -> None:
     if subset_mask is None:
         return
@@ -176,6 +185,43 @@ def save_dataset_triptych(
         subset_mask=result.artifacts.get("highest_subset_mask"),
         vmin=vmin,
         vmax=vmax,
+    )
+    fig.tight_layout()
+    out_path = Path(out_path)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_synthetic_true_curve_plot(
+    dataset: DatasetBundle,
+    out_path: str | Path,
+) -> Path | None:
+    if dataset.meta.get("source") != "synthetic":
+        return None
+
+    mode = str(dataset.meta.get("mode", ""))
+    if mode not in {"radial", "fourier", "noise"}:
+        return None
+
+    true_curve = dataset.meta.get("synthetic_true_curve")
+    if true_curve is None:
+        return None
+
+    title = "True Synthetic Isodepth"
+    if mode == "noise":
+        title = "True Synthetic Isodepth (Flat Null)"
+    elif mode == "fourier":
+        title = "True Synthetic Isodepth (Fourier)"
+    elif mode == "radial":
+        title = "True Synthetic Isodepth (Radial)"
+
+    fig, ax = plt.subplots(1, 1, figsize=(6, 5))
+    _plot_spatial_isodepth(
+        ax,
+        np.asarray(dataset.S, dtype=np.float32),
+        np.asarray(true_curve, dtype=np.float32),
+        title,
     )
     fig.tight_layout()
     out_path = Path(out_path)
@@ -323,6 +369,53 @@ def _save_subsampling_triptych(
     return out_path
 
 
+def _save_exact_existence_triptych(
+    dataset: DatasetBundle,
+    result: TestResult,
+    out_path: Path,
+) -> Path | None:
+    rows = result.artifacts.get("dimension_plot_rows")
+    if not isinstance(rows, list) or not rows:
+        return None
+
+    spatial = np.asarray(dataset.S, dtype=np.float32)
+    panels: list[tuple[np.ndarray, np.ndarray, str]] = []
+
+    for row in rows:
+        dim = int(row["tested_dim"])
+        true_depths = _as_dimension_matrix(row["true_isodepth"])
+        low_depths = _as_dimension_matrix(row["lowest_isodepth"])
+        high_depths = _as_dimension_matrix(row["highest_isodepth"])
+        low_S = np.asarray(row["lowest_S"], dtype=np.float32)
+        high_S = np.asarray(row["highest_S"], dtype=np.float32)
+        labels = list(row.get("dimension_labels") or [f"d{i + 1}" for i in range(dim)])
+        for dim_index in range(dim):
+            label = labels[dim_index] if dim_index < len(labels) else f"d{dim_index + 1}"
+            title_suffix = (
+                f"dim {dim}\np={float(row['p_value']):.4g}"
+                if dim_index == 0
+                else f"dim {dim}"
+            )
+            panels.append((spatial, true_depths[:, dim_index], f"True {label}\n{title_suffix}"))
+            panels.append((low_S, low_depths[:, dim_index], f"Lowest {label}\n{float(row['lowest_stat']):.4g}"))
+            panels.append((high_S, high_depths[:, dim_index], f"Highest {label}\n{float(row['highest_stat']):.4g}"))
+
+    n_cols = min(3, max(len(panels), 1))
+    n_rows = int(np.ceil(len(panels) / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows), squeeze=False)
+
+    for axis, (panel_S, panel_depth, panel_title) in zip(axes.flat, panels):
+        _plot_spatial_isodepth(axis, panel_S, panel_depth, panel_title)
+
+    for axis in axes.flat[len(panels):]:
+        axis.axis("off")
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
 def save_isodepth_triptych(
     dataset: DatasetBundle,
     result: TestResult,
@@ -333,6 +426,9 @@ def save_isodepth_triptych(
     lowest_S = result.artifacts.get("lowest_S")
     highest_isodepth = result.artifacts.get("highest_isodepth")
     highest_S = result.artifacts.get("highest_S")
+    if result.method_name == "exact_existence":
+        out_path = Path(out_path)
+        return _save_exact_existence_triptych(dataset, result, out_path)
     if (
         true_isodepth is None
         or lowest_isodepth is None
@@ -385,6 +481,36 @@ def save_isodepth_triptych(
 
 def save_metric_distribution_plot(result: TestResult, out_path: str | Path) -> Path:
     out_path = Path(out_path)
+    if result.method_name == "exact_existence":
+        step_summaries = result.artifacts.get("step_summaries")
+        if isinstance(step_summaries, dict) and step_summaries:
+            ordered_keys = sorted(step_summaries.keys(), key=lambda value: int(value))
+            fig, axes = plt.subplots(len(ordered_keys), 1, figsize=(6, 4 * len(ordered_keys)), squeeze=False)
+            for ax, key in zip(axes[:, 0], ordered_keys):
+                summary = step_summaries[key]
+                stat_perm = np.asarray(summary["null_distribution"], dtype=np.float64)
+                if "observed_delta" in summary:
+                    stat_true = float(summary["observed_delta"])
+                    title = f"k={int(summary['tested_dim']) - 1} -> {int(summary['tested_dim'])}"
+                    xlabel = "Loss Reduction Scale"
+                    label = f"Observed Reduction-Scale Stat: {stat_true:.4g}"
+                else:
+                    stat_true = float(summary["observed_stat"])
+                    title = "Existence Test"
+                    xlabel = result.metric
+                    label = f"Observed: {stat_true:.4g}"
+                p_value = float(summary["p_value"])
+                significance = "significant" if bool(summary["significant"]) else "not significant"
+                ax.hist(stat_perm, bins=30, color="lightsteelblue", edgecolor="black")
+                ax.axvline(stat_true, color="crimson", linestyle="--", label=label)
+                ax.set_title(f"{title}\np-value = {p_value:.4g} ({significance})")
+                ax.set_xlabel(xlabel)
+                ax.set_ylabel("Count")
+                ax.legend()
+            fig.tight_layout()
+            fig.savefig(out_path, dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            return out_path
     if result.method_name in {"comparison_perturbation_test", "perturbation_test"}:
         delta_summaries = result.artifacts.get("delta_summaries")
         if isinstance(delta_summaries, dict) and delta_summaries:

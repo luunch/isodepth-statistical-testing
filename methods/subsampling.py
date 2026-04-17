@@ -8,7 +8,12 @@ import torch
 from data.schemas import DatasetBundle, TestConfig, TestResult
 from methods.metrics import canonicalize_metric_name, compute_metric, permutation_p_value
 from methods.perturbation import score_depth_similarity
-from methods.trainers import resolve_device, train_batched_isodepth_model, train_isodepth_model
+from methods.trainers import (
+    get_training_metadata,
+    resolve_device,
+    train_batched_isodepth_model,
+    train_isodepth_model,
+)
 
 
 def _extract_isodepth_from_model(model, S: np.ndarray, device: torch.device) -> np.ndarray:
@@ -36,6 +41,22 @@ def _summarize_scores(scores: np.ndarray) -> dict[str, float]:
     }
 
 
+def _rerun_summary(model) -> dict[str, object]:
+    metadata = get_training_metadata(model)
+    return {
+        "n_reruns": int(metadata["n_reruns"]),
+        "selection_loss": str(metadata["selection_loss"]),
+    }
+
+
+def _rerun_index_and_loss(model, index: int) -> tuple[int, float]:
+    metadata = get_training_metadata(model)
+    return (
+        int(metadata["best_rerun_index_per_model"][index]),
+        float(metadata["best_train_loss_per_model"][index]),
+    )
+
+
 def _subset_size(n_cells: int, fraction: float) -> int:
     raw_size = int(round(float(fraction) * float(n_cells)))
     if n_cells <= 1:
@@ -46,12 +67,12 @@ def _subset_size(n_cells: int, fraction: float) -> int:
 def build_subset_masks(
     n_cells: int,
     subset_fractions: list[float],
-    n_subsets: int,
+    n_perms: int,
     *,
     seed: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     rng = np.random.default_rng(seed)
-    total_subsets = len(subset_fractions) * n_subsets
+    total_subsets = len(subset_fractions) * n_perms
     loss_mask_batched = np.zeros((total_subsets, n_cells, 1), dtype=np.float32)
     fraction_per_subset = np.zeros(total_subsets, dtype=np.float32)
     size_per_subset = np.zeros(total_subsets, dtype=np.int64)
@@ -59,7 +80,7 @@ def build_subset_masks(
     subset_index = 0
     for fraction in subset_fractions:
         subset_size = _subset_size(n_cells, fraction)
-        for _ in range(n_subsets):
+        for _ in range(n_perms):
             selected = rng.choice(n_cells, size=subset_size, replace=False)
             loss_mask_batched[subset_index, selected, 0] = 1.0
             fraction_per_subset[subset_index] = float(fraction)
@@ -153,7 +174,7 @@ def _fraction_summaries(
         summaries[f"{float(fraction):.3f}"] = {
             "fraction": float(fraction),
             "subset_size": int(np.round(size_per_subset[mask].mean())),
-            "n_subsets": int(mask.sum()),
+            "n_perms": int(mask.sum()),
             "loss_mean": stat_true,
             "loss_std": float(np.std(values[mask])),
             "correlation_mean": float(np.mean(correlations[mask])),
@@ -226,7 +247,7 @@ def _fraction_loss_summaries(
         summaries[f"{float(fraction):.3f}"] = {
             "fraction": float(fraction),
             "subset_size": int(np.round(size_per_subset[mask].mean())),
-            "n_subsets": int(mask.sum()),
+            "n_perms": int(mask.sum()),
             "loss_mean": float(observed_stat),
             "loss_std": 0.0,
             "correlation_mean": float(np.mean(correlations[mask])),
@@ -268,11 +289,12 @@ def run_subsampling_test(
     )
     true_isodepth = _extract_isodepth_from_model(true_model, dataset.S, device)
     observed_stat = float(compute_metric(metric, dataset.A, pred_true))
+    true_rerun_index, true_train_loss = _rerun_index_and_loss(true_model, 0)
 
     loss_mask_batched, fraction_per_subset, size_per_subset = build_subset_masks(
         dataset.n_cells,
         config.subset_fractions,
-        config.n_subsets,
+        config.n_perms,
         seed=config.seed,
     )
     total_subsets = loss_mask_batched.shape[0]
@@ -304,6 +326,8 @@ def run_subsampling_test(
 
     lowest_index = int(np.argmin(scaled_losses))
     highest_index = int(np.argmax(scaled_losses))
+    lowest_rerun_index, lowest_train_loss = _rerun_index_and_loss(observed_model, lowest_index)
+    highest_rerun_index, highest_train_loss = _rerun_index_and_loss(observed_model, highest_index)
     fraction_summaries = _fraction_loss_summaries(
         observed_stat,
         scaled_losses,
@@ -338,18 +362,25 @@ def run_subsampling_test(
         artifacts={
             "pred_true": np.asarray(pred_true, dtype=np.float32),
             "true_isodepth": true_isodepth,
+            "rerun_summary": _rerun_summary(observed_model),
+            "true_rerun_index": int(true_rerun_index),
+            "true_train_loss": float(true_train_loss),
             "lowest_isodepth": np.asarray(observed_isodepth_batched[lowest_index], dtype=np.float32),
             "lowest_S": np.asarray(dataset.S, dtype=np.float32),
             "lowest_stat": float(scaled_losses[lowest_index]),
             "lowest_subset_index": lowest_index,
             "lowest_subset_mask": np.asarray(loss_mask_batched[lowest_index, :, 0], dtype=np.float32),
             "lowest_subset_fraction": float(fraction_per_subset[lowest_index]),
+            "lowest_rerun_index": int(lowest_rerun_index),
+            "lowest_train_loss": float(lowest_train_loss),
             "highest_isodepth": np.asarray(observed_isodepth_batched[highest_index], dtype=np.float32),
             "highest_S": np.asarray(dataset.S, dtype=np.float32),
             "highest_stat": float(scaled_losses[highest_index]),
             "highest_subset_index": highest_index,
             "highest_subset_mask": np.asarray(loss_mask_batched[highest_index, :, 0], dtype=np.float32),
             "highest_subset_fraction": float(fraction_per_subset[highest_index]),
+            "highest_rerun_index": int(highest_rerun_index),
+            "highest_train_loss": float(highest_train_loss),
             "observed_scores": np.asarray(scaled_losses, dtype=np.float64),
             "observed_correlations": np.asarray(observed_correlations, dtype=np.float64),
             "observed_summary": {
@@ -367,8 +398,7 @@ def run_subsampling_test(
             "subset_fractions": [float(value) for value in config.subset_fractions],
             "subset_fraction_per_subset": np.asarray(fraction_per_subset, dtype=np.float32),
             "subset_size_per_subset": np.asarray(size_per_subset, dtype=np.int64),
-            "n_subsets": int(config.n_subsets),
-            "n_nulls": int(config.n_perms),
+            "n_perms": int(config.n_perms),
             "summary_statistic": "scaled_subset_reconstruction_loss",
         },
     ).validate()
@@ -395,11 +425,12 @@ def run_comparison_subsampling_test(
         model_label="true model",
     )
     true_isodepth = _extract_isodepth_from_model(true_model, dataset.S, device)
+    true_rerun_index, true_train_loss = _rerun_index_and_loss(true_model, 0)
 
     loss_mask_batched, fraction_per_subset, size_per_subset = build_subset_masks(
         dataset.n_cells,
         config.subset_fractions,
-        config.n_subsets,
+        config.n_perms,
         seed=config.seed,
     )
     total_subsets = loss_mask_batched.shape[0]
@@ -470,6 +501,8 @@ def run_comparison_subsampling_test(
     runtime_sec = time.time() - start
     lowest_index = int(np.argmin(observed_losses))
     highest_index = int(np.argmax(observed_losses))
+    lowest_rerun_index, lowest_train_loss = _rerun_index_and_loss(observed_model, lowest_index)
+    highest_rerun_index, highest_train_loss = _rerun_index_and_loss(observed_model, highest_index)
     fraction_summaries = _fraction_summaries(
         observed_losses,
         observed_correlations,
@@ -504,18 +537,25 @@ def run_comparison_subsampling_test(
         artifacts={
             "pred_true": np.asarray(pred_true, dtype=np.float32),
             "true_isodepth": true_isodepth,
+            "rerun_summary": _rerun_summary(observed_model),
+            "true_rerun_index": int(true_rerun_index),
+            "true_train_loss": float(true_train_loss),
             "lowest_isodepth": np.asarray(observed_isodepth_batched[lowest_index], dtype=np.float32),
             "lowest_S": np.asarray(dataset.S, dtype=np.float32),
             "lowest_stat": float(observed_losses[lowest_index]),
             "lowest_subset_index": lowest_index,
             "lowest_subset_mask": np.asarray(loss_mask_batched[lowest_index, :, 0], dtype=np.float32),
             "lowest_subset_fraction": float(fraction_per_subset[lowest_index]),
+            "lowest_rerun_index": int(lowest_rerun_index),
+            "lowest_train_loss": float(lowest_train_loss),
             "highest_isodepth": np.asarray(observed_isodepth_batched[highest_index], dtype=np.float32),
             "highest_S": np.asarray(dataset.S, dtype=np.float32),
             "highest_stat": float(observed_losses[highest_index]),
             "highest_subset_index": highest_index,
             "highest_subset_mask": np.asarray(loss_mask_batched[highest_index, :, 0], dtype=np.float32),
             "highest_subset_fraction": float(fraction_per_subset[highest_index]),
+            "highest_rerun_index": int(highest_rerun_index),
+            "highest_train_loss": float(highest_train_loss),
             "observed_scores": np.asarray(observed_losses, dtype=np.float64),
             "observed_correlations": np.asarray(observed_correlations, dtype=np.float64),
             "observed_summary": _summarize_scores(observed_losses),
@@ -527,7 +567,7 @@ def run_comparison_subsampling_test(
             "subset_fractions": [float(value) for value in config.subset_fractions],
             "subset_fraction_per_subset": np.asarray(fraction_per_subset, dtype=np.float32),
             "subset_size_per_subset": np.asarray(size_per_subset, dtype=np.int64),
-            "n_subsets": int(config.n_subsets),
+            "n_perms": int(config.n_perms),
             "n_nulls": int(config.n_nulls),
             "summary_statistic": "mean_masked_subset_loss",
         },

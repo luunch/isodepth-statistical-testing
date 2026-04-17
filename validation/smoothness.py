@@ -67,7 +67,7 @@ def run_smoothness_trials(
 
     for i in range(n_trials):
         for mode in modes:
-            S, A = simulator.generate(mode=mode, seed=i)
+            S, A, _ = simulator.generate(mode=mode, seed=i)
             Z = train_and_get_isodepth(S, A, device, epochs=epochs, patience=patience, seed=i)
             results[mode].append(calculate_laplacian_smoothness(Z))
 

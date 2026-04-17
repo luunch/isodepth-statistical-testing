@@ -1,34 +1,30 @@
 {
   "data": {
     "source": "synthetic",
-    "mode": "fourier",
+    "mode": "radial",
     "n_cells": 900,
     "n_genes": 20,
     "sigma": 0.1,
-    "k_min": 1,
-    "k_max": 2,
-    "dependent_xy": true,
     "poly_degree": 1,
     "seed": 42
   },
   "test": {
-    "method": "subsampling_test",
+    "method": "perturbation_test",
     "metric": "nll_gaussian_mse",
     "n_perms": 50,
-    "n_nulls": 50,
     "epochs": 500,
     "lr": 0.001,
     "patience": 50,
     "seed": 42,
     "device": "cuda",
     "batch_size": null,
-    "subset_fractions": [0.1, 0.3, 0.7, 0.9],
-    "n_subsets": 10,
+    "delta": [0.001, 0.005, 0.01],
+    "perturb_target": "coordinates",
     "verbose": true
   },
   "output": {
     "out_dir": "results",
-    "run_name": "fourier_subsampling",
+    "run_name": "radial_perturbation",
     "save_preds": false,
     "save_perm_stats": true
   }

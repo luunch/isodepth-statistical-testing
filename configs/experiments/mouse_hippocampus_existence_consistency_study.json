@@ -1,0 +1,9 @@
+{
+  "experiment_name": "mouse_hippocampus_existence_consistency_study",
+  "base_config": "configs/mouse_hippocampus_existence.json",
+  "output_root": "results/experiments/mouse_hippocampus_existence_consistency_study_raw_data",
+  "n_repeats": 20,
+  "repeat_seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+  "n_perms": 100,
+  "reuse_result_roots": []
+}

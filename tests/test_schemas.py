@@ -11,6 +11,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from data.schemas import DataConfig, TestConfig
 from methods.metrics import compute_metric, permutation_p_value
+from run_permutation import _build_arg_parser, _build_cli_overrides
 
 
 class TestDataSchema(unittest.TestCase):
@@ -97,6 +98,43 @@ class TestDataSchema(unittest.TestCase):
 
 
 class TestPerturbationSchema(unittest.TestCase):
+    def test_n_reruns_defaults_to_thirty(self) -> None:
+        self.assertEqual(TestConfig().n_reruns, 30)
+
+    def test_non_positive_n_reruns_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            TestConfig(n_reruns=0).validate()
+
+    def test_cli_n_reruns_override_is_parsed(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(["--n-reruns", "7"])
+        overrides = _build_cli_overrides(args)
+        self.assertEqual(overrides["test"]["n_reruns"], 7)
+
+    def test_zero_sgd_batch_size_keeps_full_batch_behavior(self) -> None:
+        config = TestConfig(
+            method="comparison_perturbation_test",
+            metric="mse",
+            delta=[0.1],
+            sgd_batch_size=0,
+        )
+        self.assertIs(config.validate(), config)
+
+    def test_negative_sgd_batch_size_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            TestConfig(
+                method="comparison_perturbation_test",
+                metric="mse",
+                delta=[0.1],
+                sgd_batch_size=-1,
+            ).validate()
+
+    def test_cli_sgd_batch_size_override_is_parsed(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(["--sgd-batch-size", "11"])
+        overrides = _build_cli_overrides(args)
+        self.assertEqual(overrides["test"]["sgd_batch_size"], 11)
+
     def test_comparison_perturbation_config_is_valid(self) -> None:
         config = TestConfig(
             method="comparison_perturbation_test",
@@ -157,10 +195,9 @@ class TestSubsetSelectionSchema(unittest.TestCase):
         config = TestConfig(
             method="comparison_subsampling_test",
             metric="mse",
-            n_perms=0,
+            n_perms=3,
             n_nulls=5,
             subset_fractions=[0.4, 0.8],
-            n_subsets=3,
         )
         self.assertIs(config.validate(), config)
 
@@ -172,12 +209,12 @@ class TestSubsetSelectionSchema(unittest.TestCase):
                 subset_fractions=[0.5, 1.0],
             ).validate()
 
-    def test_invalid_n_subsets_is_rejected(self) -> None:
+    def test_invalid_comparison_subsampling_n_perms_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             TestConfig(
                 method="comparison_subsampling_test",
                 metric="mse",
-                n_subsets=0,
+                n_perms=0,
             ).validate()
 
     def test_comparison_subsampling_rejects_correlation_metric(self) -> None:
@@ -193,7 +230,6 @@ class TestSubsetSelectionSchema(unittest.TestCase):
             metric="mse",
             n_perms=3,
             subset_fractions=[0.4, 0.8],
-            n_subsets=3,
         )
         self.assertIs(config.validate(), config)
 

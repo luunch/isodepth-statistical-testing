@@ -40,7 +40,7 @@ def run_permuted_smoothness_trials(
 
     rng = np.random.default_rng(0)
     for mode in modes:
-        S, A = simulator.generate(mode=mode, seed=0)
+        S, A, _ = simulator.generate(mode=mode, seed=0)
         Z_orig = train_and_get_isodepth(S, A, device, epochs=epochs, patience=patience, seed=0)
         orig_smooth = calculate_laplacian_smoothness(Z_orig)
         original_smoothness[mode] = orig_smooth
