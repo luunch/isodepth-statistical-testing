@@ -150,6 +150,62 @@ class TestRealDataExistenceConsistencySpec(unittest.TestCase):
         self.assertEqual(run_config.test.n_perms, 100)
         self.assertTrue(run_config.output.run_name.endswith("__seed-009"))
 
+    def test_cross_validation_base_config_is_accepted_and_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            base_config = tmp_path / "base.json"
+            spec_path = tmp_path / "spec.json"
+            base_config.write_text(
+                json.dumps(
+                    {
+                        "data": {
+                            "source": "h5ad",
+                            "h5ad": "data/h5ad/example.h5ad",
+                            "spatial_key": "spatial",
+                            "seed": 0,
+                        },
+                        "test": {
+                            "method": "cross_validation",
+                            "metric": "mse",
+                            "n_perms": 10,
+                            "train_fraction": 0.7,
+                            "epochs": 2,
+                            "lr": 0.01,
+                            "patience": 2,
+                            "seed": 9,
+                            "device": "cpu",
+                            "verbose": False,
+                        },
+                        "output": {
+                            "out_dir": str(tmp_path / "results"),
+                            "run_name": "base",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            spec_path.write_text(
+                json.dumps(
+                    {
+                        "experiment_name": "study",
+                        "base_config": str(base_config),
+                        "output_root": str(tmp_path / "study_outputs"),
+                        "n_repeats": 1,
+                        "repeat_seeds": [7],
+                        "n_perms": 5,
+                        "reuse_result_roots": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            spec = load_real_data_existence_consistency_spec(spec_path)
+            condition = expand_real_data_existence_repeat_conditions(spec)[0]
+            run_config = build_repeat_run_config(build_run_config(str(spec.base_config), {}), spec, condition)
+
+        self.assertEqual(run_config.test.method, "cross_validation")
+        self.assertEqual(run_config.test.train_fraction, 0.7)
+
 
 class TestRealDataExistenceConsistencyHelpers(unittest.TestCase):
     def test_extract_repeat_payload_expands_expected_fields(self) -> None:
@@ -185,6 +241,39 @@ class TestRealDataExistenceConsistencyHelpers(unittest.TestCase):
             self.assertEqual(record["repeat_index"], 0)
             self.assertEqual(record["seed"], 13)
             self.assertAlmostEqual(float(record["null_mean"]), 1.6333333333)
+
+    def test_extract_repeat_payload_accepts_cross_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result_path = Path(tmpdir) / "run_result.json"
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "method_name": "cross_validation",
+                        "metric": "mse",
+                        "p_value": 0.25,
+                        "stat_true": 1.2,
+                        "stat_perm": [1.5, 1.8, 1.6],
+                        "runtime_sec": 0.5,
+                        "config": {
+                            "data": {"source": "h5ad", "h5ad": "data/example.h5ad"},
+                            "test": {"seed": 13, "n_perms": 3, "train_fraction": 0.75},
+                            "output": {"run_name": "study__repeat-000__seed-013"},
+                        },
+                        "artifacts": {"true_isodepth": [0.0, 1.0, 2.0]},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            record, warnings = extract_repeat_payload(
+                result_path,
+                manifest_entry={"repeat_index": 0, "seed": 13, "run_name": "study__repeat-000__seed-013"},
+            )
+
+        self.assertEqual(warnings, [])
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record["method_name"], "cross_validation")
 
     def test_pairwise_rows_build_symmetric_spearman_matrix(self) -> None:
         rows = [

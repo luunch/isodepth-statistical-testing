@@ -14,7 +14,11 @@ from methods.metrics import (
     permutation_p_value,
 )
 from methods.perturbation import run_comparison_perturbation_test, run_perturbation_test
-from methods.subsampling import run_comparison_subsampling_test, run_subsampling_test
+from methods.subsampling import (
+    compute_masked_losses,
+    run_comparison_subsampling_test,
+    run_subsampling_test,
+)
 from methods.trainers import (
     extract_model_isodepth,
     get_training_metadata,
@@ -70,6 +74,28 @@ def _build_permuted_coordinate_batch(
         permutations.append(perm.cpu().numpy())
         s_batched[m] = s_t[perm.to(device=device)]
     return s_batched, permutations
+
+
+def _build_train_test_masks(
+    n_cells: int,
+    *,
+    n_models: int,
+    train_fraction: float,
+    seed: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    train_size = int(round(float(train_fraction) * float(n_cells)))
+    if train_size <= 0 or train_size >= n_cells:
+        raise ValueError(
+            "cross_validation requires at least one train and one test cell after rounding "
+            f"test.train_fraction={float(train_fraction):.4g} for n_cells={int(n_cells)}"
+        )
+
+    rng = np.random.default_rng(seed)
+    train_indices = rng.choice(n_cells, size=train_size, replace=False)
+    train_mask = np.zeros((n_models, n_cells, 1), dtype=np.float32)
+    train_mask[:, train_indices, 0] = 1.0
+    test_mask = 1.0 - train_mask
+    return train_mask, test_mask
 
 
 def _delta_p_value(stat_true: float, stat_perm: np.ndarray) -> float:
@@ -257,6 +283,100 @@ def run_parallel_permutation_method(
             "highest_perm_index": high_idx,
             "highest_rerun_index": int(highest_rerun_index),
             "highest_train_loss": float(highest_train_loss),
+        },
+    ).validate()
+
+
+def run_cross_validation_method(
+    dataset: DatasetBundle, config: TestConfig, device: torch.device | None = None
+) -> TestResult:
+    dataset.validate()
+    config.validate()
+    metric = canonicalize_metric_name(config.metric)
+    device = device or resolve_device(config.device)
+
+    start = time.time()
+    n_models = config.n_perms + 1
+    s_batched, _ = _build_permuted_coordinate_batch(
+        dataset.S,
+        n_perms=config.n_perms,
+        seed=config.seed,
+        device=device,
+    )
+    s_batched_np = np.asarray(s_batched.detach().cpu().numpy(), dtype=np.float32)
+    train_mask_batched, test_mask_batched = _build_train_test_masks(
+        dataset.n_cells,
+        n_models=n_models,
+        train_fraction=config.train_fraction,
+        seed=config.seed,
+    )
+    model, predictions = train_parallel_isodepth_model(
+        dataset.S,
+        dataset.A,
+        config,
+        device=device,
+        s_batched=s_batched_np,
+        loss_mask_batched=train_mask_batched,
+        model_label=f"cross validation batch (true + {config.n_perms} permuted models)",
+    )
+    targets = np.repeat(np.asarray(dataset.A, dtype=np.float32)[None, :, :], n_models, axis=0)
+    held_out_losses = compute_masked_losses(
+        predictions,
+        targets,
+        test_mask_batched,
+        metric=metric,
+    )
+    stat_true = float(held_out_losses[0])
+    stat_perm = np.asarray(held_out_losses[1:], dtype=np.float64)
+    low_idx, high_idx = _select_low_high_indices(stat_perm)
+    isodepth_batched = _extract_batched_isodepth(model, s_batched)
+    true_rerun_index, true_train_loss = _rerun_index_and_loss(model, 0)
+    lowest_rerun_index, lowest_train_loss = _rerun_index_and_loss(model, low_idx + 1)
+    highest_rerun_index, highest_train_loss = _rerun_index_and_loss(model, high_idx + 1)
+    runtime_sec = time.time() - start
+
+    return TestResult(
+        method_name="cross_validation",
+        metric=metric,
+        p_value=permutation_p_value(metric, stat_true, stat_perm),
+        stat_true=stat_true,
+        stat_perm=stat_perm,
+        runtime_sec=runtime_sec,
+        n_cells=dataset.n_cells,
+        n_genes=dataset.n_genes,
+        config={"test": config.__dict__.copy()},
+        artifacts={
+            "model": model,
+            "pred_true": np.asarray(predictions[0], dtype=np.float32),
+            "true_isodepth": np.asarray(isodepth_batched[0, :, 0], dtype=np.float32),
+            "rerun_summary": _rerun_summary(model),
+            "true_rerun_index": int(true_rerun_index),
+            "true_train_loss": float(true_train_loss),
+            "lowest_isodepth": np.asarray(isodepth_batched[low_idx + 1, :, 0], dtype=np.float32),
+            "lowest_S": np.asarray(s_batched[low_idx + 1].detach().cpu().numpy(), dtype=np.float32),
+            "lowest_stat": float(stat_perm[low_idx]),
+            "lowest_perm_index": low_idx,
+            "lowest_rerun_index": int(lowest_rerun_index),
+            "lowest_train_loss": float(lowest_train_loss),
+            "highest_isodepth": np.asarray(isodepth_batched[high_idx + 1, :, 0], dtype=np.float32),
+            "highest_S": np.asarray(s_batched[high_idx + 1].detach().cpu().numpy(), dtype=np.float32),
+            "highest_stat": float(stat_perm[high_idx]),
+            "highest_perm_index": high_idx,
+            "highest_rerun_index": int(highest_rerun_index),
+            "highest_train_loss": float(highest_train_loss),
+            "null_summary": {
+                "mean": float(np.mean(stat_perm)),
+                "std": float(np.std(stat_perm)),
+                "min": float(np.min(stat_perm)),
+                "max": float(np.max(stat_perm)),
+            },
+            "train_mask": np.asarray(train_mask_batched[0, :, 0], dtype=np.float32),
+            "test_mask": np.asarray(test_mask_batched[0, :, 0], dtype=np.float32),
+            "train_fraction": float(config.train_fraction),
+            "test_fraction": float(1.0 - config.train_fraction),
+            "train_size": int(np.sum(train_mask_batched[0, :, 0] > 0)),
+            "test_size": int(np.sum(test_mask_batched[0, :, 0] > 0)),
+            "observed_test_loss": float(stat_true),
         },
     ).validate()
 
@@ -566,6 +686,8 @@ def run_permutation_method(dataset: DatasetBundle, config: TestConfig) -> TestRe
         return run_subsampling_test(dataset, config, device=device)
     if config.method == "parallel_permutation":
         return run_parallel_permutation_method(dataset, config, device=device)
+    if config.method == "cross_validation":
+        return run_cross_validation_method(dataset, config, device=device)
     if config.method == "exact_existence":
         return run_exact_existence_method(dataset, config, device=device)
     if config.method == "full_retraining":

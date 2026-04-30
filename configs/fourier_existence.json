@@ -2,7 +2,7 @@
   "data": {
     "source": "synthetic",
     "mode": "fourier",
-    "n_cells": 900,
+    "n_cells": 2500,
     "n_genes": 20,
     "sigma": 0.0,
     "k_min": 1,
@@ -14,12 +14,14 @@
   "test": {
     "method": "parallel_permutation",
     "metric": "nll_gaussian_mse",
-    "n_perms": 50,
+    "n_perms": 100,
     "epochs": 1500,
+    "n_reruns": 10,
     "lr": 0.001,
     "patience": 50,
     "seed": 42,
     "device": "cuda",
+    "decoder": "linear",
     "batch_size": null,
     "verbose": true
   },

@@ -12,8 +12,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from experiments.configuration import build_run_config
 from experiments.fourier_kmax_existence_perturbation import (
     FourierKmaxExistencePerturbationStudySpec,
+    build_fourier_kmax_study_run_config,
     build_boxplot_rows,
     expand_fourier_kmax_study_conditions,
     extract_existence_record,
@@ -146,6 +148,106 @@ class TestFourierKmaxExistencePerturbationSpec(unittest.TestCase):
         self.assertEqual(conditions[0].test_kind, "existence")
         self.assertEqual(conditions[1].test_kind, "perturbation")
 
+    def test_cross_validation_existence_base_is_accepted_and_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            existence_base = tmp_path / "existence.json"
+            perturbation_base = tmp_path / "perturbation.json"
+            spec_path = tmp_path / "spec.json"
+
+            existence_base.write_text(
+                json.dumps(
+                    {
+                        "data": {
+                            "source": "synthetic",
+                            "mode": "fourier",
+                            "n_cells": 16,
+                            "n_genes": 2,
+                            "sigma": 0.1,
+                            "k_min": 1,
+                            "k_max": 2,
+                            "dependent_xy": False,
+                            "poly_degree": 1,
+                            "seed": 42,
+                        },
+                        "test": {
+                            "method": "cross_validation",
+                            "metric": "mse",
+                            "n_perms": 2,
+                            "train_fraction": 0.7,
+                            "epochs": 2,
+                            "lr": 0.01,
+                            "patience": 2,
+                            "seed": 42,
+                            "device": "cpu",
+                            "verbose": False,
+                        },
+                        "output": {"out_dir": str(tmp_path / "results"), "run_name": "existence"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            perturbation_base.write_text(
+                json.dumps(
+                    {
+                        "data": {
+                            "source": "synthetic",
+                            "mode": "fourier",
+                            "n_cells": 16,
+                            "n_genes": 2,
+                            "sigma": 0.1,
+                            "k_min": 1,
+                            "k_max": 2,
+                            "dependent_xy": False,
+                            "poly_degree": 1,
+                            "seed": 42,
+                        },
+                        "test": {
+                            "method": "perturbation_test",
+                            "metric": "mse",
+                            "n_perms": 2,
+                            "epochs": 2,
+                            "lr": 0.01,
+                            "patience": 2,
+                            "seed": 42,
+                            "device": "cpu",
+                            "delta": [0.01, 0.05],
+                            "verbose": False,
+                        },
+                        "output": {"out_dir": str(tmp_path / "results"), "run_name": "perturbation"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            spec_path.write_text(
+                json.dumps(
+                    {
+                        "experiment_name": "combined",
+                        "existence_base_config": str(existence_base),
+                        "perturbation_base_config": str(perturbation_base),
+                        "output_root": str(tmp_path / "study_outputs"),
+                        "k_min": 1,
+                        "k_max_values": [2],
+                        "seeds": [42],
+                        "delta_values": [0.01, 0.05],
+                        "reuse_result_roots": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            spec = load_fourier_kmax_existence_perturbation_spec(spec_path)
+            condition = expand_fourier_kmax_study_conditions(spec)[0]
+            run_config = build_fourier_kmax_study_run_config(
+                existence_base_run_config=build_run_config(str(spec.existence_base_config), {}),
+                perturbation_base_run_config=build_run_config(str(spec.perturbation_base_config), {}),
+                spec=spec,
+                condition=condition,
+            )
+
+        self.assertEqual(run_config.test.method, "cross_validation")
+        self.assertEqual(run_config.test.train_fraction, 0.7)
+
 
 class TestFourierKmaxExistencePerturbationHelpers(unittest.TestCase):
     def test_extract_perturbation_records_expands_each_delta(self) -> None:
@@ -210,6 +312,47 @@ class TestFourierKmaxExistencePerturbationHelpers(unittest.TestCase):
         self.assertEqual(rows[0]["test_label"], "existence")
         self.assertEqual(rows[1]["test_label"], "delta=0.01")
         self.assertEqual(rows[2]["test_label"], "delta=0.05")
+
+    def test_extract_existence_record_accepts_cross_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result_path = Path(tmpdir) / "existence_result.json"
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "method_name": "cross_validation",
+                        "metric": "mse",
+                        "p_value": 0.1,
+                        "stat_true": 1.5,
+                        "runtime_sec": 0.5,
+                        "config": {
+                            "data": {
+                                "source": "synthetic",
+                                "mode": "fourier",
+                                "sigma": 0.1,
+                                "seed": 42,
+                                "k_min": 1,
+                                "k_max": 5,
+                                "dependent_xy": False,
+                                "poly_degree": 1,
+                            },
+                            "output": {"run_name": "existence"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            record, warnings = extract_existence_record(
+                result_path,
+                expected_sigma=0.1,
+                expected_dependent_xy=False,
+                expected_poly_degree=1,
+            )
+
+        self.assertEqual(warnings, [])
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record["method_name"], "cross_validation")
 
     def test_summarize_perturbation_rows_groups_by_kmax_and_delta(self) -> None:
         summaries = summarize_perturbation_rows(

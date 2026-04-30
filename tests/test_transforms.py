@@ -32,6 +32,66 @@ class TestBasicTransforms(unittest.TestCase):
         self.assertEqual(filtered.shape, (3, 2))
         np.testing.assert_allclose(filtered, a[:, [0, 2]])
 
+    def test_log1p_runs_before_standardization(self) -> None:
+        counts = np.asarray(
+            [
+                [0.0, 3.0],
+                [1.0, 7.0],
+                [3.0, 15.0],
+            ],
+            dtype=np.float32,
+        )
+        transformed, metadata = apply_expression_transforms(
+            counts,
+            log1p=True,
+            standardize=True,
+            return_metadata=True,
+        )
+        expected_logged = np.log1p(counts)
+        expected = (expected_logged - expected_logged.mean(axis=0, keepdims=True)) / (
+            expected_logged.std(axis=0, keepdims=True) + 1e-8
+        )
+        np.testing.assert_allclose(transformed, expected.astype(np.float32), atol=1e-6)
+        self.assertTrue(metadata["log1p"])
+        self.assertTrue(metadata["standardize"])
+
+    def test_log1p_without_standardization_preserves_logged_scale(self) -> None:
+        counts = np.asarray(
+            [
+                [0.0, 1.0],
+                [3.0, 7.0],
+            ],
+            dtype=np.float32,
+        )
+        transformed = apply_expression_transforms(
+            counts,
+            log1p=True,
+            standardize=False,
+        )
+        np.testing.assert_allclose(transformed, np.log1p(counts).astype(np.float32), atol=1e-6)
+
+    def test_log1p_rejects_negative_values(self) -> None:
+        expression = np.asarray(
+            [
+                [1.0, -0.5],
+                [2.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        with self.assertRaises(ValueError):
+            apply_expression_transforms(expression, log1p=True, standardize=False)
+
+    def test_log1p_cannot_be_combined_with_q(self) -> None:
+        counts = np.asarray(
+            [
+                [1.0, 0.0],
+                [2.0, 3.0],
+            ],
+            dtype=np.float32,
+        )
+        with self.assertRaises(ValueError):
+            apply_expression_transforms(counts, log1p=True, q=1)
+
 
 @unittest.skipUnless(HAS_TORCH, "torch is required for Poisson low-rank transform tests")
 class TestPoissonLowRankTransform(unittest.TestCase):

@@ -8,7 +8,7 @@ from typing import Any, Mapping, Optional
 
 import numpy as np
 
-from data.schemas import RunConfig, run_config_from_mapping
+from data.schemas import RunConfig, SUPPORTED_EXISTENCE_METHODS, run_config_from_mapping
 from experiments.configuration import build_run_config
 from experiments.existence_sigma import load_result_payload, scan_result_json_paths, write_csv
 
@@ -85,8 +85,11 @@ def load_fourier_kmax_spec(path: str | Path) -> FourierKmaxStudySpec:
         raise ValueError("base_config must use data.source='synthetic'")
     if base_run_config.data.mode != "fourier":
         raise ValueError("base_config must use data.mode='fourier'")
-    if base_run_config.test.method != "parallel_permutation":
-        raise ValueError("base_config must use test.method='parallel_permutation'")
+    if base_run_config.test.method not in SUPPORTED_EXISTENCE_METHODS:
+        raise ValueError(
+            "base_config must use an existence test.method in "
+            f"{sorted(SUPPORTED_EXISTENCE_METHODS)}"
+        )
     return spec
 
 
@@ -159,7 +162,7 @@ def extract_kmax_record(
     payload = load_result_payload(path)
     warnings: list[dict[str, Any]] = []
 
-    if payload.get("method_name") != "parallel_permutation":
+    if payload.get("method_name") not in SUPPORTED_EXISTENCE_METHODS:
         return None, warnings
 
     config = payload.get("config", {})

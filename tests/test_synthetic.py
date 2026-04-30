@@ -13,7 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data.schemas import DataConfig, OutputConfig, RunConfig, TestResult
+from data.schemas import DataConfig, OutputConfig, RunConfig, TestConfig, TestResult
 from data.synthetic import SpatialDataSimulator, generate_synthetic_dataset
 from experiments.configuration import save_standardized_outputs
 
@@ -81,6 +81,8 @@ class TestSyntheticGeneration(unittest.TestCase):
         self.assertTrue(dataset.meta["dependent_xy"])
         self.assertEqual(dataset.meta["fourier_basis"], "interaction_xy")
         self.assertEqual(np.asarray(dataset.meta["synthetic_true_curve"]).shape, (16,))
+        self.assertEqual(dataset.meta["grid_height"], 4)
+        self.assertEqual(dataset.meta["grid_width"], 4)
 
     def test_fourier_dataset_can_use_independent_xy_basis(self) -> None:
         dataset = generate_synthetic_dataset(
@@ -109,6 +111,28 @@ class TestSyntheticGeneration(unittest.TestCase):
             np.asarray(dataset.meta["synthetic_true_curve"], dtype=np.float32),
             np.zeros(16, dtype=np.float32),
         )
+
+    def test_noise_rectangular_grid_matches_side_length(self) -> None:
+        dataset = generate_synthetic_dataset(
+            DataConfig(
+                source="synthetic",
+                mode="noise",
+                n_cells=24,
+                n_genes=3,
+                sigma=0.1,
+                seed=1,
+                side_length=6,
+            )
+        )
+        self.assertEqual(dataset.S.shape, (24, 2))
+        self.assertEqual(dataset.meta["grid_height"], 4)
+        self.assertEqual(dataset.meta["grid_width"], 6)
+        self.assertEqual(dataset.meta["side_length"], 6)
+        self.assertEqual(dataset.meta["other_side_length"], 4)
+        x_unique = len(np.unique(dataset.S[:, 0]))
+        y_unique = len(np.unique(dataset.S[:, 1]))
+        self.assertEqual(x_unique, 6)
+        self.assertEqual(y_unique, 4)
 
     def test_expression_manifold_respects_configured_polynomial_degree(self) -> None:
         simulator = SpatialDataSimulator(N=16, G=2, sigma=0.0, poly_degree=1)
@@ -243,6 +267,61 @@ class TestSyntheticGeneration(unittest.TestCase):
                 payload["artifacts"]["synthetic_true_curve_plot"],
                 str(result_path.parent / "synthetic_true_curve_test_true_curve.png"),
             )
+
+    def test_standardized_outputs_save_true_rerun_isodepth_grid_plot(self) -> None:
+        dataset = generate_synthetic_dataset(
+            DataConfig(source="synthetic", mode="radial", n_cells=16, n_genes=3, sigma=0.1, seed=7)
+        )
+
+        class _MockModel:
+            def __init__(self) -> None:
+                depth_a = np.linspace(0.0, 1.0, dataset.n_cells, dtype=np.float32)
+                depth_b = np.linspace(1.0, 0.0, dataset.n_cells, dtype=np.float32)
+                depth_c = np.sin(np.linspace(0.0, np.pi, dataset.n_cells, dtype=np.float32))
+                self.training_metadata = {
+                    "n_reruns": 3,
+                    "selection_loss": "training_reconstruction_loss",
+                    "best_train_loss_per_model": np.asarray([0.2], dtype=np.float64),
+                    "best_rerun_index_per_model": np.asarray([1], dtype=np.int64),
+                    "train_loss_per_rerun": np.asarray([[0.4, 0.2, 0.3]], dtype=np.float64),
+                    "true_rerun_isodepths": np.stack([depth_a, depth_b, depth_c], axis=0),
+                }
+
+        result = TestResult(
+            method_name="parallel_permutation",
+            metric="mse",
+            p_value=0.25,
+            stat_true=0.1,
+            stat_perm=np.asarray([0.2, 0.3], dtype=np.float64),
+            runtime_sec=0.01,
+            n_cells=dataset.n_cells,
+            n_genes=dataset.n_genes,
+            config={},
+            artifacts={
+                "model": _MockModel(),
+                "true_isodepth": np.linspace(0.0, 1.0, dataset.n_cells, dtype=np.float32),
+                "lowest_isodepth": np.linspace(0.0, 1.0, dataset.n_cells, dtype=np.float32),
+                "lowest_S": np.asarray(dataset.S, dtype=np.float32),
+                "lowest_stat": 0.2,
+                "highest_isodepth": np.linspace(1.0, 0.0, dataset.n_cells, dtype=np.float32),
+                "highest_S": np.asarray(dataset.S, dtype=np.float32),
+                "highest_stat": 0.3,
+                "null_summary": {"mean": 0.25},
+            },
+        ).validate()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_config = RunConfig(
+                data=DataConfig(source="synthetic", mode="radial", n_cells=16, n_genes=3, sigma=0.1, seed=7),
+                test=TestConfig(method="parallel_permutation", metric="mse", n_perms=2, n_reruns=3),
+                output=OutputConfig(out_dir=tmpdir, run_name="rerun_isodepth_test"),
+            ).validate()
+
+            payload, result_path = save_standardized_outputs(dataset, result, run_config)
+
+            expected_path = result_path.parent / "rerun_isodepth_test_true_rerun_isodepths.png"
+            self.assertTrue(expected_path.exists())
+            self.assertEqual(payload["artifacts"]["true_rerun_isodepth_grid_plot"], str(expected_path))
 
 
 if __name__ == "__main__":

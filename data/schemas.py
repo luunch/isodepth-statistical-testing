@@ -5,6 +5,8 @@ from typing import Any, Dict, Mapping, Optional
 
 import numpy as np
 
+from methods.architectures import SUPPORTED_DECODER_TYPES
+
 
 CANONICAL_METRICS = {
     "nll_gaussian_mse",
@@ -22,12 +24,18 @@ SUPPORTED_SYNTHETIC_MODES = {
 
 SUPPORTED_PERMUTATION_METHODS = {
     "parallel_permutation",
+    "cross_validation",
     "exact_existence",
     "full_retraining",
     "comparison_perturbation_test",
     "perturbation_test",
     "comparison_subsampling_test",
     "subsampling_test",
+}
+
+SUPPORTED_EXISTENCE_METHODS = {
+    "parallel_permutation",
+    "cross_validation",
 }
 
 
@@ -75,6 +83,7 @@ class DataConfig:
     layer: Optional[str] = None
     use_raw: bool = False
     min_cells_per_gene: int = 0
+    log1p: bool = False
     standardize: bool = True
     q: Optional[int] = None
     max_cells: Optional[int] = None
@@ -89,6 +98,7 @@ class DataConfig:
     k_max: Optional[int] = None
     dependent_xy: bool = True
     poly_degree: int = 3
+    side_length: Optional[int] = None
 
     def validate(self) -> "DataConfig":
         if self.source not in {"h5ad", "synthetic"}:
@@ -97,6 +107,8 @@ class DataConfig:
             raise ValueError("data.h5ad is required when data.source='h5ad'")
         if self.min_cells_per_gene < 0:
             raise ValueError("data.min_cells_per_gene must be >= 0")
+        if self.log1p and self.q is not None:
+            raise ValueError("data.log1p cannot be combined with data.q")
         if self.q is not None and self.q <= 0:
             raise ValueError("data.q must be > 0 when provided")
         if self.source == "synthetic" and self.q is not None:
@@ -109,6 +121,8 @@ class DataConfig:
             raise ValueError("data.k_max must be > 0 when provided")
         if self.poly_degree < 0:
             raise ValueError("data.poly_degree must be >= 0")
+        if self.side_length is not None and self.side_length <= 0:
+            raise ValueError("data.side_length must be > 0 when provided")
         if self.source != "synthetic" and self.k is not None:
             raise ValueError("data.k is only supported when data.source='synthetic'")
         if self.source != "synthetic" and self.k_min is not None:
@@ -119,6 +133,8 @@ class DataConfig:
             raise ValueError("data.dependent_xy is only supported when data.source='synthetic'")
         if self.source != "synthetic" and self.poly_degree != 3:
             raise ValueError("data.poly_degree is only supported when data.source='synthetic'")
+        if self.source != "synthetic" and self.side_length is not None:
+            raise ValueError("data.side_length is only supported when data.source='synthetic'")
         if self.max_cells is not None and self.max_cells <= 0:
             raise ValueError("data.max_cells must be > 0 when provided")
         if self.n_cells <= 0 or self.n_genes <= 0:
@@ -145,6 +161,13 @@ class DataConfig:
                     raise ValueError("data.k, data.k_min, and data.k_max are only supported when data.mode='fourier'")
                 if self.dependent_xy is not True:
                     raise ValueError("data.dependent_xy is only supported when data.mode='fourier'")
+            if self.mode != "noise" and self.side_length is not None:
+                raise ValueError("data.side_length is only supported when data.mode='noise'")
+            if self.mode == "noise" and self.side_length is not None:
+                if self.n_cells % int(self.side_length) != 0:
+                    raise ValueError(
+                        "When data.side_length is set for noise mode, data.n_cells must be divisible by data.side_length"
+                    )
         return self
 
 
@@ -153,6 +176,7 @@ class TestConfig:
     method: str = "parallel_permutation"
     metric: str = "nll_gaussian_mse"
     n_perms: int = 100
+    train_fraction: float = 0.8
     n_reruns: int = 30
     max_spatial_dims: int = 3
     alpha: float = 0.05
@@ -162,6 +186,7 @@ class TestConfig:
     patience: int = 50
     seed: int = 0
     device: str = "auto"
+    decoder: str = "linear"
     batch_size: Optional[int] = None
     sgd_batch_size: Optional[int] = None
     delta: list[float] = field(default_factory=lambda: [0.05])
@@ -180,6 +205,8 @@ class TestConfig:
             )
         if self.n_nulls <= 0:
             raise ValueError("test.n_nulls must be > 0")
+        if self.train_fraction <= 0.0 or self.train_fraction >= 1.0:
+            raise ValueError("test.train_fraction must lie strictly between 0 and 1")
         if self.n_reruns <= 0:
             raise ValueError("test.n_reruns must be > 0")
         if self.max_spatial_dims <= 0:
@@ -192,6 +219,10 @@ class TestConfig:
             raise ValueError("test.lr must be > 0")
         if self.patience <= 0:
             raise ValueError("test.patience must be > 0")
+        if self.decoder not in SUPPORTED_DECODER_TYPES:
+            raise ValueError(
+                f"Unsupported test.decoder '{self.decoder}'. Expected one of {sorted(SUPPORTED_DECODER_TYPES)}"
+            )
         if self.batch_size is not None and self.batch_size <= 0:
             raise ValueError("test.batch_size must be > 0 when provided")
         if self.sgd_batch_size is not None and self.sgd_batch_size < 0:
@@ -212,6 +243,7 @@ class TestConfig:
 
         if self.method in {
             "parallel_permutation",
+            "cross_validation",
             "exact_existence",
             "full_retraining",
             "comparison_perturbation_test",
@@ -221,6 +253,13 @@ class TestConfig:
         } and self.n_perms <= 0:
             raise ValueError("test.n_perms must be > 0")
 
+        if self.method == "cross_validation" and self.metric not in {
+            "nll_gaussian_mse",
+            "mse",
+        }:
+            raise ValueError(
+                "test.metric for cross_validation must be one of ['mse', 'nll_gaussian_mse']"
+            )
         if self.method == "comparison_subsampling_test" and self.metric not in {
             "nll_gaussian_mse",
             "mse",
@@ -348,6 +387,7 @@ __all__ = [
     "DatasetBundle",
     "OutputConfig",
     "RunConfig",
+    "SUPPORTED_EXISTENCE_METHODS",
     "SUPPORTED_SYNTHETIC_MODES",
     "SUPPORTED_PERMUTATION_METHODS",
     "TestConfig",

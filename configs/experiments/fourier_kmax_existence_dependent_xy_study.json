@@ -1,0 +1,9 @@
+{
+  "experiment_name": "fourier_kmax_existence_dependent_xy_study",
+  "base_config": "configs/fourier_existence_dependent_xy.json",
+  "output_root": "results/experiments/fourier_kmax_existence_dependent_xy_study",
+  "k_min": 1,
+  "k_max_values": [1, 2, 3, 4, 5, 10, 20, 30],
+  "seeds": [42, 43, 44, 45, 46, 47],
+  "reuse_result_roots": []
+}

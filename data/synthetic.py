@@ -18,18 +18,35 @@ class SpatialDataSimulator:
         sigma: float = 0.1,
         device: str = "cpu",
         poly_degree: int = 3,
+        side_length: Optional[int] = None,
     ):
-        self.N_requested = N
-        self.gridsize = int(np.sqrt(N))
-        self.N = self.gridsize**2
-        self.G = G
+        self.N_requested = int(N)
+        self.side_length = side_length
+        self.G = int(G)
         self.sigma = sigma
         self.device = device
         self.poly_degree = poly_degree
 
-        coords = np.linspace(0, 1, self.gridsize)
-        x, y = np.meshgrid(coords, coords)
-        self.S = np.stack([x.ravel(), y.ravel()], axis=1).astype(np.float32)
+        if side_length is None:
+            self.gridsize = int(np.sqrt(self.N_requested))
+            self.N = self.gridsize**2
+            self.grid_height = self.gridsize
+            self.grid_width = self.gridsize
+            coords = np.linspace(0, 1, self.gridsize)
+            x, y = np.meshgrid(coords, coords)
+            self.S = np.stack([x.ravel(), y.ravel()], axis=1).astype(np.float32)
+        else:
+            self.grid_width = int(side_length)
+            if self.grid_width <= 0:
+                raise ValueError("side_length must be positive when provided")
+            if self.N_requested % self.grid_width != 0:
+                raise ValueError("When data.side_length is set, data.n_cells must be divisible by data.side_length")
+            self.grid_height = self.N_requested // self.grid_width
+            self.N = self.N_requested
+            x_coords = np.linspace(0, 1, self.grid_width)
+            y_coords = np.linspace(0, 1, self.grid_height)
+            x, y = np.meshgrid(x_coords, y_coords)
+            self.S = np.stack([x.ravel(), y.ravel()], axis=1).astype(np.float32)
 
     def generate(
         self,
@@ -110,7 +127,7 @@ class SpatialDataSimulator:
         for i in range(min(n_genes, A.shape[1])):
             ax = plt.subplot(rows, cols, i + 1)
             im = ax.imshow(
-                A[:, i].reshape(self.gridsize, self.gridsize),
+                A[:, i].reshape(self.grid_height, self.grid_width),
                 cmap="magma",
                 extent=[0, 1, 0, 1],
                 origin="lower",
@@ -150,7 +167,7 @@ class SpatialDataSimulator:
         fig, axes = plt.subplots(2, P, figsize=(P * 4, 8))
         for p in range(P):
             ax_g = axes[0, p]
-            Z_g = gates[:, p].reshape(self.gridsize, self.gridsize)
+            Z_g = gates[:, p].reshape(self.grid_height, self.grid_width)
             im_g = ax_g.imshow(Z_g, cmap="Blues", extent=[0, 1, 0, 1], origin="lower", vmin=0, vmax=1)
             ax_g.set_title(f"Expert {p} Gate Weight")
             plt.colorbar(im_g, ax=ax_g)
@@ -158,7 +175,7 @@ class SpatialDataSimulator:
             ax_d = axes[1, p]
             d_learned = isodepths[p]
             d_norm = (d_learned - d_learned.min()) / (d_learned.max() - d_learned.min() + 1e-8)
-            Z_d = d_norm.reshape(self.gridsize, self.gridsize)
+            Z_d = d_norm.reshape(self.grid_height, self.grid_width)
             im_d = ax_d.imshow(Z_d, cmap="viridis", extent=[0, 1, 0, 1], origin="lower")
             ax_d.contour(Z_d, levels=8, colors="white", linewidths=1, extent=[0, 1, 0, 1], alpha=0.4)
             ax_d.set_title(f"Expert {p} Isodepth")
@@ -181,6 +198,7 @@ def generate_synthetic_dataset(config: DataConfig) -> DatasetBundle:
         sigma=config.sigma,
         device="cpu",
         poly_degree=config.poly_degree,
+        side_length=config.side_length,
     )
     s, a, true_curve = simulator.generate(
         mode=config.mode,
@@ -199,10 +217,15 @@ def generate_synthetic_dataset(config: DataConfig) -> DatasetBundle:
         "n_cells_generated": int(s.shape[0]),
         "n_genes": int(a.shape[1]),
         "synthetic_true_curve": np.asarray(true_curve, dtype=np.float32),
+        "grid_height": int(simulator.grid_height),
+        "grid_width": int(simulator.grid_width),
     }
     if config.mode == "fourier":
         meta["k_min"] = int(config.k_min)
         meta["k_max"] = int(config.k_max)
         meta["dependent_xy"] = bool(config.dependent_xy)
         meta["fourier_basis"] = "interaction_xy" if config.dependent_xy else "independent_xy"
+    if config.side_length is not None:
+        meta["side_length"] = int(config.side_length)
+        meta["other_side_length"] = int(s.shape[0] // config.side_length)
     return DatasetBundle(S=s, A=a, meta=meta).validate()

@@ -1,7 +1,7 @@
 {
   "data": {
     "source": "synthetic",
-    "mode": "noise",
+    "mode": "radial",
     "n_cells": 900,
     "n_genes": 20,
     "sigma": 0.1,
@@ -9,10 +9,13 @@
     "seed": 42
   },
   "test": {
-    "method": "parallel_permutation",
+    "method": "cross_validation",
     "metric": "nll_gaussian_mse",
     "n_perms": 50,
+    "train_fraction": 0.8,
     "epochs": 500,
+    "n_reruns": 10,
+    "sgd_batch_size": 0,
     "lr": 0.001,
     "patience": 50,
     "seed": 42,
@@ -23,7 +26,7 @@
   },
   "output": {
     "out_dir": "results",
-    "run_name": "noise_existence",
+    "run_name": "radial_cross_validation_existence",
     "save_preds": false,
     "save_perm_stats": true
   }

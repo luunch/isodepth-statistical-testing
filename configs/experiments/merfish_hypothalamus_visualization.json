@@ -1,0 +1,23 @@
+{
+  "data": {
+    "source": "h5ad",
+    "h5ad": "data/h5ad/merfish_hypothalamus.h5ad",
+    "spatial_key": "spatial",
+    "obs_x_col": null,
+    "obs_y_col": null,
+    "layer": null,
+    "use_raw": false,
+    "min_cells_per_gene": 1,
+    "standardize": false,
+    "log1p": true,
+    "q": null,
+    "max_cells": null,
+    "seed": 0
+  },
+  "visualization": {
+    "n_perms": 5,
+    "seed": 42,
+    "genes": ["Syt2", "Ano3", "Etv1", "Man1a", "Htr2c"],
+    "out_dir": "results/merfishhypothalamus_visualization"
+  }
+}

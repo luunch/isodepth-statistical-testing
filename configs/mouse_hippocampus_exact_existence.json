@@ -24,6 +24,7 @@
     "patience": 50,
     "seed": 42,
     "device": "cuda",
+    "decoder": "linear",
     "batch_size": null,
     "verbose": true
   },

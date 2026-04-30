@@ -23,6 +23,14 @@ class TestDataSchema(unittest.TestCase):
         config = DataConfig(source="h5ad", h5ad="data/example.h5ad", q=2)
         self.assertIs(config.validate(), config)
 
+    def test_log1p_is_valid_for_h5ad(self) -> None:
+        config = DataConfig(source="h5ad", h5ad="data/example.h5ad", log1p=True)
+        self.assertIs(config.validate(), config)
+
+    def test_log1p_cannot_be_combined_with_q(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(source="h5ad", h5ad="data/example.h5ad", log1p=True, q=2).validate()
+
     def test_non_positive_q_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             DataConfig(source="synthetic", n_cells=8, n_genes=3, q=0).validate()
@@ -83,6 +91,22 @@ class TestDataSchema(unittest.TestCase):
                 dependent_xy=False,
             ).validate()
 
+    def test_side_length_is_valid_for_noise_mode(self) -> None:
+        config = DataConfig(source="synthetic", mode="noise", n_cells=24, n_genes=3, side_length=6)
+        self.assertIs(config.validate(), config)
+
+    def test_side_length_requires_divisible_n_cells_for_noise(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(source="synthetic", mode="noise", n_cells=25, n_genes=3, side_length=6).validate()
+
+    def test_side_length_is_rejected_for_non_noise_modes(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(source="synthetic", mode="radial", n_cells=16, n_genes=3, side_length=4).validate()
+
+    def test_side_length_is_rejected_for_h5ad_configs(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(source="h5ad", h5ad="data/example.h5ad", side_length=4).validate()
+
     def test_frequency_bounds_are_rejected_for_h5ad_configs(self) -> None:
         with self.assertRaises(ValueError):
             DataConfig(source="h5ad", h5ad="data/example.h5ad", k_min=1, k_max=2).validate()
@@ -100,6 +124,31 @@ class TestDataSchema(unittest.TestCase):
 class TestPerturbationSchema(unittest.TestCase):
     def test_n_reruns_defaults_to_thirty(self) -> None:
         self.assertEqual(TestConfig().n_reruns, 30)
+
+    def test_decoder_defaults_to_linear(self) -> None:
+        self.assertEqual(TestConfig().decoder, "linear")
+
+    def test_invalid_decoder_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            TestConfig(decoder="bad").validate()
+
+    def test_cli_decoder_override_is_parsed(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(["--decoder", "nn"])
+        overrides = _build_cli_overrides(args)
+        self.assertEqual(overrides["test"]["decoder"], "nn")
+
+    def test_cli_log1p_override_is_parsed(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(["--log1p"])
+        overrides = _build_cli_overrides(args)
+        self.assertTrue(overrides["data"]["log1p"])
+
+    def test_cli_no_log1p_override_is_parsed(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(["--no-log1p"])
+        overrides = _build_cli_overrides(args)
+        self.assertFalse(overrides["data"]["log1p"])
 
     def test_non_positive_n_reruns_is_rejected(self) -> None:
         with self.assertRaises(ValueError):

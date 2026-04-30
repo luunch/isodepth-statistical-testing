@@ -1,0 +1,38 @@
+{
+  "data": {
+    "source": "h5ad",
+    "h5ad": "data/h5ad/merfish_hypothalamus.h5ad",
+    "spatial_key": "spatial",
+    "obs_x_col": null,
+    "obs_y_col": null,
+    "layer": null,
+    "use_raw": false,
+    "min_cells_per_gene": 1,
+    "standardize": true,
+    "log1p": true,
+    "max_cells": null,
+    "seed": 42
+  },
+  "test": {
+    "metric": "mse",
+    "epochs": 5000,
+    "lr": 0.001,
+    "patience": 75,
+    "seed": 42,
+    "device": "cuda",
+    "decoder": "nn",
+    "verbose": true,
+    "n_reruns": 1
+  },
+  "experiment": {
+    "base_epochs": 5000,
+    "batch_sizes": [
+      512,
+      256
+    ]
+  },
+  "output": {
+    "out_dir": "results",
+    "run_name": "merfish_hypothalamus_batchsize_comparison"
+  }
+}

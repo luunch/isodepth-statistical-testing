@@ -8,7 +8,7 @@ from typing import Any, Mapping, Optional
 
 import numpy as np
 
-from data.schemas import RunConfig, run_config_from_mapping
+from data.schemas import RunConfig, SUPPORTED_EXISTENCE_METHODS, run_config_from_mapping
 from experiments.configuration import build_run_config
 from experiments.existence_sigma import load_result_payload, scan_result_json_paths, write_csv
 from methods.metrics import compute_metric
@@ -84,8 +84,11 @@ def load_real_data_existence_consistency_spec(path: str | Path) -> RealDataExist
     base_run_config = build_run_config(str(spec.base_config), {})
     if base_run_config.data.source != "h5ad":
         raise ValueError("base_config must use data.source='h5ad'")
-    if base_run_config.test.method != "parallel_permutation":
-        raise ValueError("base_config must use test.method='parallel_permutation'")
+    if base_run_config.test.method not in SUPPORTED_EXISTENCE_METHODS:
+        raise ValueError(
+            "base_config must use an existence test.method in "
+            f"{sorted(SUPPORTED_EXISTENCE_METHODS)}"
+        )
     return spec
 
 
@@ -161,7 +164,7 @@ def extract_repeat_payload(
             }
         ]
 
-    if payload.get("method_name") != "parallel_permutation":
+    if payload.get("method_name") not in SUPPORTED_EXISTENCE_METHODS:
         warnings.append(
             {
                 "warning_type": "unexpected_method",

@@ -8,7 +8,7 @@ from typing import Any, Mapping, Optional
 
 import numpy as np
 
-from data.schemas import RunConfig, run_config_from_mapping
+from data.schemas import RunConfig, SUPPORTED_EXISTENCE_METHODS, run_config_from_mapping
 from experiments.configuration import build_run_config
 from experiments.existence_sigma import load_result_payload, scan_result_json_paths, write_csv
 
@@ -103,8 +103,11 @@ def load_fourier_kmax_existence_perturbation_spec(
             raise ValueError("base configs must use data.source='synthetic'")
         if run_config.data.mode != "fourier":
             raise ValueError("base configs must use data.mode='fourier'")
-    if existence_base.test.method != "parallel_permutation":
-        raise ValueError("existence_base_config must use test.method='parallel_permutation'")
+    if existence_base.test.method not in SUPPORTED_EXISTENCE_METHODS:
+        raise ValueError(
+            "existence_base_config must use an existence test.method in "
+            f"{sorted(SUPPORTED_EXISTENCE_METHODS)}"
+        )
     if perturbation_base.test.method != "perturbation_test":
         raise ValueError("perturbation_base_config must use test.method='perturbation_test'")
     return spec
@@ -261,7 +264,7 @@ def extract_existence_record(
 ) -> tuple[Optional[dict[str, object]], list[dict[str, object]]]:
     path = Path(result_json_path).resolve()
     payload = load_result_payload(path)
-    if payload.get("method_name") != "parallel_permutation":
+    if payload.get("method_name") not in SUPPORTED_EXISTENCE_METHODS:
         return None, []
 
     common, warnings = _extract_common_fourier_metadata(

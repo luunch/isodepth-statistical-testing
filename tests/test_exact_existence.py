@@ -46,6 +46,10 @@ class TestExactExistenceSchema(unittest.TestCase):
         with self.assertRaises(ValueError):
             TestConfig(method="exact_existence", metric="spearman_corr_mean").validate()
 
+    def test_exact_existence_rejects_invalid_decoder(self) -> None:
+        with self.assertRaises(ValueError):
+            TestConfig(method="exact_existence", decoder="bad").validate()
+
 
 class TestLatentDimensionTraining(unittest.TestCase):
     def setUp(self) -> None:
@@ -64,37 +68,55 @@ class TestLatentDimensionTraining(unittest.TestCase):
 
     def test_train_isodepth_model_supports_multiple_latent_dims(self) -> None:
         device = resolve_device("cpu")
-        for latent_dim in (1, 2, 3):
-            model, predictions = train_isodepth_model(
-                self.dataset.S,
-                self.dataset.A,
-                self.config,
-                device=device,
-                latent_dim=latent_dim,
-            )
-            self.assertEqual(predictions.shape, self.dataset.A.shape)
-            self.assertEqual(int(getattr(model, "latent_dim")), latent_dim)
-            self.assertIsInstance(model.decoder, nn.Linear)
-            self.assertEqual(model.decoder.in_features, latent_dim)
-            self.assertEqual(model.decoder.out_features, self.dataset.n_genes)
+        for decoder in ("linear", "nn"):
+            config = TestConfig(**{**self.config.__dict__, "decoder": decoder})
+            for latent_dim in (1, 2, 3):
+                model, predictions = train_isodepth_model(
+                    self.dataset.S,
+                    self.dataset.A,
+                    config,
+                    device=device,
+                    latent_dim=latent_dim,
+                )
+                self.assertEqual(predictions.shape, self.dataset.A.shape)
+                self.assertEqual(int(getattr(model, "latent_dim")), latent_dim)
+                self.assertEqual(getattr(model, "decoder_type"), decoder)
+                if decoder == "linear":
+                    self.assertIsInstance(model.decoder, nn.Linear)
+                    self.assertEqual(model.decoder.in_features, latent_dim)
+                    self.assertEqual(model.decoder.out_features, self.dataset.n_genes)
+                else:
+                    self.assertIsInstance(model.decoder, nn.Sequential)
+                    self.assertEqual(model.decoder[0].in_features, latent_dim)
+                    self.assertEqual(model.decoder[-1].out_features, self.dataset.n_genes)
 
     def test_train_batched_isodepth_model_supports_multiple_latent_dims(self) -> None:
         s_batched = np.stack([self.dataset.S, self.dataset.S[::-1]], axis=0)
         device = resolve_device("cpu")
-        for latent_dim in (1, 2, 3):
-            model, predictions = train_batched_isodepth_model(
-                s_batched,
-                self.dataset.A,
-                self.config,
-                device=device,
-                latent_dim=latent_dim,
-            )
-            self.assertEqual(predictions.shape, (2, self.dataset.n_cells, self.dataset.n_genes))
-            self.assertIsInstance(model.decoder, ParallelLinear)
-            self.assertEqual(model.decoder.weight.shape, (2, self.dataset.n_genes, latent_dim))
-            with torch.no_grad():
-                encoded = model.encoder(torch.tensor(s_batched, dtype=torch.float32, device=device))
-            self.assertEqual(tuple(encoded.shape), (2, self.dataset.n_cells, latent_dim))
+        for decoder in ("linear", "nn"):
+            config = TestConfig(**{**self.config.__dict__, "decoder": decoder})
+            for latent_dim in (1, 2, 3):
+                model, predictions = train_batched_isodepth_model(
+                    s_batched,
+                    self.dataset.A,
+                    config,
+                    device=device,
+                    latent_dim=latent_dim,
+                )
+                self.assertEqual(predictions.shape, (2, self.dataset.n_cells, self.dataset.n_genes))
+                self.assertEqual(getattr(model, "decoder_type"), decoder)
+                if decoder == "linear":
+                    self.assertIsInstance(model.decoder, ParallelLinear)
+                    self.assertEqual(model.decoder.weight.shape, (2, self.dataset.n_genes, latent_dim))
+                else:
+                    self.assertIsInstance(model.decoder, nn.Sequential)
+                    self.assertIsInstance(model.decoder[0], ParallelLinear)
+                    self.assertEqual(model.decoder[0].weight.shape, (2, 20, latent_dim))
+                    self.assertIsInstance(model.decoder[-1], ParallelLinear)
+                    self.assertEqual(model.decoder[-1].weight.shape, (2, self.dataset.n_genes, 20))
+                with torch.no_grad():
+                    encoded = model.encoder(torch.tensor(s_batched, dtype=torch.float32, device=device))
+                self.assertEqual(tuple(encoded.shape), (2, self.dataset.n_cells, latent_dim))
 
     def test_trainers_reject_zero_latent_dim(self) -> None:
         device = resolve_device("cpu")
@@ -215,6 +237,33 @@ class TestLatentDimensionTraining(unittest.TestCase):
         self.assertEqual(recorded_slot_counts[0], 6)
         self.assertEqual(predictions.shape, (2, self.dataset.n_cells, self.dataset.n_genes))
         self.assertEqual(metadata["train_loss_per_rerun"].shape, (2, 3))
+
+    def test_batched_trainer_preserves_true_rerun_isodepths_in_metadata(self) -> None:
+        s_batched = np.stack([self.dataset.S, self.dataset.S[::-1]], axis=0)
+        config = TestConfig(
+            method="parallel_permutation",
+            metric="mse",
+            n_perms=2,
+            n_reruns=3,
+            epochs=2,
+            patience=2,
+            verbose=False,
+            device="cpu",
+        )
+
+        model, _ = train_batched_isodepth_model(
+            s_batched,
+            self.dataset.A,
+            config,
+            device=resolve_device("cpu"),
+            latent_dim=2,
+        )
+
+        metadata = get_training_metadata(model)
+        true_rerun_isodepths = metadata["true_rerun_isodepths"]
+        self.assertIsNotNone(true_rerun_isodepths)
+        self.assertEqual(true_rerun_isodepths.shape, (3, self.dataset.n_cells, 2))
+        self.assertTrue(np.all(np.isfinite(true_rerun_isodepths)))
 
     def test_n_reruns_one_returns_zero_winner_indices(self) -> None:
         s_batched = np.stack([self.dataset.S, self.dataset.S[::-1]], axis=0)

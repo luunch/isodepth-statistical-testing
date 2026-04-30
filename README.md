@@ -82,6 +82,7 @@ Create a config file like this and save it as `configs/my_run.json`:
     "n_perms": 100,
     "n_nulls": 50,
     "epochs": 5000,
+    "decoder": "linear",
     "lr": 0.001,
     "patience": 50,
     "seed": 0,
@@ -103,9 +104,12 @@ Create a config file like this and save it as `configs/my_run.json`:
 
 There are ready-made perturbation examples at [noise_perturbation.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/noise_perturbation.json), [noise_comparison_perturbation.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/noise_comparison_perturbation.json), [radial_comparison_perturbation.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/radial_comparison_perturbation.json), and [mouse_hippocampus_comparison_perturbation.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/mouse_hippocampus_comparison_perturbation.json).
 
+A held-out existence example is available at [mouse_hippocampus_cross_validation_existence.json](/weka/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/mouse_hippocampus_cross_validation_existence.json).
+
 Supported `test.method` values:
 
 - `parallel_permutation`
+- `cross_validation`
 - `exact_existence`
 - `full_retraining`
 - `comparison_perturbation_test`
@@ -172,14 +176,21 @@ If `--use-raw` is set, the loader uses `adata.raw.X`.
 If neither is set, the loader uses `adata.X`.
 
 - `--min-cells-per-gene`: drop genes expressed in fewer than this many cells before running the test.
-- `--standardize`: z-score each gene after loading/filtering.
-- `--no-standardize`: leave expression values on their original scale.
+- `--log1p`: apply `log(1 + x)` after loading/filtering and before any standardization.
+- `--no-log1p`: leave expression values on their original scale before standardization.
+- `--standardize`: z-score each gene after loading/filtering and any optional `log1p`.
+- `--no-standardize`: skip z-scoring and keep the post-transform feature scale.
 - `--q`: if provided, replace the expression matrix with a Poisson low-rank latent embedding of width `2*q`.
+
+`--log1p` details:
+This controls the same `data.log1p` field from the config.
+The default pipeline behavior is log transform disabled.
+`--log1p` cannot be combined with `--q`, because the Poisson low-rank transform expects counts.
 
 `--standardize` details:
 This controls the same `data.standardize` field from the config.
 The default pipeline behavior is standardization enabled.
-Use `--no-standardize` only if you intentionally want raw-scale expression values.
+Use `--no-standardize` only if you intentionally want the post-filter/post-`log1p` feature scale without z-scoring.
 
 `--q` details:
 The loader first filters genes, then fits a Poisson low-rank factorization with `log(lambda) = L R^T` and returns the top `2*q` latent dimensions from `L`.
@@ -195,9 +206,10 @@ This option is intended for `h5ad` count-valued inputs and is not supported for 
 - `--k`: legacy shorthand for the Fourier frequency band when `--mode fourier`. It maps to `k_min = 1` and `k_max = k`, and the generator samples a coupled 2D Fourier basis over terms of the form `cos(2π(k1 x + k2 y))` and `sin(2π(k1 x + k2 y))`.
 - `data.dependent_xy`: Fourier-only boolean flag. `true` uses the coupled basis `k1 x + k2 y`; `false` uses independent `x`-only and `y`-only sine/cosine terms.
 
-- `--method`: test method. Supported values are `parallel_permutation`, `exact_existence`, `full_retraining`, `comparison_perturbation_test`, `perturbation_test`, `comparison_subsampling_test`, `subsampling_test`.
+- `--method`: test method. Supported values are `parallel_permutation`, `cross_validation`, `exact_existence`, `full_retraining`, `comparison_perturbation_test`, `perturbation_test`, `comparison_subsampling_test`, `subsampling_test`.
 - `--metric`: one of `nll_gaussian_mse`, `mse`, `pearson_corr_mean`, `spearman_corr_mean`.
 - `--n-perms`: number of perturbations for `comparison_perturbation_test` and `perturbation_test`, number of random subset draws per fraction for `subsampling_test` and `comparison_subsampling_test`, or number of permutations for existence-style methods.
+- `--train-fraction`: train-set fraction for `cross_validation`. The remaining cells define the held-out test statistic.
 - `--n-reruns`: number of parallel reruns trained per dataset instance inside the batched GASTON model. The minimum training reconstruction loss is selected independently for the observed dataset and every transformed/null dataset. Default is `30`.
 - `--max-spatial-dims`: maximum latent spatial dimension tested by `exact_existence`.
 - `--alpha`: one-sided permutation significance threshold for `exact_existence`. Default is `0.05`.
@@ -206,6 +218,7 @@ This option is intended for `h5ad` count-valued inputs and is not supported for 
 - `--lr`: learning rate.
 - `--patience`: early stopping patience.
 - `--device`: compute device such as `cpu`, `cuda`, `mps`, or `auto`.
+- `--decoder`: decoder architecture for isodepth models. Supported values are `linear` and `nn`.
 - `--batch-size`: optional grouping cap for `comparison_perturbation_test` null datasets. Each grouped null batch packs up to `batch_size * (n_perms + 1)` models into one parallel trainer call. Leave unset to batch all null datasets together.
 - `--sgd-batch-size`: optional minibatch size for stochastic gradient descent over cells during model fitting. Leave unset or set to `0` to keep the current full-batch training behavior.
 - `--delta`: comma-separated perturbation scales for perturbation methods. Noise is sampled as a fraction of each spatial axis range.
@@ -271,6 +284,7 @@ Key config fields for `exact_existence`:
 - `test.max_spatial_dims`
 - `test.alpha`
 - `test.n_perms`
+- `test.decoder`, with `linear` or `nn`
 - `test.n_reruns`
 - `test.metric`, restricted to `mse` or `nll_gaussian_mse`
 
@@ -438,13 +452,16 @@ The Fourier `k_max` sweep uses:
 - `python -m experiments.fourier_kmax_sweep --spec configs/experiments/fourier_kmax_study.json` to launch the study
 - `python -m experiments.fourier_kmax_analysis --spec configs/experiments/fourier_kmax_study.json` to aggregate saved result JSONs into `per_run_results.csv`, `summary_by_kmax.csv`, and `pvalue_vs_kmax.png`
 
-The combined Fourier existence + perturbation study uses:
+The Fourier existence-only `k_max` studies use:
 
 - [configs/fourier_existence.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/fourier_existence.json) as the existence base config
-- [configs/fourier_perturbation.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/fourier_perturbation.json) as the perturbation base config
-- [configs/experiments/fourier_kmax_existence_perturbation_study.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/experiments/fourier_kmax_existence_perturbation_study.json) as the sweep spec
-- `python -m experiments.fourier_kmax_existence_perturbation_sweep --spec configs/experiments/fourier_kmax_existence_perturbation_study.json` to launch the study
-- `python -m experiments.fourier_kmax_existence_perturbation_analysis --spec configs/experiments/fourier_kmax_existence_perturbation_study.json` to aggregate saved result JSONs into separate existence/perturbation CSVs, line plots, and one box plot per `k_max`
+- [configs/fourier_existence_dependent_xy.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/fourier_existence_dependent_xy.json) as the dependent-`xy` existence base config
+- [configs/experiments/fourier_kmax_existence_study.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/experiments/fourier_kmax_existence_study.json) as the independent-`xy` sweep spec
+- [configs/experiments/fourier_kmax_existence_dependent_xy_study.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/experiments/fourier_kmax_existence_dependent_xy_study.json) as the dependent-`xy` sweep spec
+- `python -m experiments.fourier_kmax_sweep --spec configs/experiments/fourier_kmax_existence_study.json` to launch the independent-`xy` study
+- `python -m experiments.fourier_kmax_analysis --spec configs/experiments/fourier_kmax_existence_study.json` to analyze the independent-`xy` study
+- `python -m experiments.fourier_kmax_sweep --spec configs/experiments/fourier_kmax_existence_dependent_xy_study.json` to launch the dependent-`xy` study
+- `python -m experiments.fourier_kmax_analysis --spec configs/experiments/fourier_kmax_existence_dependent_xy_study.json` to analyze the dependent-`xy` study
 
 The real-data existence consistency study uses:
 

@@ -1,22 +1,22 @@
 {
   "data": {
     "source": "h5ad",
-    "h5ad": "data/h5ad/hippocampal_pyramidal_ca3.h5ad",
+    "h5ad": "data/h5ad/merfish_hypothalamus_5genes.h5ad",
     "spatial_key": "spatial",
     "obs_x_col": null,
     "obs_y_col": null,
+    "layer": null,
     "use_raw": false,
     "min_cells_per_gene": 1,
     "standardize": true,
-    "log1p": false,
+    "log1p": true,
     "max_cells": null,
-    "seed": 0,
-    "q": 10
+    "seed": 0
   },
   "test": {
     "method": "parallel_permutation",
     "metric": "nll_gaussian_mse",
-    "n_perms": 50,
+    "n_perms": 5,
     "epochs": 5000,
     "n_reruns": 10,
     "sgd_batch_size": 0,
@@ -29,8 +29,7 @@
   },
   "output": {
     "out_dir": "results",
-    "run_name": "hippocampus_ca3_existence",
+    "run_name": "mouse_hypothalamus_5genes_existence",
     "save_preds": false,
     "save_perm_stats": true
-  }
-}
+  }}

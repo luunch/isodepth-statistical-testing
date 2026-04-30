@@ -15,9 +15,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from data.schemas import DatasetBundle
+from experiments.configuration import build_run_config
 from experiments.existence_sigma import (
     ExistenceSigmaStudySpec,
     SweepCondition,
+    build_condition_run_config,
     expand_existence_sigma_conditions,
     extract_result_record,
     load_existence_sigma_spec,
@@ -119,6 +121,70 @@ class TestExistenceSigmaSpec(unittest.TestCase):
             "study__truth-null__mode-fourier__sigma-0__seed-000__k-02__null-matched_shuffled",
         )
 
+    def test_cross_validation_base_config_is_accepted_and_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            base_config = tmp_path / "base.json"
+            spec_path = tmp_path / "spec.json"
+            base_config.write_text(
+                json.dumps(
+                    {
+                        "data": {
+                            "source": "synthetic",
+                            "mode": "radial",
+                            "n_cells": 16,
+                            "n_genes": 2,
+                            "sigma": 0.1,
+                            "seed": 0,
+                        },
+                        "test": {
+                            "method": "cross_validation",
+                            "metric": "mse",
+                            "n_perms": 2,
+                            "train_fraction": 0.75,
+                            "epochs": 2,
+                            "lr": 0.01,
+                            "patience": 2,
+                            "seed": 0,
+                            "device": "cpu",
+                            "verbose": False,
+                        },
+                        "output": {
+                            "out_dir": str(tmp_path / "results"),
+                            "run_name": "base",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            spec_path.write_text(
+                json.dumps(
+                    {
+                        "experiment_name": "study",
+                        "base_config": str(base_config),
+                        "output_root": str(tmp_path / "study_outputs"),
+                        "alpha": 0.05,
+                        "sigma_values": [0.0],
+                        "seeds": [3],
+                        "include_radial": True,
+                        "fourier_k_values": [],
+                        "null_family": "matched_shuffled",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            spec = load_existence_sigma_spec(spec_path)
+            condition = expand_existence_sigma_conditions(spec)[0]
+            run_config = build_condition_run_config(
+                base_run_config=build_run_config(str(spec.base_config), {}),
+                spec=spec,
+                condition=condition,
+            )
+
+        self.assertEqual(run_config.test.method, "cross_validation")
+        self.assertEqual(run_config.test.train_fraction, 0.75)
+
 
 class TestExistenceSigmaHelpers(unittest.TestCase):
     def test_matched_shuffle_is_reproducible_and_preserves_values(self) -> None:
@@ -185,6 +251,45 @@ class TestExistenceSigmaHelpers(unittest.TestCase):
             self.assertEqual(record["mode"], "noise")
             self.assertEqual(len(warnings), 1)
             self.assertEqual(warnings[0]["warning_type"], "run_name_mode_mismatch")
+
+    def test_extract_result_record_accepts_cross_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result_path = Path(tmpdir) / "radial_cross_validation_result.json"
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "method_name": "cross_validation",
+                        "metric": "mse",
+                        "p_value": 0.2,
+                        "stat_true": 1.0,
+                        "runtime_sec": 0.5,
+                        "config": {
+                            "data": {
+                                "source": "synthetic",
+                                "mode": "radial",
+                                "sigma": 0.1,
+                                "seed": 3,
+                            },
+                            "output": {"run_name": "radial_cross_validation"},
+                        },
+                        "artifacts": {
+                            "dataset_meta": {
+                                "source": "synthetic",
+                                "mode": "radial",
+                                "sigma": 0.1,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            record, warnings = extract_result_record(result_path)
+
+        self.assertEqual(warnings, [])
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record["method_name"], "cross_validation")
 
     def test_summary_computes_rates(self) -> None:
         rows = [

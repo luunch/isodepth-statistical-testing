@@ -1,22 +1,23 @@
 {
   "data": {
     "source": "h5ad",
-    "h5ad": "data/h5ad/hippocampal_pyramidal_ca3.h5ad",
+    "h5ad": "data/h5ad/hippocampal_pyramidal.h5ad",
     "spatial_key": "spatial",
     "obs_x_col": null,
     "obs_y_col": null,
+    "layer": null,
     "use_raw": false,
     "min_cells_per_gene": 1,
     "standardize": true,
-    "log1p": false,
     "max_cells": null,
-    "seed": 0,
-    "q": 10
+    "q": 10,
+    "seed": 0
   },
   "test": {
-    "method": "parallel_permutation",
+    "method": "cross_validation",
     "metric": "nll_gaussian_mse",
-    "n_perms": 50,
+    "n_perms": 100,
+    "train_fraction": 0.8,
     "epochs": 5000,
     "n_reruns": 10,
     "sgd_batch_size": 0,
@@ -24,12 +25,12 @@
     "patience": 50,
     "seed": 42,
     "device": "cuda",
-    "decoder": "nn",
+    "batch_size": null,
     "verbose": true
   },
   "output": {
     "out_dir": "results",
-    "run_name": "hippocampus_ca3_existence",
+    "run_name": "mouse_hippocampus_cross_validation_existence",
     "save_preds": false,
     "save_perm_stats": true
   }

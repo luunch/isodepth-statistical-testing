@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping, Optional
 
 import numpy as np
 
-from data.schemas import DatasetBundle, RunConfig, run_config_from_mapping
+from data.schemas import DatasetBundle, RunConfig, SUPPORTED_EXISTENCE_METHODS, run_config_from_mapping
 from experiments.configuration import build_run_config
 
 
@@ -133,8 +133,11 @@ def load_existence_sigma_spec(path: str | Path) -> ExistenceSigmaStudySpec:
     base_run_config = build_run_config(str(spec.base_config), {})
     if base_run_config.data.source != "synthetic":
         raise ValueError("base_config must use data.source='synthetic'")
-    if base_run_config.test.method != "parallel_permutation":
-        raise ValueError("base_config must use test.method='parallel_permutation'")
+    if base_run_config.test.method not in SUPPORTED_EXISTENCE_METHODS:
+        raise ValueError(
+            "base_config must use an existence test.method in "
+            f"{sorted(SUPPORTED_EXISTENCE_METHODS)}"
+        )
     return spec
 
 
@@ -199,7 +202,6 @@ def build_condition_run_config(
     else:
         mapping["data"].pop("k_min", None)
         mapping["data"].pop("k_max", None)
-    mapping["test"]["method"] = "parallel_permutation"
     mapping["test"]["seed"] = int(condition.seed)
     mapping["output"]["out_dir"] = str(spec.output_root / "runs")
     mapping["output"]["run_name"] = condition.run_name
@@ -307,7 +309,7 @@ def extract_result_record(
     payload = load_result_payload(path)
     warnings: list[dict[str, Any]] = []
 
-    if payload.get("method_name") != "parallel_permutation":
+    if payload.get("method_name") not in SUPPORTED_EXISTENCE_METHODS:
         return None, warnings
 
     config = payload.get("config", {})

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any, Optional
 
@@ -11,6 +12,93 @@ from tqdm import tqdm
 
 from data.schemas import TestConfig
 from methods.architectures import IsoDepthNet, ParallelIsoDepthNet
+
+
+def _resolve_decoder_type(config: TestConfig) -> str:
+    return str(getattr(config, "decoder", "linear"))
+
+
+def _clone_state_dict(state_dict: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {name: tensor.detach().cpu().clone() for name, tensor in state_dict.items()}
+
+
+def _load_initial_state(
+    model: nn.Module,
+    initial_state: Mapping[str, torch.Tensor] | None,
+    *,
+    device: torch.device,
+) -> None:
+    if initial_state is None:
+        return
+    current_state = model.state_dict()
+    loaded_state: dict[str, torch.Tensor] = {}
+    for name, tensor in current_state.items():
+        if name not in initial_state:
+            raise ValueError(f"initial_state is missing parameter '{name}'")
+        source_tensor = initial_state[name].detach()
+        if source_tensor.shape == tensor.shape:
+            loaded_state[name] = source_tensor.to(device=device)
+            continue
+        if tensor.ndim == source_tensor.ndim + 1 and tensor.shape[0] == 1 and tensor.shape[1:] == source_tensor.shape:
+            loaded_state[name] = source_tensor.unsqueeze(0).to(device=device)
+            continue
+        raise ValueError(
+            f"initial_state parameter '{name}' has shape {tuple(source_tensor.shape)} but expected {tuple(tensor.shape)}"
+        )
+    model.load_state_dict(loaded_state)
+
+
+def build_parallel_initial_state(
+    n_models: int,
+    n_genes: int,
+    *,
+    latent_dim: int = 1,
+    decoder_type: str = "linear",
+    seed: int = 0,
+    device: torch.device | None = None,
+) -> dict[str, torch.Tensor]:
+    resolved_device = device or torch.device("cpu")
+    _set_torch_seed(seed)
+    model = ParallelIsoDepthNet(
+        n_models,
+        n_genes,
+        latent_dim=latent_dim,
+        decoder_type=decoder_type,
+    ).to(resolved_device)
+    return _clone_state_dict(model.state_dict())
+
+
+def extract_parallel_slot_initial_state(
+    parallel_state: Mapping[str, torch.Tensor],
+    *,
+    slot_index: int,
+    n_genes: int,
+    latent_dim: int = 1,
+    decoder_type: str = "linear",
+    device: torch.device | None = None,
+) -> dict[str, torch.Tensor]:
+    resolved_device = device or torch.device("cpu")
+    model = IsoDepthNet(
+        n_genes,
+        latent_dim=latent_dim,
+        decoder_type=decoder_type,
+    ).to(resolved_device)
+    single_state = model.state_dict()
+    extracted_state: dict[str, torch.Tensor] = {}
+    for name, tensor in single_state.items():
+        source = parallel_state.get(name)
+        if source is None:
+            raise ValueError(f"parallel_state is missing parameter '{name}'")
+        detached_source = source.detach().cpu()
+        if detached_source.shape == tensor.shape:
+            extracted_state[name] = detached_source.clone()
+        elif detached_source.ndim > 0 and detached_source.shape[0] > int(slot_index):
+            extracted_state[name] = detached_source[int(slot_index)].clone()
+        else:
+            raise ValueError(
+                f"Cannot extract slot {int(slot_index)} for parameter '{name}' with shape {tuple(detached_source.shape)}"
+            )
+    return extracted_state
 
 
 def resolve_device(device: str) -> torch.device:
@@ -162,14 +250,18 @@ def _attach_training_metadata(
     best_train_loss_per_model: np.ndarray,
     best_rerun_index_per_model: np.ndarray,
     train_loss_per_rerun: np.ndarray,
+    true_rerun_isodepths: Optional[np.ndarray] = None,
 ) -> None:
-    model.training_metadata = {
+    metadata = {
         "n_reruns": int(n_reruns),
         "selection_loss": "training_reconstruction_loss",
         "best_train_loss_per_model": np.asarray(best_train_loss_per_model, dtype=np.float64),
         "best_rerun_index_per_model": np.asarray(best_rerun_index_per_model, dtype=np.int64),
         "train_loss_per_rerun": np.asarray(train_loss_per_rerun, dtype=np.float64),
     }
+    if true_rerun_isodepths is not None:
+        metadata["true_rerun_isodepths"] = np.asarray(true_rerun_isodepths, dtype=np.float32)
+    model.training_metadata = metadata
 
 
 def get_training_metadata(model: nn.Module) -> dict[str, Any]:
@@ -181,6 +273,7 @@ def get_training_metadata(model: nn.Module) -> dict[str, Any]:
             "best_train_loss_per_model": np.zeros(1, dtype=np.float64),
             "best_rerun_index_per_model": np.zeros(1, dtype=np.int64),
             "train_loss_per_rerun": np.zeros((1, 1), dtype=np.float64),
+            "true_rerun_isodepths": None,
         }
     return {
         "n_reruns": int(metadata.get("n_reruns", 1)),
@@ -188,6 +281,9 @@ def get_training_metadata(model: nn.Module) -> dict[str, Any]:
         "best_train_loss_per_model": np.asarray(metadata.get("best_train_loss_per_model", [0.0]), dtype=np.float64),
         "best_rerun_index_per_model": np.asarray(metadata.get("best_rerun_index_per_model", [0]), dtype=np.int64),
         "train_loss_per_rerun": np.asarray(metadata.get("train_loss_per_rerun", [[0.0]]), dtype=np.float64),
+        "true_rerun_isodepths": None
+        if metadata.get("true_rerun_isodepths") is None
+        else np.asarray(metadata.get("true_rerun_isodepths"), dtype=np.float32),
     }
 
 
@@ -198,16 +294,22 @@ def _compact_parallel_model(
     n_models: int,
     n_genes: int,
     latent_dim: int,
+    decoder_type: str,
     device: torch.device,
 ) -> ParallelIsoDepthNet:
-    compact_model = ParallelIsoDepthNet(n_models, n_genes, latent_dim=latent_dim).to(device)
+    compact_model = ParallelIsoDepthNet(
+        n_models,
+        n_genes,
+        latent_dim=latent_dim,
+        decoder_type=decoder_type,
+    ).to(device)
     expanded_state = expanded_model.state_dict()
     compact_state = compact_model.state_dict()
     slot_indices = [int(index) for index in np.asarray(selected_indices, dtype=np.int64).tolist()]
     restored_state: dict[str, torch.Tensor] = {}
     for name, tensor in compact_state.items():
         source = expanded_state[name].detach().cpu()
-        if source.ndim > 0 and source.shape[0] == expanded_model.decoder.weight.shape[0]:
+        if source.ndim > 0 and source.shape[0] == expanded_model.encoder[0].weight.shape[0]:
             restored_state[name] = source[slot_indices].clone().to(device=device)
         else:
             restored_state[name] = source.clone().to(device=device)
@@ -221,9 +323,14 @@ def _compact_single_model(
     selected_index: int,
     n_genes: int,
     latent_dim: int,
+    decoder_type: str,
     device: torch.device,
 ) -> IsoDepthNet:
-    compact_model = IsoDepthNet(n_genes, latent_dim=latent_dim).to(device)
+    compact_model = IsoDepthNet(
+        n_genes,
+        latent_dim=latent_dim,
+        decoder_type=decoder_type,
+    ).to(device)
     parallel_layers = [
         expanded_model.encoder[0],
         expanded_model.encoder[2],
@@ -238,8 +345,10 @@ def _compact_single_model(
         for parallel_layer, single_layer in zip(parallel_layers, single_layers):
             single_layer.weight.copy_(parallel_layer.weight[selected_index])
             single_layer.bias.copy_(parallel_layer.bias[selected_index])
-        compact_model.decoder.weight.copy_(expanded_model.decoder.weight[selected_index])
-        compact_model.decoder.bias.copy_(expanded_model.decoder.bias[selected_index])
+        compact_model.decoder.load_state_dict({
+            name: tensor[selected_index].detach().cpu()
+            for name, tensor in expanded_model.decoder.state_dict().items()
+        })
     return compact_model
 
 
@@ -253,6 +362,8 @@ def train_batched_isodepth_model(
     loss_mask_batched: Optional[np.ndarray] = None,
     latent_dim: int = 1,
     model_label: str = "parallel isodepth batch",
+    initial_state: Mapping[str, torch.Tensor] | None = None,
+    gradient_scale_divisor: float | None = None,
 ) -> tuple[nn.Module, np.ndarray]:
     device = device or resolve_device(config.device)
     _set_torch_seed(config.seed)
@@ -268,6 +379,9 @@ def train_batched_isodepth_model(
 
     if latent_dim <= 0:
         raise ValueError("latent_dim must be >= 1")
+    decoder_type = _resolve_decoder_type(config)
+    if gradient_scale_divisor is not None and float(gradient_scale_divisor) <= 0.0:
+        raise ValueError("gradient_scale_divisor must be > 0 when provided")
 
     if a_batched is None:
         base_a_batched = np.repeat(np.asarray(A, dtype=np.float32)[None, :, :], n_models, axis=0)
@@ -297,7 +411,13 @@ def train_batched_isodepth_model(
         device=device,
     )
 
-    model = ParallelIsoDepthNet(total_models, n_genes, latent_dim=latent_dim).to(device)
+    model = ParallelIsoDepthNet(
+        total_models,
+        n_genes,
+        latent_dim=latent_dim,
+        decoder_type=decoder_type,
+    ).to(device)
+    _load_initial_state(model, initial_state, device=device)
     optimizer = optim.Adam(model.parameters(), lr=config.lr, foreach=False)
     sgd_batch_size = _resolve_sgd_batch_size(config, n_cells)
     active_mask_t = torch.ones(total_models, dtype=torch.float32, device=device)
@@ -318,7 +438,8 @@ def train_batched_isodepth_model(
             optimizer.zero_grad()
             output = model(s_batched_t)
             loss_per_model = _compute_reconstruction_loss_per_model(output, a_batched_t, loss_mask_t)
-            total_loss = (loss_per_model * active_mask_t).sum() / max(active_count, 1.0)
+            divisor = float(gradient_scale_divisor) if gradient_scale_divisor is not None else max(active_count, 1.0)
+            total_loss = (loss_per_model * active_mask_t).sum() / divisor
             total_loss.backward()
             optimizer.step()
         else:
@@ -332,7 +453,8 @@ def train_batched_isodepth_model(
                 optimizer.zero_grad()
                 batch_output = model(batch_s)
                 batch_loss_per_model = _compute_reconstruction_loss_per_model(batch_output, batch_a, batch_mask)
-                batch_total_loss = (batch_loss_per_model * active_mask_t).sum() / max(active_count, 1.0)
+                divisor = float(gradient_scale_divisor) if gradient_scale_divisor is not None else max(active_count, 1.0)
+                batch_total_loss = (batch_loss_per_model * active_mask_t).sum() / divisor
                 batch_total_loss.backward()
                 optimizer.step()
 
@@ -361,6 +483,7 @@ def train_batched_isodepth_model(
     _restore_parallel_model_snapshot(model, best_state, device)
     with torch.no_grad():
         expanded_predictions = model(s_batched_t).detach().cpu().numpy().astype(np.float32)
+        expanded_isodepth = model.encoder(s_batched_t).detach().cpu().numpy().astype(np.float32)
         final_loss_values = _compute_reconstruction_loss_per_model(
             model(s_batched_t),
             a_batched_t,
@@ -380,15 +503,18 @@ def train_batched_isodepth_model(
         n_models=n_models,
         n_genes=n_genes,
         latent_dim=latent_dim,
+        decoder_type=decoder_type,
         device=device,
     )
     best_train_loss_per_model = train_loss_per_rerun[np.arange(n_models, dtype=np.int64), best_rerun_index_per_model]
+    true_rerun_isodepths = expanded_isodepth.reshape(n_models, n_reruns, n_cells, latent_dim)[0]
     _attach_training_metadata(
         compact_model,
         n_reruns=n_reruns,
         best_train_loss_per_model=best_train_loss_per_model,
         best_rerun_index_per_model=best_rerun_index_per_model,
         train_loss_per_rerun=train_loss_per_rerun,
+        true_rerun_isodepths=true_rerun_isodepths,
     )
     return compact_model, np.asarray(predictions, dtype=np.float32)
 
@@ -404,6 +530,8 @@ def train_parallel_isodepth_model(
     loss_mask_batched: Optional[np.ndarray] = None,
     latent_dim: int = 1,
     model_label: Optional[str] = None,
+    initial_state: Mapping[str, torch.Tensor] | None = None,
+    gradient_scale_divisor: float | None = None,
 ) -> tuple[nn.Module, np.ndarray]:
     device = device or resolve_device(config.device)
     if s_batched is None:
@@ -434,6 +562,8 @@ def train_parallel_isodepth_model(
         loss_mask_batched=loss_mask_batched,
         latent_dim=latent_dim,
         model_label=model_label,
+        initial_state=initial_state,
+        gradient_scale_divisor=gradient_scale_divisor,
     )
 
 
@@ -446,6 +576,8 @@ def train_isodepth_model(
     seed_offset: int = 0,
     latent_dim: int = 1,
     model_label: str = "model",
+    initial_state: Mapping[str, torch.Tensor] | None = None,
+    gradient_scale_divisor: float | None = None,
 ) -> tuple[nn.Module, np.ndarray]:
     device = device or resolve_device(config.device)
     if latent_dim <= 0:
@@ -459,6 +591,8 @@ def train_isodepth_model(
         device=device,
         latent_dim=latent_dim,
         model_label=model_label,
+        initial_state=initial_state,
+        gradient_scale_divisor=gradient_scale_divisor,
     )
     metadata = get_training_metadata(parallel_model)
     model = _compact_single_model(
@@ -466,6 +600,7 @@ def train_isodepth_model(
         selected_index=0,
         n_genes=A.shape[1],
         latent_dim=latent_dim,
+        decoder_type=_resolve_decoder_type(config),
         device=device,
     )
     _attach_training_metadata(
@@ -474,5 +609,6 @@ def train_isodepth_model(
         best_train_loss_per_model=metadata["best_train_loss_per_model"],
         best_rerun_index_per_model=metadata["best_rerun_index_per_model"],
         train_loss_per_rerun=metadata["train_loss_per_rerun"],
+        true_rerun_isodepths=metadata["true_rerun_isodepths"],
     )
     return model, np.asarray(predictions[0], dtype=np.float32)

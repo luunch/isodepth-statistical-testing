@@ -17,8 +17,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from experiments.configuration import build_run_config
 from experiments.fourier_kmax import (
     FourierKmaxStudySpec,
+    build_fourier_kmax_run_config,
     expand_fourier_kmax_conditions,
     extract_kmax_record,
     load_fourier_kmax_spec,
@@ -117,6 +119,69 @@ class TestFourierKmaxSpec(unittest.TestCase):
             "fourier_kmax_study__kmin-01__kmax-04__seed-002",
         )
 
+    def test_cross_validation_base_config_is_accepted_and_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            base_config = tmp_path / "base.json"
+            spec_path = tmp_path / "spec.json"
+            base_config.write_text(
+                json.dumps(
+                    {
+                        "data": {
+                            "source": "synthetic",
+                            "mode": "fourier",
+                            "n_cells": 16,
+                            "n_genes": 2,
+                            "sigma": 0.1,
+                            "k_min": 1,
+                            "k_max": 3,
+                            "dependent_xy": False,
+                            "poly_degree": 1,
+                            "seed": 0,
+                        },
+                        "test": {
+                            "method": "cross_validation",
+                            "metric": "mse",
+                            "n_perms": 2,
+                            "train_fraction": 0.7,
+                            "epochs": 2,
+                            "lr": 0.01,
+                            "patience": 2,
+                            "seed": 0,
+                            "device": "cpu",
+                            "verbose": False,
+                        },
+                        "output": {"out_dir": str(tmp_path / "results"), "run_name": "base"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            spec_path.write_text(
+                json.dumps(
+                    {
+                        "experiment_name": "fourier_kmax_study",
+                        "base_config": str(base_config),
+                        "output_root": str(tmp_path / "study_outputs"),
+                        "k_min": 1,
+                        "k_max_values": [2],
+                        "seeds": [7],
+                        "reuse_result_roots": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            spec = load_fourier_kmax_spec(spec_path)
+            condition = expand_fourier_kmax_conditions(spec)[0]
+            run_config = build_fourier_kmax_run_config(
+                base_run_config=build_run_config(str(spec.base_config), {}),
+                spec=spec,
+                condition=condition,
+            )
+
+        self.assertEqual(run_config.test.method, "cross_validation")
+        self.assertEqual(run_config.test.train_fraction, 0.7)
+
 
 class TestFourierKmaxHelpers(unittest.TestCase):
     def test_extract_record_reads_kmax_metadata(self) -> None:
@@ -162,6 +227,47 @@ class TestFourierKmaxHelpers(unittest.TestCase):
             self.assertEqual(record["k_max"], 4)
             self.assertEqual(record["seed"], 7)
             self.assertAlmostEqual(float(record["p_value"]), 0.125)
+
+    def test_extract_record_accepts_cross_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result_path = Path(tmpdir) / "fourier_cross_validation_result.json"
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "method_name": "cross_validation",
+                        "metric": "mse",
+                        "p_value": 0.125,
+                        "stat_true": 1.5,
+                        "runtime_sec": 0.5,
+                        "config": {
+                            "data": {
+                                "source": "synthetic",
+                                "mode": "fourier",
+                                "sigma": 0.1,
+                                "seed": 7,
+                                "k_min": 1,
+                                "k_max": 4,
+                                "dependent_xy": False,
+                                "poly_degree": 1,
+                            },
+                            "output": {"run_name": "fourier_cross_validation"},
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            record, warnings = extract_kmax_record(
+                result_path,
+                expected_sigma=0.1,
+                expected_dependent_xy=False,
+                expected_poly_degree=1,
+            )
+
+        self.assertEqual(warnings, [])
+        self.assertIsNotNone(record)
+        assert record is not None
+        self.assertEqual(record["method_name"], "cross_validation")
 
     def test_summary_groups_by_kmax(self) -> None:
         rows = [

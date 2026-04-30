@@ -34,6 +34,13 @@ def standardize_expression(a: np.ndarray) -> np.ndarray:
     return np.asarray((a - mu) / (sigma + 1e-8), dtype=np.float32)
 
 
+def log1p_expression(a: np.ndarray) -> np.ndarray:
+    expression = np.asarray(a, dtype=np.float32)
+    if np.any(expression < 0):
+        raise ValueError("log1p transform requires non-negative expression values")
+    return np.asarray(np.log1p(expression), dtype=np.float32)
+
+
 def poisson_low_rank_factorization(
     a: np.ndarray,
     q: int,
@@ -124,6 +131,7 @@ def apply_expression_transforms(
     a: np.ndarray,
     *,
     min_cells_per_gene: int = 0,
+    log1p: bool = False,
     standardize: bool = True,
     q: int | None = None,
     seed: int = 0,
@@ -134,6 +142,12 @@ def apply_expression_transforms(
         "gene_keep_mask": keep_mask,
         "representation": "gene_expression",
     }
+
+    if log1p and q is not None:
+        raise ValueError("log1p cannot be combined with q because the Poisson low-rank factorization expects counts")
+
+    if log1p:
+        transformed = log1p_expression(transformed)
 
     if q is not None:
         latent, _ = poisson_low_rank_factorization(transformed, q=q, seed=seed)
@@ -152,6 +166,7 @@ def apply_expression_transforms(
 
     transformed = np.asarray(transformed, dtype=np.float32)
     if return_metadata:
+        metadata["log1p"] = bool(log1p)
         metadata["standardize"] = bool(standardize)
         return transformed, metadata
     return transformed

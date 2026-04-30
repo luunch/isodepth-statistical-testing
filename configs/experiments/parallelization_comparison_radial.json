@@ -1,0 +1,10 @@
+{
+  "experiment_name": "radial_parallelization_comparison",
+  "base_config": "configs/hypothalamus_existence.json",
+  "output_root": "results/parallelization_comparison/hypothalamus_log1p_nostandardize",
+  "n_perms": 5,
+  "epochs": 5000,
+  "n_reruns": 1,
+  "device": "cuda",
+  "verbose": true
+}

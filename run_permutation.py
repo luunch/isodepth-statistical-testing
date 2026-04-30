@@ -34,6 +34,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-raw", dest="use_raw", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--no-use-raw", dest="use_raw", action="store_false", default=argparse.SUPPRESS)
     parser.add_argument("--min-cells-per-gene", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--log1p", dest="log1p", action="store_true", default=argparse.SUPPRESS)
+    parser.add_argument("--no-log1p", dest="log1p", action="store_false", default=argparse.SUPPRESS)
     parser.add_argument("--standardize", dest="standardize", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--no-standardize", dest="standardize", action="store_false", default=argparse.SUPPRESS)
     parser.add_argument("--q", type=int, default=argparse.SUPPRESS)
@@ -50,6 +52,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--method", default=argparse.SUPPRESS)
     parser.add_argument("--metric", default=argparse.SUPPRESS)
     parser.add_argument("--n-perms", type=int, default=argparse.SUPPRESS)
+    parser.add_argument("--train-fraction", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--n-reruns", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--max-spatial-dims", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--alpha", type=float, default=argparse.SUPPRESS)
@@ -58,6 +61,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--patience", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--device", default=argparse.SUPPRESS)
+    parser.add_argument("--decoder", default=argparse.SUPPRESS)
     parser.add_argument("--batch-size", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--sgd-batch-size", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--delta", type=_parse_csv_floats, default=argparse.SUPPRESS)
@@ -99,6 +103,7 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict:
         "layer": "layer",
         "use_raw": "use_raw",
         "min_cells_per_gene": "min_cells_per_gene",
+        "log1p": "log1p",
         "standardize": "standardize",
         "q": "q",
         "max_cells": "max_cells",
@@ -117,6 +122,7 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict:
         "method": "method",
         "metric": "metric",
         "n_perms": "n_perms",
+        "train_fraction": "train_fraction",
         "n_reruns": "n_reruns",
         "max_spatial_dims": "max_spatial_dims",
         "alpha": "alpha",
@@ -125,6 +131,7 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict:
         "lr": "lr",
         "patience": "patience",
         "device": "device",
+        "decoder": "decoder",
         "batch_size": "batch_size",
         "sgd_batch_size": "sgd_batch_size",
         "delta": "delta",

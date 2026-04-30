@@ -13,6 +13,7 @@ from analysis.plots import (
     save_perturbation_delta_pvalue_plot,
     save_synthetic_true_curve_plot,
     save_subset_fraction_pvalue_plot,
+    save_true_rerun_isodepth_grid,
 )
 from data.schemas import DatasetBundle, RunConfig, TestResult, run_config_from_mapping
 from methods.metrics import summarize_metric_distribution
@@ -127,12 +128,17 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
             "layer",
             "use_raw",
             "min_cells_per_gene",
+            "log1p",
             "standardize",
             "q",
             "max_cells",
         }
     if data.get("mode") == "fourier":
         data_keys |= {"k_min", "k_max"}
+    if data.get("source") == "synthetic":
+        data_keys.add("dependent_xy")
+    if data.get("mode") == "noise":
+        data_keys.add("side_length")
 
     test_keys = {
         "method",
@@ -142,12 +148,14 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
         "patience",
         "seed",
         "device",
+        "decoder",
         "verbose",
         "n_reruns",
         "sgd_batch_size",
     }
     if method in {
         "parallel_permutation",
+        "cross_validation",
         "exact_existence",
         "full_retraining",
         "comparison_perturbation_test",
@@ -156,6 +164,8 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
         "subsampling_test",
     }:
         test_keys.add("n_perms")
+    if method == "cross_validation":
+        test_keys.add("train_fraction")
     if method == "exact_existence":
         test_keys |= {"max_spatial_dims", "alpha"}
     if method in {"comparison_perturbation_test", "perturbation_test"}:
@@ -189,11 +199,22 @@ def _method_artifact_keys(method_name: str) -> set[str]:
     }
     if method_name in {
         "parallel_permutation",
+        "cross_validation",
         "exact_existence",
         "full_retraining",
         "subsampling_test",
     }:
         extra = {"null_summary", "true_isodepth"}
+        if method_name == "cross_validation":
+            extra |= {
+                "train_mask",
+                "test_mask",
+                "train_fraction",
+                "test_fraction",
+                "train_size",
+                "test_size",
+                "observed_test_loss",
+            }
         if method_name == "exact_existence":
             extra |= {"selected_spatial_dims", "tested_spatial_dims", "step_summaries", "alpha", "max_spatial_dims"}
         return shared | extra
@@ -289,6 +310,30 @@ def save_standardized_outputs(
     )
     if perturbation_delta_plot_path is not None:
         artifact_paths["delta_pvalue_plot"] = str(perturbation_delta_plot_path)
+
+    model = result.artifacts.get("model")
+    training_metadata = getattr(model, "training_metadata", None)
+    if isinstance(training_metadata, Mapping):
+        true_rerun_isodepths = training_metadata.get("true_rerun_isodepths")
+        if true_rerun_isodepths is not None:
+            rerun_losses = np.asarray(
+                training_metadata.get("train_loss_per_rerun", [[0.0]]),
+                dtype=np.float64,
+            )
+            selected_rerun_index_array = np.asarray(
+                training_metadata.get("best_rerun_index_per_model", [0]),
+                dtype=np.int64,
+            )
+            selected_rerun_index = int(selected_rerun_index_array[0]) if selected_rerun_index_array.size else 0
+            true_rerun_plot_path = save_true_rerun_isodepth_grid(
+                dataset,
+                np.asarray(true_rerun_isodepths, dtype=np.float32),
+                out_dir / f"{run_config.output.run_name}_true_rerun_isodepths.png",
+                rerun_losses=rerun_losses[0] if rerun_losses.ndim >= 2 and rerun_losses.shape[0] > 0 else None,
+                selected_rerun_index=selected_rerun_index,
+            )
+            if true_rerun_plot_path is not None:
+                artifact_paths["true_rerun_isodepth_grid_plot"] = str(true_rerun_plot_path)
 
     payload = result.to_json_dict(
         config=_compact_run_config(run_config),
