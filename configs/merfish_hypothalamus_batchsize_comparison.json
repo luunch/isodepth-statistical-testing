@@ -24,15 +24,8 @@
     "verbose": true,
     "n_reruns": 1
   },
-  "experiment": {
-    "base_epochs": 5000,
-    "batch_sizes": [
-      512,
-      256
-    ]
-  },
   "output": {
     "out_dir": "results",
-    "run_name": "merfish_hypothalamus_batchsize_comparison"
+    "run_name": "merfish_hypothalamus_batchsize_base"
   }
 }

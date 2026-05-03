@@ -184,6 +184,72 @@ class TestPerturbationSchema(unittest.TestCase):
         overrides = _build_cli_overrides(args)
         self.assertEqual(overrides["test"]["sgd_batch_size"], 11)
 
+    def test_cosine_lr_decay_requires_positive_sgd_batch_size(self) -> None:
+        with self.assertRaises(ValueError):
+            TestConfig(
+                method="comparison_perturbation_test",
+                metric="mse",
+                delta=[0.1],
+                sgd_cosine_lr_decay=True,
+                sgd_batch_size=0,
+            ).validate()
+        with self.assertRaises(ValueError):
+            TestConfig(
+                method="comparison_perturbation_test",
+                metric="mse",
+                delta=[0.1],
+                sgd_cosine_lr_decay=True,
+                sgd_batch_size=None,
+            ).validate()
+
+    def test_cosine_eta_min_must_be_in_range(self) -> None:
+        with self.assertRaises(ValueError):
+            TestConfig(
+                method="comparison_perturbation_test",
+                metric="mse",
+                delta=[0.1],
+                sgd_batch_size=4,
+                sgd_cosine_lr_decay=True,
+                sgd_cosine_eta_min=-1e-6,
+            ).validate()
+        with self.assertRaises(ValueError):
+            TestConfig(
+                method="comparison_perturbation_test",
+                metric="mse",
+                delta=[0.1],
+                sgd_batch_size=4,
+                lr=1e-3,
+                sgd_cosine_lr_decay=True,
+                sgd_cosine_eta_min=1e-2,
+            ).validate()
+
+    def test_cosine_t_max_steps_must_be_positive_when_set(self) -> None:
+        with self.assertRaises(ValueError):
+            TestConfig(
+                method="comparison_perturbation_test",
+                metric="mse",
+                delta=[0.1],
+                sgd_batch_size=4,
+                sgd_cosine_lr_decay=True,
+                sgd_cosine_t_max_steps=0,
+            ).validate()
+
+    def test_cli_sgd_cosine_overrides_are_parsed(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(
+            [
+                "--sgd-cosine-lr-decay",
+                "--sgd-cosine-eta-min",
+                "1e-5",
+                "--sgd-cosine-t-max-steps",
+                "400",
+            ]
+        )
+        overrides = _build_cli_overrides(args)
+        self.assertTrue(overrides["test"]["sgd_cosine_lr_decay"])
+        self.assertEqual(overrides["test"]["sgd_cosine_eta_min"], 1e-5)
+        self.assertEqual(overrides["test"]["sgd_cosine_t_max_steps"], 400)
+
     def test_comparison_perturbation_config_is_valid(self) -> None:
         config = TestConfig(
             method="comparison_perturbation_test",

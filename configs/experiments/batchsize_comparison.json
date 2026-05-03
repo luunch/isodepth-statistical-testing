@@ -1,0 +1,8 @@
+{
+  "experiment_name": "batchsize_comparison",
+  "base_config": "configs/merfish_hypothalamus_batchsize_comparison.json",
+  "output_root": "results/experiments/batchsize_comparison",
+  "base_epochs": 5000,
+  "batch_sizes": [512, 256],
+  "device": "cuda"
+}

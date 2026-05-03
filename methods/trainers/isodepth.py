@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.optim import lr_scheduler
 from tqdm import tqdm
 
 from data.schemas import TestConfig
@@ -243,6 +244,10 @@ def _resolve_sgd_batch_size(config: TestConfig, n_cells: int) -> int | None:
     return min(int(config.sgd_batch_size), int(n_cells))
 
 
+def _sgd_steps_per_epoch(n_cells: int, sgd_batch_size: int) -> int:
+    return (int(n_cells) + int(sgd_batch_size) - 1) // int(sgd_batch_size)
+
+
 def _attach_training_metadata(
     model: nn.Module,
     *,
@@ -420,6 +425,18 @@ def train_batched_isodepth_model(
     _load_initial_state(model, initial_state, device=device)
     optimizer = optim.Adam(model.parameters(), lr=config.lr, foreach=False)
     sgd_batch_size = _resolve_sgd_batch_size(config, n_cells)
+    lr_scheduler_step: lr_scheduler.CosineAnnealingLR | None = None
+    if sgd_batch_size is not None and config.sgd_cosine_lr_decay:
+        steps_per_epoch = _sgd_steps_per_epoch(n_cells, sgd_batch_size)
+        t_max = config.sgd_cosine_t_max_steps
+        if t_max is None:
+            t_max = int(config.epochs) * steps_per_epoch
+        t_max = max(int(t_max), 1)
+        lr_scheduler_step = lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=t_max,
+            eta_min=float(config.sgd_cosine_eta_min),
+        )
     active_mask_t = torch.ones(total_models, dtype=torch.float32, device=device)
     minibatch_generator = None
     if sgd_batch_size is not None:
@@ -457,6 +474,8 @@ def train_batched_isodepth_model(
                 batch_total_loss = (batch_loss_per_model * active_mask_t).sum() / divisor
                 batch_total_loss.backward()
                 optimizer.step()
+                if lr_scheduler_step is not None:
+                    lr_scheduler_step.step()
 
         with torch.no_grad():
             output = model(s_batched_t)

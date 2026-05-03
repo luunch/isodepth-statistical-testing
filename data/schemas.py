@@ -189,6 +189,9 @@ class TestConfig:
     decoder: str = "linear"
     batch_size: Optional[int] = None
     sgd_batch_size: Optional[int] = None
+    sgd_cosine_lr_decay: bool = False
+    sgd_cosine_eta_min: float = 0.0
+    sgd_cosine_t_max_steps: Optional[int] = None
     delta: list[float] = field(default_factory=lambda: [0.05])
     perturb_target: str = "coordinates"
     subset_fractions: list[float] = field(default_factory=lambda: [0.5, 0.7, 0.9])
@@ -227,6 +230,18 @@ class TestConfig:
             raise ValueError("test.batch_size must be > 0 when provided")
         if self.sgd_batch_size is not None and self.sgd_batch_size < 0:
             raise ValueError("test.sgd_batch_size must be >= 0 when provided")
+        if self.sgd_cosine_lr_decay:
+            if self.sgd_batch_size is None or self.sgd_batch_size <= 0:
+                raise ValueError(
+                    "test.sgd_cosine_lr_decay requires test.sgd_batch_size > 0 (minibatch cell SGD)"
+                )
+            if self.sgd_cosine_eta_min < 0.0 or self.sgd_cosine_eta_min > self.lr:
+                raise ValueError(
+                    "test.sgd_cosine_eta_min must satisfy 0 <= sgd_cosine_eta_min <= test.lr "
+                    f"(got eta_min={self.sgd_cosine_eta_min}, lr={self.lr})"
+                )
+            if self.sgd_cosine_t_max_steps is not None and int(self.sgd_cosine_t_max_steps) <= 0:
+                raise ValueError("test.sgd_cosine_t_max_steps must be > 0 when provided")
         self.delta = [float(value) for value in self.delta]
         if not self.delta:
             raise ValueError("test.delta must contain at least one value")

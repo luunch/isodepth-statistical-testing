@@ -13,6 +13,28 @@ from data.schemas import DatasetBundle, TestResult
 # Exclude points treated as zero expression when ``hide_zero_expression`` is enabled.
 _EXPRESSION_ZERO_EPS = 1e-15
 
+# Low ≈ white / very light, high = dark — cycle across per-gene figures for distinction.
+_EXPRESSION_WHITE_TO_DARK_CYCLIC = (
+    "Reds",
+    "Blues",
+    "Purples",
+    "Oranges",
+    "Greens",
+    "BuPu",
+    "PuRd",
+    "YlOrRd",
+)
+
+# Single aggregate over genes (e.g. dataset triptych mean |expression|): white-low → dark-high.
+DEFAULT_EXPRESSION_AGGREGATE_COLORMAP = "Reds"
+
+
+def expression_colormap_for_index(index: int) -> str:
+    """Sequential colormap name for per-gene expression plots (near-white low → dark high)."""
+    return _EXPRESSION_WHITE_TO_DARK_CYCLIC[
+        int(index) % len(_EXPRESSION_WHITE_TO_DARK_CYCLIC)
+    ]
+
 
 def _normalize_depth(
     values: np.ndarray,
@@ -269,16 +291,20 @@ def _plot_spatial_dataset_heatmap(
     vmin: float | None = None,
     vmax: float | None = None,
 ) -> None:
+    sig = np.asarray(signal, dtype=np.float32)
+    if vmin is not None and vmax is not None:
+        norm = mcolors.Normalize(vmin=float(vmin), vmax=float(vmax))
+    else:
+        norm = None
     scatter = ax.scatter(
         S[:, 0],
         S[:, 1],
-        c=np.asarray(signal, dtype=np.float32),
-        cmap="magma",
+        c=sig,
+        cmap=DEFAULT_EXPRESSION_AGGREGATE_COLORMAP,
+        norm=norm,
         s=_point_size(S),
         linewidths=0,
         alpha=0.9,
-        vmin=vmin,
-        vmax=vmax,
     )
     _overlay_subsampling(ax, S, subset_mask)
     ax.set_title(title)
@@ -856,8 +882,13 @@ def _plot_spatial_expression_panel(
     vmax: float,
     show_contours: bool = True,
     hide_zero_expression: bool = False,
-) -> None:
-    """Scatter (and optional tricontour) for one gene on one spatial layout; values use vmin/vmax directly."""
+    cmap: str = "Reds",
+):
+    """Scatter (and optional tricontour) for one gene on one spatial layout; values use vmin/vmax directly.
+
+    Uses a sequential colormap (default ``Reds``): near-white at low expression, dark at high.
+    Returns the scatter ``PathCollection`` when points were drawn, else ``None``.
+    """
     z = np.asarray(z, dtype=np.float32).reshape(-1)
     S = np.asarray(S, dtype=np.float32)
     if hide_zero_expression:
@@ -871,7 +902,7 @@ def _plot_spatial_expression_panel(
             S[:, 0],
             S[:, 1],
             c=z,
-            cmap="viridis",
+            cmap=cmap,
             norm=norm,
             s=_point_size(S),
             linewidths=0,
@@ -893,7 +924,13 @@ def _plot_spatial_expression_panel(
             triangulation = _masked_triangulation(S)
             levels = np.linspace(float(vmin), float(vmax), num=8)
             if levels.size > 1 and float(vmax) > float(vmin) + 1e-12:
-                contour_colors = plt.cm.Reds(np.linspace(0.35, 0.95, levels.size))
+                try:
+                    from matplotlib import colormaps as _mpl_colormaps
+
+                    cm = _mpl_colormaps[cmap]
+                except (KeyError, TypeError, AttributeError):
+                    cm = plt.get_cmap(cmap)
+                contour_colors = cm(np.linspace(0.35, 0.98, levels.size))
                 ax.tricontour(
                     triangulation,
                     z,
@@ -908,6 +945,7 @@ def _plot_spatial_expression_panel(
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_aspect("equal")
+    return scatter
 
 
 def save_gene_spatial_contour_grid(
@@ -921,6 +959,7 @@ def save_gene_spatial_contour_grid(
     figure_title: str | None = None,
     show_contours: bool = True,
     hide_zero_expression: bool = False,
+    cmap: str = "Reds",
 ) -> Path:
     """Save a grid (e.g. true + spatial nulls) of spatial expression maps; optional contour lines."""
     out_path = Path(out_path)
@@ -948,6 +987,7 @@ def save_gene_spatial_contour_grid(
             vmax=vmax,
             show_contours=show_contours,
             hide_zero_expression=hide_zero_expression,
+            cmap=cmap,
         )
 
     for idx in range(n_panels, nrows * ncols):
@@ -955,7 +995,7 @@ def save_gene_spatial_contour_grid(
         axes_arr[r, c].set_visible(False)
 
     norm = mcolors.Normalize(vmin=float(vmin), vmax=float(vmax))
-    sm = plt.cm.ScalarMappable(norm=norm, cmap="viridis")
+    sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
     sm.set_array([])
     fig.subplots_adjust(right=0.88)
     cbar_ax = fig.add_axes([0.91, 0.15, 0.02, 0.7])
@@ -1016,7 +1056,8 @@ def save_multi_gene_spatial_expression_grid(
         r, c = divmod(idx, ncols)
         ax = axes[r, c]
         z = np.asarray(expr[:, idx], dtype=np.float32)
-        _plot_spatial_expression_panel(
+        cmap_i = expression_colormap_for_index(idx)
+        sc = _plot_spatial_expression_panel(
             ax,
             S,
             z,
@@ -1025,18 +1066,14 @@ def save_multi_gene_spatial_expression_grid(
             vmax=vmax,
             show_contours=show_contours,
             hide_zero_expression=hide_zero_expression,
+            cmap=cmap_i,
         )
+        if sc is not None:
+            plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.02, label="Expression")
 
     for idx in range(n_genes, nrows * ncols):
         r, c = divmod(idx, ncols)
         axes[r, c].set_visible(False)
-
-    norm = mcolors.Normalize(vmin=float(vmin), vmax=float(vmax))
-    sm = plt.cm.ScalarMappable(norm=norm, cmap="viridis")
-    sm.set_array([])
-    fig.subplots_adjust(right=0.88)
-    cbar_ax = fig.add_axes([0.91, 0.15, 0.02, 0.7])
-    fig.colorbar(sm, cax=cbar_ax, label="Expression")
 
     if figure_title:
         fig.suptitle(figure_title, fontsize=12, y=1.02)

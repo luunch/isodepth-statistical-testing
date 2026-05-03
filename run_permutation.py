@@ -64,6 +64,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--decoder", default=argparse.SUPPRESS)
     parser.add_argument("--batch-size", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--sgd-batch-size", type=int, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--sgd-cosine-lr-decay",
+        dest="sgd_cosine_lr_decay",
+        action="store_true",
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--no-sgd-cosine-lr-decay",
+        dest="sgd_cosine_lr_decay",
+        action="store_false",
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument("--sgd-cosine-eta-min", type=float, default=argparse.SUPPRESS)
+    parser.add_argument("--sgd-cosine-t-max-steps", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--delta", type=_parse_csv_floats, default=argparse.SUPPRESS)
     parser.add_argument("--perturb-target", default=argparse.SUPPRESS)
     parser.add_argument("--subset-fractions", type=_parse_csv_floats, default=argparse.SUPPRESS)
@@ -134,6 +148,9 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict:
         "decoder": "decoder",
         "batch_size": "batch_size",
         "sgd_batch_size": "sgd_batch_size",
+        "sgd_cosine_lr_decay": "sgd_cosine_lr_decay",
+        "sgd_cosine_eta_min": "sgd_cosine_eta_min",
+        "sgd_cosine_t_max_steps": "sgd_cosine_t_max_steps",
         "delta": "delta",
         "perturb_target": "perturb_target",
         "subset_fractions": "subset_fractions",

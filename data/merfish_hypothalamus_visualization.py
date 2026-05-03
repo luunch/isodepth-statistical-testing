@@ -9,6 +9,7 @@ import numpy as np
 import torch
 
 from analysis.plots import (
+    expression_colormap_for_index,
     save_gene_spatial_contour_grid,
     save_multi_gene_spatial_expression_grid,
     save_spatial_binned_density_plot,
@@ -138,7 +139,7 @@ def run_merfish_hypothalamus_visualization(
         )
         summary["plots"].append(str(combined_out))
     else:
-        for requested, (var_name, col_idx) in resolved_map.items():
+        for gene_idx, (requested, (var_name, col_idx)) in enumerate(resolved_map.items()):
             z = np.asarray(dataset.A[:, col_idx], dtype=np.float32)
             if hide_zero_expression:
                 # Keep in sync with analysis.plots._EXPRESSION_ZERO_EPS
@@ -169,6 +170,7 @@ def run_merfish_hypothalamus_visualization(
                 figure_title=f"{requested} ({var_name})",
                 show_contours=show_contours,
                 hide_zero_expression=hide_zero_expression,
+                cmap=expression_colormap_for_index(gene_idx),
             )
             summary["plots"].append(str(out_png))
 

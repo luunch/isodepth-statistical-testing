@@ -152,6 +152,9 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
         "verbose",
         "n_reruns",
         "sgd_batch_size",
+        "sgd_cosine_lr_decay",
+        "sgd_cosine_eta_min",
+        "sgd_cosine_t_max_steps",
     }
     if method in {
         "parallel_permutation",

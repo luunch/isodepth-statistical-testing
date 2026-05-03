@@ -1,7 +1,7 @@
 {
   "data": {
     "source": "h5ad",
-    "h5ad": "data/h5ad/hippocampal_pyramidal_ca3.h5ad",
+    "h5ad": "data/h5ad/hippocampal_pyramidal.h5ad",
     "spatial_key": "spatial",
     "obs_x_col": null,
     "obs_y_col": null,
@@ -17,9 +17,9 @@
     "method": "parallel_permutation",
     "metric": "nll_gaussian_mse",
     "n_perms": 50,
-    "epochs": 5000,
+    "epochs": 100,
     "n_reruns": 10,
-    "sgd_batch_size": 0,
+    "sgd_batch_size": 512,
     "lr": 0.001,
     "patience": 50,
     "seed": 42,
@@ -29,7 +29,7 @@
   },
   "output": {
     "out_dir": "results",
-    "run_name": "hippocampus_ca3_existence",
+    "run_name": "hippocampus_existence_sgd512e100",
     "save_preds": false,
     "save_perm_stats": true
   }
