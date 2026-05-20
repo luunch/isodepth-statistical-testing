@@ -1,0 +1,10 @@
+{
+  "experiment_name": "isodepth_bias_detection",
+  "base_config": "configs/hypothalamus_celltype_existence.json",
+  "output_root": "results/experiments/isodepth_bias_detection/hypothalamus_celltype_existence",
+  "n_perms": 5,
+  "n_reruns": 1,
+  "epochs": 5000,
+  "devices": ["cuda"],
+  "verbose": true
+}

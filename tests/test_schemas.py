@@ -9,7 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data.schemas import DataConfig, TestConfig
+from data.schemas import CovariateConfig, DataConfig, TestConfig, run_config_from_mapping
 from methods.metrics import compute_metric, permutation_p_value
 from run_permutation import _build_arg_parser, _build_cli_overrides
 
@@ -95,6 +95,128 @@ class TestDataSchema(unittest.TestCase):
         config = DataConfig(source="synthetic", mode="noise", n_cells=24, n_genes=3, side_length=6)
         self.assertIs(config.validate(), config)
 
+    def test_side_length_is_rejected_when_shape_is_not_square(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="synthetic",
+                mode="noise",
+                n_cells=24,
+                n_genes=3,
+                shape="semicircle",
+                side_length=6,
+            ).validate()
+
+    def test_non_square_shape_is_valid_without_side_length(self) -> None:
+        config = DataConfig(
+            source="synthetic",
+            mode="noise",
+            n_cells=24,
+            n_genes=3,
+            shape="semicircle",
+        )
+        self.assertIs(config.validate(), config)
+
+    def test_invalid_shape_string_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="synthetic",
+                mode="noise",
+                n_cells=16,
+                n_genes=3,
+                shape="hexagon",
+            ).validate()
+
+    def test_invalid_sampling_bias_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="synthetic",
+                mode="noise",
+                n_cells=16,
+                n_genes=3,
+                sampling_bias={"type": "gaussian"},
+            ).validate()
+
+    def test_sampling_bias_is_rejected_for_h5ad(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="h5ad",
+                h5ad="data/example.h5ad",
+                sampling_bias={"type": "uniform"},
+            ).validate()
+
+    def test_uniform_sampling_bias_allows_side_length_ignored_for_lattice(self) -> None:
+        config = DataConfig(
+            source="synthetic",
+            mode="noise",
+            n_cells=25,
+            n_genes=3,
+            shape="square",
+            side_length=6,
+            sampling_bias={"type": "uniform"},
+        )
+        self.assertIs(config.validate(), config)
+
+    def test_uniform_sampling_bias_is_valid_without_side_length(self) -> None:
+        config = DataConfig(
+            source="synthetic",
+            mode="noise",
+            n_cells=120,
+            n_genes=3,
+            sampling_bias={"type": "uniform"},
+        )
+        self.assertIs(config.validate(), config)
+
+    def test_legacy_string_sampling_bias_is_accepted(self) -> None:
+        config = DataConfig(
+            source="synthetic",
+            mode="noise",
+            n_cells=120,
+            n_genes=3,
+            sampling_bias="uniform",
+        ).validate()
+        self.assertEqual(config.sampling_bias.type, "uniform")
+        self.assertIsNone(config.sampling_bias.variance)
+
+    def test_normal_sampling_bias_requires_variance(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="synthetic",
+                mode="noise",
+                n_cells=16,
+                n_genes=3,
+                sampling_bias={"type": "normal"},
+            ).validate()
+
+    def test_normal_sampling_bias_rejects_nonpositive_variance(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="synthetic",
+                mode="noise",
+                n_cells=16,
+                n_genes=3,
+                sampling_bias={"type": "normal", "variance": 0.0},
+            ).validate()
+
+    def test_uniform_sampling_bias_rejects_variance(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="synthetic",
+                mode="noise",
+                n_cells=16,
+                n_genes=3,
+                sampling_bias={"type": "uniform", "variance": 0.05},
+            ).validate()
+
+    def test_unknown_sampling_bias_keys_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="synthetic",
+                mode="noise",
+                n_cells=16,
+                n_genes=3,
+                sampling_bias={"type": "uniform", "stddev": 0.1},
+            ).validate()
+
     def test_side_length_requires_divisible_n_cells_for_noise(self) -> None:
         with self.assertRaises(ValueError):
             DataConfig(source="synthetic", mode="noise", n_cells=25, n_genes=3, side_length=6).validate()
@@ -125,8 +247,8 @@ class TestPerturbationSchema(unittest.TestCase):
     def test_n_reruns_defaults_to_thirty(self) -> None:
         self.assertEqual(TestConfig().n_reruns, 30)
 
-    def test_decoder_defaults_to_linear(self) -> None:
-        self.assertEqual(TestConfig().decoder, "linear")
+    def test_decoder_defaults_to_nn(self) -> None:
+        self.assertEqual(TestConfig().decoder, "nn")
 
     def test_invalid_decoder_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
@@ -355,6 +477,52 @@ class TestSubsetSelectionSchema(unittest.TestCase):
                 metric="spearman_corr_mean",
                 n_perms=3,
             ).validate()
+
+
+class TestCovariateSchema(unittest.TestCase):
+    def test_midline_rejects_exact_existence(self) -> None:
+        with self.assertRaises(ValueError):
+            TestConfig(
+                method="exact_existence",
+                metric="mse",
+                n_perms=5,
+                covariate=CovariateConfig(type="midline"),
+            ).validate()
+
+    def test_unknown_covariate_type_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            CovariateConfig(type="unknown").validate()
+
+    def test_run_config_parses_nested_covariate(self) -> None:
+        cfg = run_config_from_mapping(
+            {
+                "data": {"source": "synthetic", "n_cells": 16, "n_genes": 3, "mode": "noise"},
+                "test": {
+                    "method": "parallel_permutation",
+                    "metric": "mse",
+                    "n_perms": 2,
+                    "covariate": {"type": "midline"},
+                },
+                "output": {"out_dir": "results", "run_name": "t"},
+            }
+        )
+        self.assertIsNotNone(cfg.test.covariate)
+        self.assertEqual(cfg.test.covariate.type, "midline")
+
+    def test_run_config_accepts_string_covariate_shorthand(self) -> None:
+        cfg = run_config_from_mapping(
+            {
+                "data": {"source": "synthetic", "n_cells": 16, "n_genes": 3, "mode": "noise"},
+                "test": {
+                    "method": "parallel_permutation",
+                    "metric": "mse",
+                    "n_perms": 2,
+                    "covariate": "midline",
+                },
+                "output": {"out_dir": "results", "run_name": "t"},
+            }
+        )
+        self.assertEqual(cfg.test.covariate.type, "midline")
 
 
 class TestMetricUtilities(unittest.TestCase):

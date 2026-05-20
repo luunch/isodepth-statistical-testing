@@ -95,6 +95,62 @@ class TestRealDataExistenceConsistencySpec(unittest.TestCase):
             self.assertTrue(spec.base_config.is_absolute())
             self.assertTrue(spec.output_root.is_absolute())
 
+    def test_load_spec_accepts_synthetic_base_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            base_config = tmp_path / "base.json"
+            spec_path = tmp_path / "spec.json"
+            base_config.write_text(
+                json.dumps(
+                    {
+                        "data": {
+                            "source": "synthetic",
+                            "mode": "noise",
+                            "n_cells": 100,
+                            "n_genes": 10,
+                            "shape": "square",
+                            "sigma": 0.1,
+                            "poly_degree": 1,
+                            "seed": 0,
+                        },
+                        "test": {
+                            "method": "parallel_permutation",
+                            "metric": "mse",
+                            "n_perms": 10,
+                            "epochs": 2,
+                            "lr": 0.01,
+                            "patience": 2,
+                            "seed": 9,
+                            "device": "cpu",
+                            "verbose": False,
+                        },
+                        "output": {
+                            "out_dir": str(tmp_path / "results"),
+                            "run_name": "base",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            spec_path.write_text(
+                json.dumps(
+                    {
+                        "experiment_name": "synth_study",
+                        "base_config": str(base_config),
+                        "output_root": str(tmp_path / "study_outputs"),
+                        "n_repeats": 1,
+                        "repeat_seeds": [0],
+                        "n_perms": 10,
+                        "reuse_result_roots": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            spec = load_real_data_existence_consistency_spec(spec_path)
+            self.assertEqual(spec.experiment_name, "synth_study")
+            brc = build_run_config(str(spec.base_config), {})
+            self.assertEqual(brc.data.source, "synthetic")
+
     def test_spec_rejects_invalid_lengths(self) -> None:
         spec = RealDataExistenceConsistencyStudySpec(
             experiment_name="study",
@@ -138,7 +194,7 @@ class TestRealDataExistenceConsistencySpec(unittest.TestCase):
         self.assertEqual(conditions[1].run_name, "study__repeat-001__seed-009")
 
         loaded_spec = load_real_data_existence_consistency_spec(
-            REPO_ROOT / "configs/experiments/mouse_hippocampus_existence_consistency_study.json"
+            REPO_ROOT / "configs/experiments/consistency_study.json"
         )
         base_run_config = build_run_config(str(loaded_spec.base_config), {})
         run_config = build_repeat_run_config(

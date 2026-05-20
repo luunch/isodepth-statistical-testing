@@ -456,12 +456,18 @@ class TestFourierKmaxSmoke(unittest.TestCase):
             )
 
             spec = load_fourier_kmax_spec(spec_path)
-            manifest = run_fourier_kmax_sweep(spec)
+            manifest = run_fourier_kmax_sweep(spec, spec_path=str(spec_path))
             analysis = analyze_fourier_kmax_results(spec_path)
 
             self.assertEqual(len(manifest["runs"]), 2)
             self.assertEqual(analysis["n_rows_analyzed"], 2)
             self.assertTrue((output_root / "analysis" / "pvalue_vs_kmax.png").exists())
+            self.assertIn("config_snapshot", manifest)
+            snapshot = manifest["config_snapshot"]
+            self.assertEqual(snapshot["spec"]["experiment_name"], "fourier_kmax_study")
+            self.assertIn("base_config", snapshot["base_configs"])
+            base_contents = snapshot["base_configs"]["base_config"]["contents"]
+            self.assertEqual(base_contents["data"]["mode"], "fourier")
 
 
 if __name__ == "__main__":

@@ -94,7 +94,7 @@ class TestSubsetSelectionHelpers(unittest.TestCase):
             verbose=False,
         ).validate()
 
-        _, predictions = train_batched_isodepth_model(
+        _, outputs = train_batched_isodepth_model(
             s_batched,
             self.a,
             config,
@@ -103,7 +103,7 @@ class TestSubsetSelectionHelpers(unittest.TestCase):
             model_label="test subset masked trainer",
         )
 
-        self.assertEqual(predictions.shape, (2, self.s.shape[0], self.a.shape[1]))
+        self.assertEqual(outputs.model_metrics.shape, (2,))
 
 
 @unittest.skipUnless(HAS_TORCH, "torch is required for subset selection tests")

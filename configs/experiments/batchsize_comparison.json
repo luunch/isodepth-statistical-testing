@@ -1,8 +1,10 @@
 {
   "experiment_name": "batchsize_comparison",
-  "base_config": "configs/merfish_hypothalamus_batchsize_comparison.json",
+  "base_config": "configs/fourier_existence.json",
   "output_root": "results/experiments/batchsize_comparison",
   "base_epochs": 5000,
-  "batch_sizes": [512, 256],
+  "batch_sizes": [512, 256, 128, 64, 32, 8],
+  "n_perms": 100,
+  "n_reruns": 10,
   "device": "cuda"
 }

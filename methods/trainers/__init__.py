@@ -1,23 +1,39 @@
+from methods.trainers.gpu_selection import (
+    module_inference_device,
+    offload_module_to_cpu,
+    resolve_device,
+    run_with_cuda_oom_retry,
+)
 from methods.trainers.isodepth import (
+    BatchedTrainingOutputs,
+    build_batched_isodepth_initial_state,
     build_parallel_initial_state,
+    extract_celltype_model_isodepth,
     extract_model_isodepth,
     extract_parallel_slot_initial_state,
     evaluate_predictions,
     get_training_metadata,
-    resolve_device,
     train_batched_isodepth_model,
+    train_celltype_parallel_isodepth_model,
     train_isodepth_model,
     train_parallel_isodepth_model,
 )
 
 __all__ = [
+    "BatchedTrainingOutputs",
+    "build_batched_isodepth_initial_state",
     "build_parallel_initial_state",
+    "extract_celltype_model_isodepth",
     "extract_model_isodepth",
     "extract_parallel_slot_initial_state",
     "evaluate_predictions",
     "get_training_metadata",
+    "module_inference_device",
+    "offload_module_to_cpu",
     "resolve_device",
+    "run_with_cuda_oom_retry",
     "train_batched_isodepth_model",
+    "train_celltype_parallel_isodepth_model",
     "train_isodepth_model",
     "train_parallel_isodepth_model",
 ]

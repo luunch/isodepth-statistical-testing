@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -134,6 +135,123 @@ class TestSyntheticGeneration(unittest.TestCase):
         self.assertEqual(x_unique, 6)
         self.assertEqual(y_unique, 4)
 
+    def test_noise_semicircle_lattice_cell_count_and_region(self) -> None:
+        dataset = generate_synthetic_dataset(
+            DataConfig(
+                source="synthetic",
+                mode="noise",
+                n_cells=900,
+                n_genes=3,
+                sigma=0.1,
+                seed=42,
+                shape="semicircle",
+            )
+        )
+        self.assertEqual(dataset.n_cells, 900)
+        self.assertEqual(dataset.meta["shape"], "semicircle")
+        self.assertIn("lattice_resolution", dataset.meta)
+        S = np.asarray(dataset.S, dtype=np.float64)
+        self.assertTrue(np.all(S[:, 1] >= -1e-5))
+        self.assertTrue(np.all((S[:, 0] - 0.5) ** 2 + S[:, 1] ** 2 <= 0.25 + 1e-5))
+
+    def test_noise_square_cutout_lattice_cell_count_and_region(self) -> None:
+        dataset = generate_synthetic_dataset(
+            DataConfig(
+                source="synthetic",
+                mode="noise",
+                n_cells=900,
+                n_genes=3,
+                sigma=0.1,
+                seed=42,
+                shape="square_cutout",
+            )
+        )
+        self.assertEqual(dataset.n_cells, 900)
+        self.assertEqual(dataset.meta["shape"], "square_cutout")
+        self.assertIn("lattice_resolution", dataset.meta)
+        S = np.asarray(dataset.S, dtype=np.float64)
+        self.assertTrue(np.all(S >= -1e-5))
+        self.assertTrue(np.all(S <= 1.0 + 1e-5))
+        in_removed = (S[:, 1] >= -1e-5) & ((S[:, 0] - 0.5) ** 2 + S[:, 1] ** 2 <= 0.25 + 1e-5)
+        self.assertFalse(np.any(in_removed))
+
+    def test_noise_uniform_sampling_bias_cell_count_and_region(self) -> None:
+        dataset = generate_synthetic_dataset(
+            DataConfig(
+                source="synthetic",
+                mode="noise",
+                n_cells=900,
+                n_genes=3,
+                sigma=0.1,
+                seed=42,
+                shape="semicircle",
+                sampling_bias={"type": "uniform"},
+            )
+        )
+        self.assertEqual(dataset.n_cells, 900)
+        self.assertEqual(dataset.meta["sampling_bias"], {"type": "uniform"})
+        self.assertNotIn("lattice_resolution", dataset.meta)
+        self.assertNotIn("side_length", dataset.meta)
+        S = np.asarray(dataset.S, dtype=np.float64)
+        self.assertTrue(np.all(S[:, 1] >= -1e-5))
+        self.assertTrue(np.all((S[:, 0] - 0.5) ** 2 + S[:, 1] ** 2 <= 0.25 + 1e-5))
+
+    def test_uniform_sampling_bias_ignores_side_length_in_meta(self) -> None:
+        dataset = generate_synthetic_dataset(
+            DataConfig(
+                source="synthetic",
+                mode="noise",
+                n_cells=100,
+                n_genes=2,
+                shape="square",
+                side_length=10,
+                sampling_bias={"type": "uniform"},
+                seed=0,
+            )
+        )
+        self.assertNotIn("side_length", dataset.meta)
+        self.assertEqual(dataset.n_cells, 100)
+
+    def test_normal_sampling_bias_is_centered_and_in_shape(self) -> None:
+        dataset = generate_synthetic_dataset(
+            DataConfig(
+                source="synthetic",
+                mode="noise",
+                n_cells=2000,
+                n_genes=3,
+                sigma=0.1,
+                seed=7,
+                shape="square",
+                sampling_bias={"type": "normal", "variance": 0.05},
+            )
+        )
+        self.assertEqual(dataset.n_cells, 2000)
+        self.assertEqual(
+            dataset.meta["sampling_bias"], {"type": "normal", "variance": 0.05}
+        )
+        S = np.asarray(dataset.S, dtype=np.float64)
+        self.assertTrue(np.all(S >= -1e-5))
+        self.assertTrue(np.all(S <= 1.0 + 1e-5))
+        self.assertAlmostEqual(float(np.mean(S[:, 0])), 0.5, delta=0.05)
+        self.assertAlmostEqual(float(np.mean(S[:, 1])), 0.5, delta=0.05)
+
+    def test_normal_sampling_bias_respects_spatial_mask(self) -> None:
+        dataset = generate_synthetic_dataset(
+            DataConfig(
+                source="synthetic",
+                mode="noise",
+                n_cells=600,
+                n_genes=2,
+                sigma=0.1,
+                seed=3,
+                shape="square_cutout",
+                sampling_bias={"type": "normal", "variance": 0.2},
+            )
+        )
+        S = np.asarray(dataset.S, dtype=np.float64)
+        in_removed = (S[:, 1] >= -1e-5) & ((S[:, 0] - 0.5) ** 2 + S[:, 1] ** 2 <= 0.25 + 1e-5)
+        self.assertFalse(np.any(in_removed))
+
     def test_expression_manifold_respects_configured_polynomial_degree(self) -> None:
         simulator = SpatialDataSimulator(N=16, G=2, sigma=0.0, poly_degree=1)
         latent = np.linspace(0.0, 1.0, simulator.N)
@@ -226,6 +344,72 @@ class TestSyntheticGeneration(unittest.TestCase):
         self.assertIn("synthetic_true_curve_plot", payload["artifacts"])
         self.assertNotIn("synthetic_true_curve", payload["artifacts"]["dataset_meta"])
         self.assertTrue(payload["artifacts"]["dataset_meta"]["has_synthetic_true_curve"])
+
+    def test_standardized_outputs_writes_selected_genes_with_predictions(self) -> None:
+        dataset = generate_synthetic_dataset(
+            DataConfig(
+                source="synthetic",
+                mode="fourier",
+                n_cells=16,
+                n_genes=4,
+                sigma=0.1,
+                k_min=1,
+                k_max=2,
+                seed=7,
+            )
+        )
+        rng = np.random.RandomState(0)
+        pred = np.asarray(dataset.A, dtype=np.float32) + 0.01 * rng.randn(*dataset.A.shape).astype(np.float32)
+        depth = np.linspace(0.0, 1.0, dataset.n_cells, dtype=np.float32)
+        result = TestResult(
+            method_name="parallel_permutation",
+            metric="mse",
+            p_value=0.25,
+            stat_true=0.1,
+            stat_perm=np.asarray([0.2, 0.3], dtype=np.float64),
+            runtime_sec=0.01,
+            n_cells=dataset.n_cells,
+            n_genes=dataset.n_genes,
+            config={},
+            artifacts={
+                "pred_true": pred,
+                "true_isodepth": depth,
+                "lowest_isodepth": np.linspace(0.0, 1.0, dataset.n_cells, dtype=np.float32),
+                "lowest_S": np.asarray(dataset.S, dtype=np.float32),
+                "lowest_stat": 0.2,
+                "highest_isodepth": np.linspace(1.0, 0.0, dataset.n_cells, dtype=np.float32),
+                "highest_S": np.asarray(dataset.S, dtype=np.float32),
+                "highest_stat": 0.3,
+                "null_summary": {"mean": 0.25},
+            },
+        ).validate()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_config = RunConfig(
+                data=DataConfig(
+                    source="synthetic",
+                    mode="fourier",
+                    n_cells=16,
+                    n_genes=4,
+                    sigma=0.1,
+                    k_min=1,
+                    k_max=2,
+                    seed=7,
+                ),
+                output=OutputConfig(out_dir=tmpdir, run_name="selected_genes_test"),
+            ).validate()
+
+            payload, _ = save_standardized_outputs(dataset, result, run_config)
+
+            sg = Path(payload["artifacts"]["selected_genes_dir"])
+            self.assertTrue(sg.is_dir())
+            self.assertTrue((sg / "manifest.json").exists())
+            manifest = json.loads((sg / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["top_k"], 5)
+            self.assertEqual(len(manifest["scenarios"]), 1)
+            self.assertEqual(manifest["scenarios"][0]["subdir"], "primary")
+            pngs = list((sg / "primary").glob("*.png"))
+            self.assertEqual(len(pngs), min(5, dataset.n_genes))
 
     def test_standardized_outputs_save_synthetic_true_curve_plot(self) -> None:
         dataset = generate_synthetic_dataset(

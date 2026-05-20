@@ -83,13 +83,15 @@ class TestCrossValidationMethod(unittest.TestCase):
             model_label=None,
             a_batched=None,
             loss_mask_batched=None,
+            metric_loss_mask_batched=None,
         ):
             assert s_batched is not None
             assert loss_mask_batched is not None
+            assert metric_loss_mask_batched is not None
             s_batched_np = np.asarray(s_batched, dtype=np.float32)
             train_mask = np.asarray(loss_mask_batched, dtype=np.float32)
             recorded_masks.append(train_mask.copy())
-            test_mask = 1.0 - train_mask
+            test_mask = np.asarray(metric_loss_mask_batched, dtype=np.float32)
             n_models, n_cells, _ = s_batched_np.shape
             predictions = np.repeat(np.asarray(A, dtype=np.float32)[None, :, :], n_models, axis=0)
 
@@ -97,9 +99,22 @@ class TestCrossValidationMethod(unittest.TestCase):
             predictions[1, test_mask[1, :, 0] > 0, 0] += 1.0
             predictions[2, test_mask[2, :, 0] > 0, 0] += 2.0
 
-            class _MockModel:
+            from methods.subsampling import compute_masked_losses
+            from methods.trainers import BatchedTrainingOutputs
+
+            held_out_losses = compute_masked_losses(
+                predictions,
+                np.repeat(np.asarray(A, dtype=np.float32)[None, :, :], n_models, axis=0),
+                test_mask,
+                metric=config.metric,
+            )
+
+            class _MockModel(torch.nn.Module):
                 def __init__(self) -> None:
+                    super().__init__()
                     self.latent_dim = int(latent_dim)
+                    self.M = n_models
+                    self._dummy = torch.nn.Parameter(torch.zeros(1))
                     self.training_metadata = {
                         "n_reruns": int(config.n_reruns),
                         "selection_loss": "training_reconstruction_loss",
@@ -111,7 +126,18 @@ class TestCrossValidationMethod(unittest.TestCase):
                 def encoder(self, s_t: torch.Tensor) -> torch.Tensor:
                     return s_t[:, :, :1]
 
-            return _MockModel(), predictions
+            stat_perm = held_out_losses[1:]
+            best_null_index = int(np.argmin(stat_perm))
+            worst_null_index = int(np.argmax(stat_perm))
+            outputs = BatchedTrainingOutputs(
+                model_metrics=held_out_losses,
+                pred_true=np.asarray(predictions[0], dtype=np.float32),
+                pred_best_null=np.asarray(predictions[best_null_index + 1], dtype=np.float32),
+                pred_worst_null=np.asarray(predictions[worst_null_index + 1], dtype=np.float32),
+                best_null_index=best_null_index,
+                worst_null_index=worst_null_index,
+            )
+            return _MockModel(), outputs, s_batched_np
 
         with patch(
             "methods.permutation.train_parallel_isodepth_model",

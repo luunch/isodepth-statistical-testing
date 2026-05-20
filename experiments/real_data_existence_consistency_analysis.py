@@ -187,7 +187,7 @@ def analyze_real_data_existence_consistency_results(spec_path: str | Path) -> di
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Analyze a real-data existence consistency study.")
+    parser = argparse.ArgumentParser(description="Analyze an existence consistency study (h5ad or synthetic).")
     parser.add_argument("--spec", required=True, help="Path to the experiment spec JSON")
     return parser
 

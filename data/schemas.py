@@ -22,6 +22,106 @@ SUPPORTED_SYNTHETIC_MODES = {
     "radial",
 }
 
+SUPPORTED_SPATIAL_SHAPES = frozenset({"square", "semicircle", "circle", "triangle", "square_cutout"})
+
+SUPPORTED_SAMPLING_BIAS = frozenset({"uniform", "normal", "anisotropic_normal"})
+
+
+@dataclass
+class SamplingBiasConfig:
+    """Spatial cell-sampling bias for synthetic datasets.
+
+    - ``type='uniform'`` is Lebesgue-uniform on the configured spatial shape (no ``variance``).
+    - ``type='normal'`` is isotropic Gaussian centered at ``(0.5, 0.5)`` with per-axis
+      variance ``variance`` (i.e. covariance ``variance * I_2``); ``variance`` must be a
+      positive scalar.
+    - ``type='anisotropic_normal'`` is a diagonal-covariance Gaussian centered at ``(0.5, 0.5)``
+      with covariance ``diag(variance[0], variance[1])`` (per-axis variances `\sigma_x^2`,
+      `\sigma_y^2`); ``variance`` must be a length-2 list/tuple of positive floats. Useful for
+      midline-style densities (e.g. ``variance=[0.003, 0.05]`` produces a vertical strip).
+
+    All Gaussian variants are rejection-sampled inside the spatial mask intersected with
+    ``[0, 1]^2``.
+    """
+
+    type: str = "uniform"
+    variance: Optional[Any] = None
+
+    def validate(self) -> "SamplingBiasConfig":
+        if self.type not in SUPPORTED_SAMPLING_BIAS:
+            raise ValueError(
+                f"Unsupported data.sampling_bias.type {self.type!r}. "
+                f"Expected one of {sorted(SUPPORTED_SAMPLING_BIAS)}"
+            )
+        if self.type == "normal":
+            if self.variance is None:
+                raise ValueError("data.sampling_bias.variance is required when type='normal'")
+            if isinstance(self.variance, (list, tuple)):
+                raise ValueError(
+                    "data.sampling_bias.variance must be a positive scalar when type='normal'; "
+                    "use type='anisotropic_normal' for per-axis variances"
+                )
+            self.variance = float(self.variance)
+            if self.variance <= 0.0:
+                raise ValueError("data.sampling_bias.variance must be > 0 when provided")
+        elif self.type == "anisotropic_normal":
+            if self.variance is None:
+                raise ValueError(
+                    "data.sampling_bias.variance is required when type='anisotropic_normal' "
+                    "and must be a length-2 list [\u03c3_x\u00b2, \u03c3_y\u00b2]"
+                )
+            if not isinstance(self.variance, (list, tuple)) or len(self.variance) != 2:
+                raise ValueError(
+                    "data.sampling_bias.variance must be a length-2 list/tuple "
+                    "[\u03c3_x\u00b2, \u03c3_y\u00b2] when type='anisotropic_normal'"
+                )
+            self.variance = [float(self.variance[0]), float(self.variance[1])]
+            if any(v <= 0.0 for v in self.variance):
+                raise ValueError(
+                    "data.sampling_bias.variance entries must be > 0 when type='anisotropic_normal'"
+                )
+        else:  # uniform
+            if self.variance is not None:
+                raise ValueError(
+                    f"data.sampling_bias.variance is only supported when type in "
+                    f"{{'normal', 'anisotropic_normal'}} (got type={self.type!r})"
+                )
+        return self
+
+    def to_meta(self) -> Dict[str, Any]:
+        meta: Dict[str, Any] = {"type": str(self.type)}
+        if self.variance is not None:
+            if isinstance(self.variance, (list, tuple)):
+                meta["variance"] = [float(v) for v in self.variance]
+            else:
+                meta["variance"] = float(self.variance)
+        return meta
+
+
+_SAMPLING_BIAS_ALLOWED_KEYS = frozenset({"type", "variance"})
+
+
+def _sampling_bias_from_raw(raw: Any) -> Optional[SamplingBiasConfig]:
+    if raw is None:
+        return None
+    if isinstance(raw, SamplingBiasConfig):
+        return raw
+    if isinstance(raw, str):
+        return SamplingBiasConfig(type=raw.strip())
+    if isinstance(raw, Mapping):
+        unknown = set(raw.keys()) - _SAMPLING_BIAS_ALLOWED_KEYS
+        if unknown:
+            raise ValueError(
+                f"data.sampling_bias has unsupported keys {sorted(unknown)}; "
+                f"allowed: {sorted(_SAMPLING_BIAS_ALLOWED_KEYS)}"
+            )
+        return SamplingBiasConfig(**dict(raw))
+    raise TypeError(
+        "data.sampling_bias must be a mapping like {\"type\": \"uniform\"} or "
+        "{\"type\": \"normal\", \"variance\": 0.05}, a string such as \"uniform\", or null; "
+        f"got {type(raw).__name__}"
+    )
+
 SUPPORTED_PERMUTATION_METHODS = {
     "parallel_permutation",
     "cross_validation",
@@ -84,7 +184,7 @@ class DataConfig:
     use_raw: bool = False
     min_cells_per_gene: int = 0
     log1p: bool = False
-    standardize: bool = True
+    standardize_expression: bool = True
     q: Optional[int] = None
     max_cells: Optional[int] = None
     seed: int = 0
@@ -99,6 +199,31 @@ class DataConfig:
     dependent_xy: bool = True
     poly_degree: int = 3
     side_length: Optional[int] = None
+    shape: str = "square"
+    sampling_bias: Optional[SamplingBiasConfig] = None
+    standardize_coordinates: bool = True
+    cell_type: Any = False
+    cell_type_key: str = "cell_type"
+    min_cells_per_celltype: int = 1
+
+    def __post_init__(self) -> None:
+        if self.sampling_bias is not None and not isinstance(self.sampling_bias, SamplingBiasConfig):
+            self.sampling_bias = _sampling_bias_from_raw(self.sampling_bias)
+
+    @property
+    def cell_type_mode(self) -> str:
+        """Returns ``'none'``, ``'together'``, or ``'separate'``."""
+        ct = self.cell_type
+        if ct is False or ct is None:
+            return "none"
+        if ct is True or ct == "together":
+            return "together"
+        if ct == "separate":
+            return "separate"
+        raise ValueError(
+            f"Unsupported data.cell_type value {ct!r}; "
+            "expected false, true, \"together\", or \"separate\""
+        )
 
     def validate(self) -> "DataConfig":
         if self.source not in {"h5ad", "synthetic"}:
@@ -135,11 +260,28 @@ class DataConfig:
             raise ValueError("data.poly_degree is only supported when data.source='synthetic'")
         if self.source != "synthetic" and self.side_length is not None:
             raise ValueError("data.side_length is only supported when data.source='synthetic'")
+        if self.source != "synthetic" and self.shape != "square":
+            raise ValueError("data.shape is only supported when data.source='synthetic'")
+        if self.source != "synthetic" and self.sampling_bias is not None:
+            raise ValueError("data.sampling_bias is only supported when data.source='synthetic'")
+        if self.shape not in SUPPORTED_SPATIAL_SHAPES:
+            raise ValueError(
+                f"Unsupported data.shape '{self.shape}'. Expected one of {sorted(SUPPORTED_SPATIAL_SHAPES)}"
+            )
         if self.max_cells is not None and self.max_cells <= 0:
             raise ValueError("data.max_cells must be > 0 when provided")
+        _ = self.cell_type_mode
+        if self.cell_type_mode != "none" and self.source != "h5ad":
+            raise ValueError("data.cell_type is only supported when data.source='h5ad'")
+        if self.min_cells_per_celltype < 1:
+            raise ValueError("data.min_cells_per_celltype must be >= 1")
         if self.n_cells <= 0 or self.n_genes <= 0:
             raise ValueError("Synthetic data requires positive n_cells and n_genes")
         if self.source == "synthetic":
+            if self.sampling_bias is not None:
+                if not isinstance(self.sampling_bias, SamplingBiasConfig):
+                    self.sampling_bias = _sampling_bias_from_raw(self.sampling_bias)
+                self.sampling_bias = self.sampling_bias.validate()
             if self.mode not in SUPPORTED_SYNTHETIC_MODES:
                 raise ValueError(
                     f"Unsupported synthetic data mode '{self.mode}'. Expected one of {sorted(SUPPORTED_SYNTHETIC_MODES)}"
@@ -163,11 +305,39 @@ class DataConfig:
                     raise ValueError("data.dependent_xy is only supported when data.mode='fourier'")
             if self.mode != "noise" and self.side_length is not None:
                 raise ValueError("data.side_length is only supported when data.mode='noise'")
-            if self.mode == "noise" and self.side_length is not None:
+            if self.shape != "square" and self.side_length is not None:
+                raise ValueError(
+                    "data.side_length is only supported when data.shape='square'; "
+                    "omit side_length for semicircle, circle, or triangle (the lattice is sized from data.n_cells)"
+                )
+            if (
+                self.mode == "noise"
+                and self.side_length is not None
+                and self.shape == "square"
+                and self.sampling_bias is None
+            ):
                 if self.n_cells % int(self.side_length) != 0:
                     raise ValueError(
                         "When data.side_length is set for noise mode, data.n_cells must be divisible by data.side_length"
                     )
+        return self
+
+
+SUPPORTED_COVARIATE_TYPES = frozenset({"midline"})
+
+
+@dataclass
+class CovariateConfig:
+    """Optional fixed bottleneck / isodepth specification (decoder-only training for supported types)."""
+
+    type: Optional[str] = None
+
+    def validate(self) -> "CovariateConfig":
+        if self.type is not None and self.type not in SUPPORTED_COVARIATE_TYPES:
+            raise ValueError(
+                f"Unsupported test.covariate.type '{self.type}'. "
+                f"Expected one of {sorted(SUPPORTED_COVARIATE_TYPES)} or null."
+            )
         return self
 
 
@@ -183,10 +353,10 @@ class TestConfig:
     n_nulls: int = 50
     epochs: int = 5000
     lr: float = 1e-3
-    patience: int = 50
+    patience: int = 0
     seed: int = 0
-    device: str = "auto"
-    decoder: str = "linear"
+    device: str = "cuda"
+    decoder: str = "nn"
     batch_size: Optional[int] = None
     sgd_batch_size: Optional[int] = None
     sgd_cosine_lr_decay: bool = False
@@ -196,6 +366,7 @@ class TestConfig:
     perturb_target: str = "coordinates"
     subset_fractions: list[float] = field(default_factory=lambda: [0.5, 0.7, 0.9])
     verbose: bool = True
+    covariate: Optional[CovariateConfig] = None
 
     def validate(self) -> "TestConfig":
         if self.method not in SUPPORTED_PERMUTATION_METHODS:
@@ -220,8 +391,8 @@ class TestConfig:
             raise ValueError("test.epochs must be > 0")
         if self.lr <= 0:
             raise ValueError("test.lr must be > 0")
-        if self.patience <= 0:
-            raise ValueError("test.patience must be > 0")
+        if self.patience < 0:
+            raise ValueError("test.patience must be >= 0 (0 disables early stopping)")
         if self.decoder not in SUPPORTED_DECODER_TYPES:
             raise ValueError(
                 f"Unsupported test.decoder '{self.decoder}'. Expected one of {sorted(SUPPORTED_DECODER_TYPES)}"
@@ -303,6 +474,15 @@ class TestConfig:
             raise ValueError(
                 "test.metric for exact_existence must be one of ['mse', 'nll_gaussian_mse']"
             )
+
+        if self.covariate is not None:
+            self.covariate.validate()
+            if self.covariate.type == "midline":
+                if self.method == "exact_existence":
+                    raise ValueError(
+                        "test.covariate.type 'midline' is incompatible with test.method 'exact_existence' "
+                        "(midline fixes a 1D depth; use parallel_permutation, cross_validation, or full_retraining)."
+                    )
         return self
 
 
@@ -387,22 +567,46 @@ class TestResult:
         }
 
 
+def _covariate_config_from_raw(raw: Any) -> CovariateConfig:
+    """Build ``CovariateConfig`` from JSON/YAML: nested dict, or shorthand string ``\"midline\"``."""
+    if isinstance(raw, CovariateConfig):
+        return raw
+    if isinstance(raw, str):
+        return CovariateConfig(type=raw.strip() or None)
+    if isinstance(raw, Mapping):
+        return CovariateConfig(**dict(raw))
+    raise TypeError(
+        "test.covariate must be a mapping like {\"type\": \"midline\"}, "
+        f"a string such as \"midline\", or omitted; got {type(raw).__name__}"
+    )
+
+
 def run_config_from_mapping(mapping: Optional[Mapping[str, Any]]) -> RunConfig:
     mapping = dict(mapping or {})
+    test_mapping = dict(mapping.get("test", {}))
+    covariate_raw = test_mapping.pop("covariate", None)
+    test_config = TestConfig(**test_mapping)
+    if covariate_raw is not None:
+        test_config.covariate = _covariate_config_from_raw(covariate_raw)
     return RunConfig(
         data=DataConfig(**dict(mapping.get("data", {}))),
-        test=TestConfig(**dict(mapping.get("test", {}))),
+        test=test_config.validate(),
         output=OutputConfig(**dict(mapping.get("output", {}))),
     ).validate()
 
 
 __all__ = [
     "CANONICAL_METRICS",
+    "CovariateConfig",
     "DataConfig",
     "DatasetBundle",
     "OutputConfig",
     "RunConfig",
+    "SUPPORTED_COVARIATE_TYPES",
     "SUPPORTED_EXISTENCE_METHODS",
+    "SUPPORTED_SAMPLING_BIAS",
+    "SamplingBiasConfig",
+    "SUPPORTED_SPATIAL_SHAPES",
     "SUPPORTED_SYNTHETIC_MODES",
     "SUPPORTED_PERMUTATION_METHODS",
     "TestConfig",

@@ -36,8 +36,30 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-cells-per-gene", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--log1p", dest="log1p", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--no-log1p", dest="log1p", action="store_false", default=argparse.SUPPRESS)
-    parser.add_argument("--standardize", dest="standardize", action="store_true", default=argparse.SUPPRESS)
-    parser.add_argument("--no-standardize", dest="standardize", action="store_false", default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--standardize-expression",
+        dest="standardize_expression",
+        action="store_true",
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--no-standardize-expression",
+        dest="standardize_expression",
+        action="store_false",
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--standardize-coordinates",
+        dest="standardize_coordinates",
+        action="store_true",
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--no-standardize-coordinates",
+        dest="standardize_coordinates",
+        action="store_false",
+        default=argparse.SUPPRESS,
+    )
     parser.add_argument("--q", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--max-cells", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--mode", default=argparse.SUPPRESS)
@@ -100,6 +122,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_false",
         default=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--covariate-type",
+        dest="covariate_type",
+        choices=["midline"],
+        default=argparse.SUPPRESS,
+        help="Fixed bottleneck covariate: midline uses d(x,y)=|x-median(x)|; only the decoder is trained.",
+    )
     return parser
 
 
@@ -118,7 +147,8 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict:
         "use_raw": "use_raw",
         "min_cells_per_gene": "min_cells_per_gene",
         "log1p": "log1p",
-        "standardize": "standardize",
+        "standardize_expression": "standardize_expression",
+        "standardize_coordinates": "standardize_coordinates",
         "q": "q",
         "max_cells": "max_cells",
         "mode": "mode",
@@ -158,6 +188,9 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict:
     }.items():
         if hasattr(args, arg_name):
             test_overrides[config_key] = getattr(args, arg_name)
+
+    if hasattr(args, "covariate_type"):
+        test_overrides["covariate"] = {"type": args.covariate_type}
 
     for arg_name, config_key in {
         "out_dir": "out_dir",

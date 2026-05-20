@@ -9,7 +9,6 @@ from data.schemas import DatasetBundle, TestConfig, TestResult
 from methods.metrics import (
     canonicalize_metric_name,
     compute_metric,
-    compute_metric_batch,
     metric_prefers_lower,
     permutation_p_value,
 )
@@ -121,7 +120,7 @@ def _run_perturbation_batch(
     a_batched: np.ndarray | None = None,
 ) -> tuple[object, np.ndarray, np.ndarray, np.ndarray]:
     s_batched, delta_per_score = _build_perturbation_batch(S, config, seed_base=seed_base)
-    model, _ = train_parallel_isodepth_model(
+    model, _, _ = train_parallel_isodepth_model(
         S,
         A,
         config,
@@ -182,7 +181,7 @@ def _run_grouped_null_batches(
             a_null = np.asarray(A[perm], dtype=np.float32)
             a_group[block_start:block_stop] = a_null[None, :, :]
 
-        model, _ = train_parallel_isodepth_model(
+        model, _, _ = train_parallel_isodepth_model(
             S,
             A,
             config,
@@ -311,7 +310,7 @@ def run_perturbation_test(
         config,
         seed_base=config.seed,
     )
-    observed_model, observed_predictions = train_parallel_isodepth_model(
+    observed_model, observed_outputs, _ = train_parallel_isodepth_model(
         dataset.S,
         dataset.A,
         config,
@@ -319,9 +318,8 @@ def run_perturbation_test(
         device=device,
         model_label=f"perturbation batch (observed + {config.n_perms} perturbed models)",
     )
-    observed_model_losses = compute_metric_batch(metric, dataset.A, observed_predictions)
-    observed_stat = float(observed_model_losses[0])
-    null_losses = np.asarray(observed_model_losses[1:], dtype=np.float64)
+    observed_stat = float(observed_outputs.stat_true)
+    null_losses = observed_outputs.stat_perm
     observed_isodepth_batched = _extract_isodepth_batch(
         observed_model,
         observed_s_batched,

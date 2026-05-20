@@ -4,7 +4,7 @@ import argparse
 import json
 
 from data import load_dataset
-from experiments.configuration import build_run_config, save_standardized_outputs
+from experiments.configuration import build_manifest_config_snapshot, build_run_config, save_standardized_outputs
 from experiments.real_data_existence_consistency import (
     RealDataExistenceConsistencyStudySpec,
     analysis_dir_for_spec,
@@ -18,6 +18,7 @@ from experiments.real_data_existence_consistency import (
 def run_real_data_existence_consistency_sweep(
     spec: RealDataExistenceConsistencyStudySpec,
     *,
+    spec_path: str | None = None,
     dry_run: bool = False,
     max_runs: int | None = None,
 ) -> dict[str, object]:
@@ -35,6 +36,10 @@ def run_real_data_existence_consistency_sweep(
         "n_perms": int(spec.n_perms),
         "runs": [],
     }
+    if spec_path is not None:
+        manifest_payload["config_snapshot"] = build_manifest_config_snapshot(
+            spec_path, {"base_config": spec.base_config},
+        )
 
     if dry_run:
         manifest_payload["planned_run_count"] = len(conditions)
@@ -77,7 +82,7 @@ def run_real_data_existence_consistency_sweep(
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run a real-data existence consistency study.")
+    parser = argparse.ArgumentParser(description="Run an existence consistency sweep (h5ad or synthetic base_config).")
     parser.add_argument("--spec", required=True, help="Path to the experiment spec JSON")
     parser.add_argument("--dry-run", action="store_true", help="Print the planned runs without executing them")
     parser.add_argument("--max-runs", type=int, default=None, help="Optional cap on the number of planned runs")
@@ -87,7 +92,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _build_arg_parser().parse_args()
     spec = load_real_data_existence_consistency_spec(args.spec)
-    payload = run_real_data_existence_consistency_sweep(spec, dry_run=args.dry_run, max_runs=args.max_runs)
+    payload = run_real_data_existence_consistency_sweep(spec, spec_path=args.spec, dry_run=args.dry_run, max_runs=args.max_runs)
     print(json.dumps(payload, indent=2))
 
 

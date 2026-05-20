@@ -1,20 +1,21 @@
 {
   "data": {
     "source": "synthetic",
-    "mode": "noise",
-    "n_cells": 900,
+    "mode": "radial",
+    "n_cells": 5000,
     "n_genes": 20,
-    "side_length": 10,
-    "sigma": 0.1,
+    "shape": "square",
+    "sampling_bias": {"type": "uniform"},
+    "sigma": 0,
     "poly_degree": 1,
     "seed": 42
   },
   "test": {
     "method": "parallel_permutation",
     "metric": "nll_gaussian_mse",
-    "n_perms": 50,
-    "epochs": 500,
-    "n_reruns": 10,
+    "n_perms": 100,
+    "epochs": 1000,
+    "n_reruns": 1,
     "lr": 0.001,
     "patience": 50,
     "seed": 42,
@@ -25,7 +26,7 @@
   },
   "output": {
     "out_dir": "results",
-    "run_name": "noise_existence",
+    "run_name": "radial",
     "save_preds": false,
     "save_perm_stats": true
   }

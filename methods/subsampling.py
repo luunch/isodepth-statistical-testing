@@ -301,7 +301,7 @@ def run_subsampling_test(
     s_batched = np.repeat(np.asarray(dataset.S, dtype=np.float32)[None, :, :], total_subsets, axis=0)
     a_batched = np.repeat(np.asarray(dataset.A, dtype=np.float32)[None, :, :], total_subsets, axis=0)
 
-    observed_model, observed_predictions = train_batched_isodepth_model(
+    observed_model, observed_outputs = train_batched_isodepth_model(
         s_batched,
         dataset.A,
         config,
@@ -311,12 +311,7 @@ def run_subsampling_test(
         model_label=f"subsampling batch ({total_subsets} subset refits)",
     )
     observed_isodepth_batched = _extract_isodepth_batch(observed_model, s_batched, device)
-    subset_losses = compute_masked_losses(
-        observed_predictions,
-        a_batched,
-        loss_mask_batched,
-        metric=metric,
-    )
+    subset_losses = np.asarray(observed_outputs.model_metrics, dtype=np.float64)
     scaled_losses = np.asarray(subset_losses / np.asarray(fraction_per_subset, dtype=np.float64), dtype=np.float64)
     observed_correlations = compute_subset_correlations(
         true_isodepth,
@@ -437,7 +432,7 @@ def run_comparison_subsampling_test(
     s_batched = np.repeat(np.asarray(dataset.S, dtype=np.float32)[None, :, :], total_subsets, axis=0)
     a_batched = np.repeat(np.asarray(dataset.A, dtype=np.float32)[None, :, :], total_subsets, axis=0)
 
-    observed_model, observed_predictions = train_batched_isodepth_model(
+    observed_model, observed_outputs = train_batched_isodepth_model(
         s_batched,
         dataset.A,
         config,
@@ -447,12 +442,7 @@ def run_comparison_subsampling_test(
         model_label=f"subset selection batch ({total_subsets} subset refits)",
     )
     observed_isodepth_batched = _extract_isodepth_batch(observed_model, s_batched, device)
-    observed_losses = compute_masked_losses(
-        observed_predictions,
-        a_batched,
-        loss_mask_batched,
-        metric=metric,
-    )
+    observed_losses = np.asarray(observed_outputs.model_metrics, dtype=np.float64)
     observed_correlations = compute_subset_correlations(
         true_isodepth,
         observed_isodepth_batched,
@@ -479,7 +469,7 @@ def run_comparison_subsampling_test(
             a_group[block_start:block_stop] = a_perm[None, :, :]
             mask_group[block_start:block_stop] = loss_mask_batched
 
-        _, null_predictions = train_batched_isodepth_model(
+        _, null_outputs = train_batched_isodepth_model(
             s_group,
             dataset.A,
             config,
@@ -488,12 +478,7 @@ def run_comparison_subsampling_test(
             loss_mask_batched=mask_group,
             model_label=f"subset null batch {group_start + 1}-{group_stop}/{config.n_nulls}",
         )
-        grouped_losses = compute_masked_losses(
-            null_predictions,
-            a_group,
-            mask_group,
-            metric=metric,
-        )
+        grouped_losses = np.asarray(null_outputs.model_metrics, dtype=np.float64)
         grouped_losses = grouped_losses.reshape(active_nulls, total_subsets)
         null_losses_per_subset[group_start:group_stop] = grouped_losses
         stat_perm[group_start:group_stop] = grouped_losses.mean(axis=1)

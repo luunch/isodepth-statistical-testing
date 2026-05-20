@@ -20,7 +20,13 @@ from data.synthetic import generate_synthetic_dataset
 from experiments.configuration import save_standardized_outputs
 from methods.architectures import ParallelLinear
 from methods.permutation import run_exact_existence_method
-from methods.trainers import get_training_metadata, resolve_device, train_batched_isodepth_model, train_isodepth_model
+from methods.trainers import (
+    BatchedTrainingOutputs,
+    get_training_metadata,
+    resolve_device,
+    train_batched_isodepth_model,
+    train_isodepth_model,
+)
 
 
 class TestExactExistenceSchema(unittest.TestCase):
@@ -96,14 +102,15 @@ class TestLatentDimensionTraining(unittest.TestCase):
         for decoder in ("linear", "nn"):
             config = TestConfig(**{**self.config.__dict__, "decoder": decoder})
             for latent_dim in (1, 2, 3):
-                model, predictions = train_batched_isodepth_model(
+                model, training_outputs = train_batched_isodepth_model(
                     s_batched,
                     self.dataset.A,
                     config,
                     device=device,
                     latent_dim=latent_dim,
                 )
-                self.assertEqual(predictions.shape, (2, self.dataset.n_cells, self.dataset.n_genes))
+                self.assertEqual(training_outputs.model_metrics.shape, (2,))
+                self.assertEqual(training_outputs.pred_true.shape, (self.dataset.n_cells, self.dataset.n_genes))
                 self.assertEqual(getattr(model, "decoder_type"), decoder)
                 if decoder == "linear":
                     self.assertIsInstance(model.decoder, ParallelLinear)
@@ -143,26 +150,27 @@ class TestLatentDimensionTraining(unittest.TestCase):
     def test_batched_training_is_deterministic_for_fixed_seed(self) -> None:
         s_batched = np.stack([self.dataset.S, self.dataset.S[::-1]], axis=0)
         device = resolve_device("cpu")
-        _, predictions_a = train_batched_isodepth_model(
+        _, outputs_a = train_batched_isodepth_model(
             s_batched,
             self.dataset.A,
             self.config,
             device=device,
             latent_dim=2,
         )
-        _, predictions_b = train_batched_isodepth_model(
+        _, outputs_b = train_batched_isodepth_model(
             s_batched,
             self.dataset.A,
             self.config,
             device=device,
             latent_dim=2,
         )
-        np.testing.assert_allclose(predictions_a, predictions_b, atol=1e-7)
+        np.testing.assert_allclose(outputs_a.model_metrics, outputs_b.model_metrics, atol=1e-7)
+        np.testing.assert_allclose(outputs_a.pred_true, outputs_b.pred_true, atol=1e-7)
 
     def test_zero_sgd_batch_size_matches_default_training(self) -> None:
         s_batched = np.stack([self.dataset.S, self.dataset.S[::-1]], axis=0)
         device = resolve_device("cpu")
-        _, predictions_default = train_batched_isodepth_model(
+        _, outputs_default = train_batched_isodepth_model(
             s_batched,
             self.dataset.A,
             self.config,
@@ -170,35 +178,34 @@ class TestLatentDimensionTraining(unittest.TestCase):
             latent_dim=2,
         )
         config_zero_sgd = TestConfig(**{**self.config.__dict__, "sgd_batch_size": 0})
-        _, predictions_zero_sgd = train_batched_isodepth_model(
+        _, outputs_zero_sgd = train_batched_isodepth_model(
             s_batched,
             self.dataset.A,
             config_zero_sgd,
             device=device,
             latent_dim=2,
         )
-        np.testing.assert_allclose(predictions_default, predictions_zero_sgd, atol=1e-7)
+        np.testing.assert_allclose(outputs_default.model_metrics, outputs_zero_sgd.model_metrics, atol=1e-7)
 
     def test_batched_training_supports_sgd_minibatches(self) -> None:
         s_batched = np.stack([self.dataset.S, self.dataset.S[::-1]], axis=0)
         device = resolve_device("cpu")
         minibatch_config = TestConfig(**{**self.config.__dict__, "sgd_batch_size": 5})
-        model_a, predictions_a = train_batched_isodepth_model(
+        model_a, outputs_a = train_batched_isodepth_model(
             s_batched,
             self.dataset.A,
             minibatch_config,
             device=device,
             latent_dim=2,
         )
-        model_b, predictions_b = train_batched_isodepth_model(
+        model_b, outputs_b = train_batched_isodepth_model(
             s_batched,
             self.dataset.A,
             minibatch_config,
             device=device,
             latent_dim=2,
         )
-        self.assertEqual(predictions_a.shape, (2, self.dataset.n_cells, self.dataset.n_genes))
-        np.testing.assert_allclose(predictions_a, predictions_b, atol=1e-7)
+        np.testing.assert_allclose(outputs_a.model_metrics, outputs_b.model_metrics, atol=1e-7)
         self.assertEqual(int(getattr(model_a, "latent_dim")), 2)
         self.assertEqual(int(getattr(model_b, "latent_dim")), 2)
 
@@ -225,7 +232,7 @@ class TestLatentDimensionTraining(unittest.TestCase):
             return original_snapshot(model, n_models)
 
         with patch("methods.trainers.isodepth._snapshot_parallel_model_state", side_effect=_record_snapshot):
-            model, predictions = train_batched_isodepth_model(
+            model, training_outputs = train_batched_isodepth_model(
                 s_batched,
                 self.dataset.A,
                 config,
@@ -235,7 +242,7 @@ class TestLatentDimensionTraining(unittest.TestCase):
 
         metadata = get_training_metadata(model)
         self.assertEqual(recorded_slot_counts[0], 6)
-        self.assertEqual(predictions.shape, (2, self.dataset.n_cells, self.dataset.n_genes))
+        self.assertEqual(training_outputs.model_metrics.shape, (2,))
         self.assertEqual(metadata["train_loss_per_rerun"].shape, (2, 3))
 
     def test_batched_trainer_preserves_true_rerun_isodepths_in_metadata(self) -> None:
@@ -299,7 +306,19 @@ class TestExactExistenceMethod(unittest.TestCase):
         )
 
     @staticmethod
-    def _mock_train_parallel_isodepth_model(S, A, config, *, device=None, s_batched=None, latent_dim=1, model_label=None, a_batched=None, loss_mask_batched=None):
+    def _mock_train_parallel_isodepth_model(
+        S,
+        A,
+        config,
+        *,
+        device=None,
+        s_batched=None,
+        latent_dim=1,
+        model_label=None,
+        a_batched=None,
+        loss_mask_batched=None,
+        metric_loss_mask_batched=None,
+    ):
         if s_batched is None:
             s_batched_np = np.repeat(np.asarray(S, dtype=np.float32)[None, :, :], config.n_perms + 1, axis=0)
         else:
@@ -318,9 +337,12 @@ class TestExactExistenceMethod(unittest.TestCase):
         elif latent_dim >= 3:
             preds[:] = np.repeat(A[None, :, :], n_models, axis=0)
 
-        class _MockModel:
+        class _MockModel(torch.nn.Module):
             def __init__(self, dim: int):
+                super().__init__()
                 self.latent_dim = dim
+                self.M = n_models
+                self._dummy = torch.nn.Parameter(torch.zeros(1))
                 self.training_metadata = {
                     "n_reruns": int(config.n_reruns),
                     "selection_loss": "training_reconstruction_loss",
@@ -338,7 +360,20 @@ class TestExactExistenceMethod(unittest.TestCase):
                 return torch.cat([s_t[:, :, :2], extra], dim=2)
 
         model = _MockModel(latent_dim)
-        return model, preds
+        from methods.metrics import compute_metric_batch
+
+        model_metrics = compute_metric_batch(config.metric, A, preds)
+        stat_perm = model_metrics[1:]
+        best_null_index = int(np.argmin(stat_perm))
+        worst_null_index = int(np.argmax(stat_perm))
+        return model, BatchedTrainingOutputs(
+            model_metrics=model_metrics,
+            pred_true=np.asarray(preds[0], dtype=np.float32),
+            pred_best_null=np.asarray(preds[best_null_index + 1], dtype=np.float32),
+            pred_worst_null=np.asarray(preds[worst_null_index + 1], dtype=np.float32),
+            best_null_index=best_null_index,
+            worst_null_index=worst_null_index,
+        ), s_batched_np
 
     def test_exact_existence_selects_two_dimensions_and_stops(self) -> None:
         with patch("methods.permutation.train_parallel_isodepth_model", side_effect=self._mock_train_parallel_isodepth_model):
@@ -354,11 +389,28 @@ class TestExactExistenceMethod(unittest.TestCase):
 
     def test_exact_existence_can_stop_at_zero_dimensions(self) -> None:
         def no_gain(*args, **kwargs):
-            model, preds = self._mock_train_parallel_isodepth_model(*args, **kwargs)
+            model, outputs, s_np = self._mock_train_parallel_isodepth_model(*args, **kwargs)
             latent_dim = int(kwargs.get("latent_dim", 1))
             if latent_dim >= 1:
-                preds[:] = self.dataset.A.mean(axis=0, keepdims=True)
-            return model, preds
+                from methods.metrics import compute_metric_batch
+
+                config = args[2]
+                mean_pred = np.broadcast_to(
+                    self.dataset.A.mean(axis=0, keepdims=True),
+                    (self.dataset.n_cells, self.dataset.n_genes),
+                ).astype(np.float32)
+                n_models = len(outputs.model_metrics)
+                uniform_preds = np.repeat(mean_pred[None, :, :], n_models, axis=0)
+                uniform_metrics = compute_metric_batch(config.metric, self.dataset.A, uniform_preds)
+                return model, BatchedTrainingOutputs(
+                    model_metrics=uniform_metrics,
+                    pred_true=mean_pred.copy(),
+                    pred_best_null=mean_pred.copy(),
+                    pred_worst_null=mean_pred.copy(),
+                    best_null_index=0,
+                    worst_null_index=0,
+                ), s_np
+            return model, outputs, s_np
 
         with patch("methods.permutation.train_parallel_isodepth_model", side_effect=no_gain):
             result = run_exact_existence_method(self.dataset, self.config, device=resolve_device("cpu"))

@@ -82,8 +82,13 @@ def load_real_data_existence_consistency_spec(path: str | Path) -> RealDataExist
     ).validate()
 
     base_run_config = build_run_config(str(spec.base_config), {})
-    if base_run_config.data.source != "h5ad":
-        raise ValueError("base_config must use data.source='h5ad'")
+    allowed_sources = frozenset({"h5ad", "synthetic"})
+    if base_run_config.data.source not in allowed_sources:
+        raise ValueError(
+            "base_config data.source must be "
+            f"{', '.join(sorted(allowed_sources))} (same as DataConfig); "
+            f"got {base_run_config.data.source!r}"
+        )
     if base_run_config.test.method not in SUPPORTED_EXISTENCE_METHODS:
         raise ValueError(
             "base_config must use an existence test.method in "

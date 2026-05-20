@@ -28,7 +28,7 @@ def filter_genes_by_min_cells(a: np.ndarray, min_cells_per_gene: int = 0) -> np.
     return filtered
 
 
-def standardize_expression(a: np.ndarray) -> np.ndarray:
+def _zscore_expression(a: np.ndarray) -> np.ndarray:
     mu = a.mean(axis=0, keepdims=True)
     sigma = a.std(axis=0, keepdims=True)
     return np.asarray((a - mu) / (sigma + 1e-8), dtype=np.float32)
@@ -132,7 +132,7 @@ def apply_expression_transforms(
     *,
     min_cells_per_gene: int = 0,
     log1p: bool = False,
-    standardize: bool = True,
+    standardize_expression: bool = True,
     q: int | None = None,
     seed: int = 0,
     return_metadata: bool = False,
@@ -161,12 +161,12 @@ def apply_expression_transforms(
             }
         )
 
-    if standardize:
-        transformed = standardize_expression(transformed)
+    if standardize_expression:
+        transformed = _zscore_expression(transformed)
 
     transformed = np.asarray(transformed, dtype=np.float32)
     if return_metadata:
         metadata["log1p"] = bool(log1p)
-        metadata["standardize"] = bool(standardize)
+        metadata["standardize_expression"] = bool(standardize_expression)
         return transformed, metadata
     return transformed

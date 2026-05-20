@@ -71,7 +71,8 @@ Create a config file like this and save it as `configs/my_run.json`:
     "layer": null,
     "use_raw": false,
     "min_cells_per_gene": 1,
-    "standardize": true,
+    "standardize_expression": true,
+    "standardize_coordinates": true,
     "q": null,
     "max_cells": null,
     "seed": 0
@@ -82,7 +83,7 @@ Create a config file like this and save it as `configs/my_run.json`:
     "n_perms": 100,
     "n_nulls": 50,
     "epochs": 5000,
-    "decoder": "linear",
+    "decoder": "nn",
     "lr": 0.001,
     "patience": 50,
     "seed": 0,
@@ -178,8 +179,10 @@ If neither is set, the loader uses `adata.X`.
 - `--min-cells-per-gene`: drop genes expressed in fewer than this many cells before running the test.
 - `--log1p`: apply `log(1 + x)` after loading/filtering and before any standardization.
 - `--no-log1p`: leave expression values on their original scale before standardization.
-- `--standardize`: z-score each gene after loading/filtering and any optional `log1p`.
-- `--no-standardize`: skip z-scoring and keep the post-transform feature scale.
+- `--standardize-expression`: z-score each gene after loading/filtering and any optional `log1p`.
+- `--no-standardize-expression`: skip z-scoring and keep the post-transform feature scale.
+- `--standardize-coordinates`: z-score each spatial axis (x, y) before training so the encoder sees N(0,1) inputs.
+- `--no-standardize-coordinates`: keep raw spatial coordinates as loaded.
 - `--q`: if provided, replace the expression matrix with a Poisson low-rank latent embedding of width `2*q`.
 
 `--log1p` details:
@@ -187,10 +190,15 @@ This controls the same `data.log1p` field from the config.
 The default pipeline behavior is log transform disabled.
 `--log1p` cannot be combined with `--q`, because the Poisson low-rank transform expects counts.
 
-`--standardize` details:
-This controls the same `data.standardize` field from the config.
+`--standardize-expression` details:
+This controls the same `data.standardize_expression` field from the config.
 The default pipeline behavior is standardization enabled.
-Use `--no-standardize` only if you intentionally want the post-filter/post-`log1p` feature scale without z-scoring.
+Use `--no-standardize-expression` only if you intentionally want the post-filter/post-`log1p` feature scale without z-scoring.
+
+`--standardize-coordinates` details:
+This controls the same `data.standardize_coordinates` field from the config.
+The default pipeline behavior is coordinate standardization enabled (per-axis z-score on `dataset.S`).
+Use `--no-standardize-coordinates` only if you want to preserve the raw spatial scale (e.g. for visualization-only runs).
 
 `--q` details:
 The loader first filters genes, then fits a Poisson low-rank factorization with `log(lambda) = L R^T` and returns the top `2*q` latent dimensions from `L`.
@@ -218,7 +226,7 @@ This option is intended for `h5ad` count-valued inputs and is not supported for 
 - `--lr`: learning rate.
 - `--patience`: early stopping patience.
 - `--device`: compute device such as `cpu`, `cuda`, `mps`, or `auto`.
-- `--decoder`: decoder architecture for isodepth models. Supported values are `linear` and `nn`.
+- `--decoder`: decoder architecture for isodepth models. Supported values are `linear` and `nn`. Default is `nn` when omitted from config and CLI.
 - `--batch-size`: optional grouping cap for `comparison_perturbation_test` null datasets. Each grouped null batch packs up to `batch_size * (n_perms + 1)` models into one parallel trainer call. Leave unset to batch all null datasets together.
 - `--sgd-batch-size`: optional minibatch size for stochastic gradient descent over cells during model fitting. Leave unset or set to `0` to keep the current full-batch training behavior.
 - `--delta`: comma-separated perturbation scales for perturbation methods. Noise is sampled as a fraction of each spatial axis range.
@@ -284,7 +292,7 @@ Key config fields for `exact_existence`:
 - `test.max_spatial_dims`
 - `test.alpha`
 - `test.n_perms`
-- `test.decoder`, with `linear` or `nn`
+- `test.decoder`, with `linear` or `nn` (default `nn`)
 - `test.n_reruns`
 - `test.metric`, restricted to `mse` or `nll_gaussian_mse`
 
@@ -465,10 +473,10 @@ The Fourier existence-only `k_max` studies use:
 
 The real-data existence consistency study uses:
 
-- [configs/mouse_hippocampus_existence.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/mouse_hippocampus_existence.json) as the base real-data existence config
-- [configs/experiments/mouse_hippocampus_existence_consistency_study.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/experiments/mouse_hippocampus_existence_consistency_study.json) as the sweep spec
-- `python -m experiments.real_data_existence_consistency_sweep --spec configs/experiments/mouse_hippocampus_existence_consistency_study.json` to launch the 20-repeat study
-- `python -m experiments.real_data_existence_consistency_analysis --spec configs/experiments/mouse_hippocampus_existence_consistency_study.json` to aggregate saved result JSONs into repeat-level CSVs and plots for p-values, true losses, null loss distributions, and the true-isodepth Spearman matrix
+- [configs/mouse_hippocampus_existence.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/mouse_hippocampus_existence.json) as the default base real-data existence config (override via `base_config` in the spec for other datasets)
+- [configs/experiments/consistency_study.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/experiments/consistency_study.json) as the sweep spec (`experiment_name` is `consistency_study`; runner: `run_consistency_study.sh`)
+- `python -m experiments.real_data_existence_consistency_sweep --spec configs/experiments/consistency_study.json` to launch the repeat sweep
+- `python -m experiments.real_data_existence_consistency_analysis --spec configs/experiments/consistency_study.json` to aggregate saved result JSONs into repeat-level CSVs and plots for p-values, true losses, null loss distributions, and the true-isodepth Spearman matrix
 
 This study keeps the real dataset fixed, reruns the same `parallel_permutation` existence test with different seeds, and records:
 
@@ -500,6 +508,7 @@ results/experiments/<experiment_name>/
 
 ## Notes
 
+- The default `test.decoder` is `nn` (multilayer perceptron); use `linear` for the linear decoder when needed.
 - The default metric is `nll_gaussian_mse`.
 - The active runner supports `data.source = "h5ad"` and `data.source = "synthetic"`.
 - The shared method/config interfaces are designed so future tests and metrics can reuse the same contracts.

@@ -1,12 +1,13 @@
 #!/bin/bash
 #SBATCH -c 4
-#SBATCH --mem=64G
+#SBATCH --mem=32G
+#SBATCH --partition=a100
 #SBATCH --time=10:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --exclude=c008,c010,c012
 #SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH --mail-user=3144105234@vzwpix.com
+#SBATCH --mail-user=ajain71@jh.edu
 #SBATCH --output=isodepth_batchsize_comparison-%j.log
 
 

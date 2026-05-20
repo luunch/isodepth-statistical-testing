@@ -211,7 +211,7 @@ def load_dataset_for_visualization(data_cfg: DataConfig) -> DatasetBundle:
         use_raw=data_cfg.use_raw,
         min_cells_per_gene=data_cfg.min_cells_per_gene,
         log1p=data_cfg.log1p,
-        standardize=data_cfg.standardize,
+        standardize_expression=data_cfg.standardize_expression,
         q=data_cfg.q,
         max_cells=data_cfg.max_cells,
         seed=data_cfg.seed,

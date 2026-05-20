@@ -92,7 +92,7 @@ class TestPerturbationHelpers(unittest.TestCase):
             delta=[0.1],
             verbose=False,
         ).validate()
-        _, predictions = train_parallel_isodepth_model(
+        _, outputs, _ = train_parallel_isodepth_model(
             self.S,
             a,
             config,
@@ -100,7 +100,8 @@ class TestPerturbationHelpers(unittest.TestCase):
             s_batched=s_batched,
             model_label="test batched trainer",
         )
-        self.assertEqual(predictions.shape, (3, self.S.shape[0], a.shape[1]))
+        self.assertEqual(outputs.model_metrics.shape, (3,))
+        self.assertEqual(outputs.pred_true.shape, (self.S.shape[0], a.shape[1]))
 
     def test_batched_trainer_accepts_arbitrary_a_batched(self) -> None:
         a = np.stack([self.S[:, 0], self.S[:, 1]], axis=1).astype(np.float32)
@@ -132,7 +133,7 @@ class TestPerturbationHelpers(unittest.TestCase):
             delta=[0.1],
             verbose=False,
         ).validate()
-        _, predictions = train_parallel_isodepth_model(
+        _, outputs, _ = train_parallel_isodepth_model(
             self.S,
             a,
             config,
@@ -141,7 +142,7 @@ class TestPerturbationHelpers(unittest.TestCase):
             a_batched=a_batched,
             model_label="test batched trainer with a_batched",
         )
-        self.assertEqual(predictions.shape, (2, self.S.shape[0], a.shape[1]))
+        self.assertEqual(outputs.model_metrics.shape, (2,))
 
 
 @unittest.skipUnless(HAS_TORCH, "torch is required for perturbation method tests")

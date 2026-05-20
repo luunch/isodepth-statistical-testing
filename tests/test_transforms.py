@@ -44,7 +44,7 @@ class TestBasicTransforms(unittest.TestCase):
         transformed, metadata = apply_expression_transforms(
             counts,
             log1p=True,
-            standardize=True,
+            standardize_expression=True,
             return_metadata=True,
         )
         expected_logged = np.log1p(counts)
@@ -53,7 +53,7 @@ class TestBasicTransforms(unittest.TestCase):
         )
         np.testing.assert_allclose(transformed, expected.astype(np.float32), atol=1e-6)
         self.assertTrue(metadata["log1p"])
-        self.assertTrue(metadata["standardize"])
+        self.assertTrue(metadata["standardize_expression"])
 
     def test_log1p_without_standardization_preserves_logged_scale(self) -> None:
         counts = np.asarray(
@@ -66,7 +66,7 @@ class TestBasicTransforms(unittest.TestCase):
         transformed = apply_expression_transforms(
             counts,
             log1p=True,
-            standardize=False,
+            standardize_expression=False,
         )
         np.testing.assert_allclose(transformed, np.log1p(counts).astype(np.float32), atol=1e-6)
 
@@ -79,7 +79,7 @@ class TestBasicTransforms(unittest.TestCase):
             dtype=np.float32,
         )
         with self.assertRaises(ValueError):
-            apply_expression_transforms(expression, log1p=True, standardize=False)
+            apply_expression_transforms(expression, log1p=True, standardize_expression=False)
 
     def test_log1p_cannot_be_combined_with_q(self) -> None:
         counts = np.asarray(
@@ -110,7 +110,7 @@ class TestPoissonLowRankTransform(unittest.TestCase):
         latent, metadata = apply_expression_transforms(
             counts,
             min_cells_per_gene=1,
-            standardize=True,
+            standardize_expression=True,
             q=2,
             seed=7,
             return_metadata=True,
@@ -136,13 +136,13 @@ class TestPoissonLowRankTransform(unittest.TestCase):
 
         latent_a = apply_expression_transforms(
             counts,
-            standardize=False,
+            standardize_expression=False,
             q=1,
             seed=11,
         )
         latent_b = apply_expression_transforms(
             counts,
-            standardize=False,
+            standardize_expression=False,
             q=1,
             seed=11,
         )

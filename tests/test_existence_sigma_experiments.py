@@ -379,10 +379,20 @@ class TestExistenceSigmaSmoke(unittest.TestCase):
             )
 
             spec = load_existence_sigma_spec(spec_path)
-            manifest = run_existence_sigma_sweep(spec, max_runs=None)
+            manifest = run_existence_sigma_sweep(spec, spec_path=str(spec_path), max_runs=None)
             analysis = analyze_existence_sigma_results(spec_path)
 
             self.assertEqual(len(manifest["runs"]), 4)
+            self.assertIn("config_snapshot", manifest)
+            snapshot = manifest["config_snapshot"]
+            self.assertIn("spec", snapshot)
+            self.assertEqual(snapshot["spec"]["experiment_name"], "study")
+            self.assertIn("base_configs", snapshot)
+            self.assertIn("base_config", snapshot["base_configs"])
+            self.assertIn("contents", snapshot["base_configs"]["base_config"])
+            base_contents = snapshot["base_configs"]["base_config"]["contents"]
+            self.assertEqual(base_contents["data"]["source"], "synthetic")
+            self.assertEqual(base_contents["test"]["method"], "parallel_permutation")
             self.assertTrue((output_root / "analysis" / "per_run_results.csv").exists())
             self.assertTrue((output_root / "analysis" / "summary_by_condition.csv").exists())
             self.assertTrue((output_root / "analysis" / "power_vs_sigma.png").exists())

@@ -4,7 +4,7 @@ import argparse
 import json
 
 from data import load_dataset
-from experiments.configuration import build_run_config, save_standardized_outputs
+from experiments.configuration import build_manifest_config_snapshot, build_run_config, save_standardized_outputs
 from experiments.existence_sigma import (
     ExistenceSigmaStudySpec,
     analysis_dir_for_spec,
@@ -19,6 +19,7 @@ from experiments.existence_sigma import (
 def run_existence_sigma_sweep(
     spec: ExistenceSigmaStudySpec,
     *,
+    spec_path: str | None = None,
     dry_run: bool = False,
     max_runs: int | None = None,
 ) -> dict[str, object]:
@@ -35,6 +36,10 @@ def run_existence_sigma_sweep(
         "alpha": float(spec.alpha),
         "runs": [],
     }
+    if spec_path is not None:
+        manifest_payload["config_snapshot"] = build_manifest_config_snapshot(
+            spec_path, {"base_config": spec.base_config},
+        )
 
     if dry_run:
         manifest_payload["planned_run_count"] = len(conditions)
@@ -96,7 +101,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _build_arg_parser().parse_args()
     spec = load_existence_sigma_spec(args.spec)
-    payload = run_existence_sigma_sweep(spec, dry_run=args.dry_run, max_runs=args.max_runs)
+    payload = run_existence_sigma_sweep(spec, spec_path=args.spec, dry_run=args.dry_run, max_runs=args.max_runs)
     print(json.dumps(payload, indent=2))
 
 

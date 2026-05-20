@@ -601,12 +601,25 @@ class TestFourierKmaxExistencePerturbationSmoke(unittest.TestCase):
             )
 
             spec = load_fourier_kmax_existence_perturbation_spec(spec_path)
-            manifest = run_fourier_kmax_existence_perturbation_sweep(spec)
+            manifest = run_fourier_kmax_existence_perturbation_sweep(spec, spec_path=str(spec_path))
             analysis = analyze_fourier_kmax_existence_perturbation_results(spec_path)
 
             self.assertEqual(len(manifest["runs"]), 4)
             self.assertEqual(analysis["n_existence_rows_analyzed"], 2)
             self.assertEqual(analysis["n_perturbation_rows_analyzed"], 4)
+            self.assertIn("config_snapshot", manifest)
+            snapshot = manifest["config_snapshot"]
+            self.assertEqual(snapshot["spec"]["experiment_name"], "combined")
+            self.assertIn("existence_base_config", snapshot["base_configs"])
+            self.assertIn("perturbation_base_config", snapshot["base_configs"])
+            self.assertEqual(
+                snapshot["base_configs"]["existence_base_config"]["contents"]["test"]["method"],
+                "parallel_permutation",
+            )
+            self.assertEqual(
+                snapshot["base_configs"]["perturbation_base_config"]["contents"]["test"]["method"],
+                "perturbation_test",
+            )
 
 
 if __name__ == "__main__":

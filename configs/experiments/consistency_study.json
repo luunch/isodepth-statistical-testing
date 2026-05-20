@@ -1,0 +1,9 @@
+{
+  "experiment_name": "consistency_study",
+  "base_config": "configs/noise_existence.json",
+  "output_root": "results/experiments/consistency_study",
+  "n_repeats": 5,
+  "repeat_seeds": [0, 1, 2, 3, 4],
+  "reuse_result_roots": [],
+  "decoder": "nn"
+}

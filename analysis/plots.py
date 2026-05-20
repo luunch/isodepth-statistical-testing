@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any
 
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
@@ -53,6 +55,23 @@ def _point_size(S: np.ndarray) -> float:
     return float(max(2, min(16, 500 / np.sqrt(n))))
 
 
+def _spatial_axis_limits(
+    S: np.ndarray,
+    *,
+    padding_frac: float = 0.02,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Axis limits ((xmin, xmax), (ymin, ymax)) with light padding."""
+    coords = np.asarray(S, dtype=np.float64)
+    mins = coords.min(axis=0)
+    maxs = coords.max(axis=0)
+    spans = np.maximum(maxs - mins, 1e-8)
+    pad = spans * float(padding_frac)
+    return (
+        (float(mins[0] - pad[0]), float(maxs[0] + pad[0])),
+        (float(mins[1] - pad[1]), float(maxs[1] + pad[1])),
+    )
+
+
 def _masked_triangulation(S: np.ndarray) -> mtri.Triangulation:
     triangulation = mtri.Triangulation(S[:, 0], S[:, 1])
     if triangulation.triangles.size == 0:
@@ -88,6 +107,7 @@ def _plot_spatial_isodepth(
     title: str,
     *,
     normalize_bounds: tuple[float, float] | None = None,
+    spatial_limits: tuple[tuple[float, float], tuple[float, float]] | None = None,
     colorbar_label: str = "Normalized isodepth",
 ) -> None:
     bounds = None if normalize_bounds is None else (float(normalize_bounds[0]), float(normalize_bounds[1]))
@@ -124,6 +144,10 @@ def _plot_spatial_isodepth(
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_aspect("equal")
+    if spatial_limits is not None:
+        xlim, ylim = spatial_limits
+        ax.set_xlim(float(xlim[0]), float(xlim[1]))
+        ax.set_ylim(float(ylim[0]), float(ylim[1]))
     plt.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04, label=colorbar_label)
 
 
@@ -248,6 +272,265 @@ def save_parallelization_paired_comparison(
     return out_path
 
 
+def _bias_detection_pearson(a: np.ndarray, b: np.ndarray) -> float:
+    a = np.asarray(a, dtype=np.float64).reshape(-1)
+    b = np.asarray(b, dtype=np.float64).reshape(-1)
+    if a.size != b.size or a.size < 2:
+        return float("nan")
+    a_c = a - a.mean()
+    b_c = b - b.mean()
+    denom = float(np.sqrt(float((a_c * a_c).sum()) * float((b_c * b_c).sum())))
+    if denom <= 1e-12:
+        return float("nan")
+    return float((a_c * b_c).sum() / denom)
+
+
+def compute_isodepth_bias_detection_similarity(
+    isodepths_by_device: dict[str, np.ndarray],
+) -> dict[str, list[dict[str, float]]]:
+    """Per-device, per-slot Pearson against that device's true-data slot (column 0).
+
+    Returns ``{device: [ {model_index, perm_index, pearson}, ... ]}``; the entry for
+    ``model_index == 0`` (the true-data slot itself) is included with ``perm_index = None``
+    and ``pearson = 1.0`` for completeness.
+    """
+    similarity: dict[str, list[dict[str, float]]] = {}
+    for device_name, batch in isodepths_by_device.items():
+        depth_batch = np.asarray(batch, dtype=np.float32)
+        if depth_batch.ndim == 3 and depth_batch.shape[-1] == 1:
+            depth_batch = depth_batch[:, :, 0]
+        if depth_batch.ndim != 2:
+            raise ValueError(
+                f"isodepths for {device_name!r} must have shape (M, N) or (M, N, 1), got {depth_batch.shape}"
+            )
+        true_depth = _flatten_isodepth_vector(depth_batch[0]).astype(np.float64)
+        device_rows: list[dict[str, float]] = []
+        for model_index in range(depth_batch.shape[0]):
+            other = _flatten_isodepth_vector(depth_batch[model_index]).astype(np.float64)
+            entry: dict[str, float | None | int] = {
+                "model_index": int(model_index),
+                "perm_index": None if model_index == 0 else int(model_index - 1),
+            }
+            entry["pearson"] = (
+                1.0 if model_index == 0 else _bias_detection_pearson(true_depth, other)
+            )
+            device_rows.append(entry)
+        similarity[str(device_name)] = device_rows
+    return similarity
+
+
+def compute_isodepth_cross_correlation_matrices(
+    isodepths_by_device: dict[str, np.ndarray],
+) -> dict[str, np.ndarray]:
+    """Per-device M\u00d7M matrix of pairwise Pearson correlations between every pair of slots
+    (true + permutations). ``M[i, j] = Pearson(isodepth_slot_i, isodepth_slot_j)``; symmetric,
+    diagonal is exactly 1.0."""
+    matrices: dict[str, np.ndarray] = {}
+    for device_name, batch in isodepths_by_device.items():
+        depth_batch = np.asarray(batch, dtype=np.float32)
+        if depth_batch.ndim == 3 and depth_batch.shape[-1] == 1:
+            depth_batch = depth_batch[:, :, 0]
+        if depth_batch.ndim != 2:
+            raise ValueError(
+                f"isodepths for {device_name!r} must have shape (M, N) or (M, N, 1), got {depth_batch.shape}"
+            )
+        m = int(depth_batch.shape[0])
+        flat = np.stack(
+            [_flatten_isodepth_vector(depth_batch[i]).astype(np.float64) for i in range(m)],
+            axis=0,
+        )
+        matrix = np.empty((m, m), dtype=np.float64)
+        for i in range(m):
+            matrix[i, i] = 1.0
+            for j in range(i + 1, m):
+                value = _bias_detection_pearson(flat[i], flat[j])
+                matrix[i, j] = value
+                matrix[j, i] = value
+        matrices[str(device_name)] = matrix
+    return matrices
+
+
+def save_isodepth_cross_correlation_matrix_figure(
+    matrices_by_device: dict[str, np.ndarray],
+    out_path: str | Path,
+    *,
+    panel_titles: list[str] | None = None,
+    figure_title: str | None = None,
+    annotate_threshold: int = 30,
+) -> Path:
+    """Heatmap(s) of the per-device M\u00d7M Pearson correlation matrix from
+    ``compute_isodepth_cross_correlation_matrices``. One subplot per device, axes labeled by
+    ``panel_titles``. Cells are annotated with the correlation value when ``M <= annotate_threshold``.
+    """
+    if not matrices_by_device:
+        raise ValueError("matrices_by_device must be non-empty")
+    out_path = Path(out_path)
+    devices = list(matrices_by_device.keys())
+    n_devices = len(devices)
+    first_matrix = np.asarray(next(iter(matrices_by_device.values())), dtype=np.float64)
+    m = int(first_matrix.shape[0])
+    titles = panel_titles or [f"Slot {index + 1}" for index in range(m)]
+    if len(titles) != m:
+        raise ValueError(f"panel_titles length {len(titles)} must equal matrix size {m}")
+
+    fig_w = max(5.5, 0.45 * m + 2.5) * n_devices
+    fig_h = max(5.5, 0.45 * m + 2.5)
+    fig, axes = plt.subplots(1, n_devices, figsize=(fig_w, fig_h), squeeze=False)
+    norm = mcolors.TwoSlopeNorm(vcenter=0.0, vmin=-1.0, vmax=1.0)
+    for ax, device_name in zip(axes.flat, devices):
+        matrix = np.asarray(matrices_by_device[device_name], dtype=np.float64)
+        if matrix.shape != (m, m):
+            raise ValueError(
+                f"matrix for {device_name!r} must be square ({m}, {m}), got {matrix.shape}"
+            )
+        im = ax.imshow(matrix, cmap="coolwarm", norm=norm, interpolation="nearest")
+        ax.set_title(f"{device_name}\nPearson cross-correlation")
+        ax.set_xticks(range(m))
+        ax.set_yticks(range(m))
+        ax.set_xticklabels(titles, rotation=45, ha="right", fontsize=8)
+        ax.set_yticklabels(titles, fontsize=8)
+        if m <= int(annotate_threshold):
+            for i in range(m):
+                for j in range(m):
+                    val = matrix[i, j]
+                    text_color = "white" if abs(val) > 0.55 else "0.1"
+                    ax.text(
+                        j, i,
+                        "nan" if not np.isfinite(val) else f"{val:.2f}",
+                        ha="center", va="center",
+                        fontsize=7, color=text_color,
+                    )
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="r")
+    if figure_title:
+        fig.suptitle(figure_title)
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+    else:
+        fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_isodepth_bias_detection_figure(
+    spatial_batches: np.ndarray,
+    isodepths_by_device: dict[str, np.ndarray],
+    out_path: str | Path,
+    *,
+    device_order: list[str],
+    panel_titles: list[str] | None = None,
+    figure_title: str | None = None,
+) -> Path:
+    """Grid: one column per permutation slot; one row per device (shared color scale within each column).
+
+    When at least two devices are present, an extra row plots their signed isodepth difference (first − second
+    in ``device_order``) on the **raw** latent scale (color axis in model units, not min–max compressed).
+
+    For each permutation column (col_index >= 1), each device's panel is annotated with the per-device
+    ``Pearson(true_isodepth_for_device, perm_isodepth_for_device)`` (a single rankable similarity number).
+    The full M\u00d7M cross-correlation matrix is computed separately by
+    ``compute_isodepth_cross_correlation_matrices`` and rendered by
+    ``save_isodepth_cross_correlation_matrix_figure``.
+    """
+    spatial_array = np.asarray(spatial_batches, dtype=np.float32)
+    if spatial_array.ndim != 3 or spatial_array.shape[-1] != 2:
+        raise ValueError(f"spatial_batches must have shape (M, N, 2), got {spatial_array.shape}")
+
+    n_models = int(spatial_array.shape[0])
+    titles = panel_titles or [f"Slot {index + 1}" for index in range(n_models)]
+
+    ordered_devices = [str(d) for d in device_order]
+    if not ordered_devices:
+        raise ValueError("device_order must be non-empty")
+    for name in ordered_devices:
+        if name not in isodepths_by_device:
+            raise ValueError(f"Missing isodepth batch for device {name!r}")
+
+    depth_rows: list[np.ndarray] = []
+    for device_name in ordered_devices:
+        batch = np.asarray(isodepths_by_device[device_name], dtype=np.float32)
+        if batch.ndim == 3 and batch.shape[-1] == 1:
+            batch = batch[:, :, 0]
+        if batch.ndim != 2 or batch.shape[0] != n_models:
+            raise ValueError(
+                f"isodepths for {device_name!r} must have shape ({n_models}, N), got {batch.shape}"
+            )
+        if spatial_array.shape[:2] != batch.shape:
+            raise ValueError(f"Spatial vs isodepth mismatch for {device_name}: {spatial_array.shape[:2]} vs {batch.shape}")
+        depth_rows.append(batch)
+
+    show_diff_row = len(ordered_devices) >= 2
+    n_rows = len(depth_rows) + (1 if show_diff_row else 0)
+
+    out_path = Path(out_path)
+    fig, axes = plt.subplots(n_rows, n_models, figsize=(4.6 * n_models, 3.9 * n_rows), squeeze=False)
+
+    for col_index in range(n_models):
+        spatial = spatial_array[col_index]
+        shared_bounds = (
+            float(min(row[col_index].min() for row in depth_rows)),
+            float(max(row[col_index].max() for row in depth_rows)),
+        )
+        for row_index, device_name in enumerate(ordered_devices):
+            depth = _flatten_isodepth_vector(depth_rows[row_index][col_index])
+            row_title = f"{titles[col_index]}\n{device_name}"
+            if col_index >= 1:
+                true_depth_for_device = _flatten_isodepth_vector(depth_rows[row_index][0])
+                pearson = _bias_detection_pearson(true_depth_for_device, depth)
+                row_title += f"\nr={pearson:.3f}"
+            _plot_spatial_isodepth(
+                axes[row_index, col_index],
+                spatial,
+                depth,
+                row_title,
+                normalize_bounds=shared_bounds,
+            )
+        if show_diff_row:
+            d0 = _flatten_isodepth_vector(depth_rows[0][col_index]).astype(np.float64)
+            d1 = _flatten_isodepth_vector(depth_rows[1][col_index]).astype(np.float64)
+            signed_diff = d0 - d1
+            diff_row_index = len(ordered_devices)
+            _plot_spatial_signed_difference(
+                axes[diff_row_index, col_index],
+                spatial,
+                signed_diff,
+                f"{titles[col_index]}\nΔ ({ordered_devices[0]} − {ordered_devices[1]})",
+            )
+
+    for axis in axes.flat:
+        axis.label_outer()
+
+    if figure_title:
+        fig.suptitle(figure_title)
+        fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.98))
+    else:
+        fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def _plot_spatial_signed_difference(ax, S: np.ndarray, diff: np.ndarray, title: str) -> None:
+    """Scatter signed difference with a diverging colormap; colorbar ticks are raw model units (not rescaled to [0, 1])."""
+    diff = np.asarray(diff, dtype=np.float64).reshape(-1)
+    bound = float(max(abs(float(diff.min())), abs(float(diff.max())), 1e-15))
+    norm = mcolors.TwoSlopeNorm(vcenter=0.0, vmin=-bound, vmax=bound)
+    scatter = ax.scatter(
+        S[:, 0],
+        S[:, 1],
+        c=diff,
+        cmap="coolwarm",
+        norm=norm,
+        s=_point_size(S),
+        linewidths=0,
+        alpha=0.9,
+    )
+    ax.set_title(title)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_aspect("equal")
+    plt.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04, label="Isodepth difference")
+
+
 def _as_dimension_matrix(values: np.ndarray) -> np.ndarray:
     array = np.asarray(values, dtype=np.float32)
     if array.ndim == 1:
@@ -328,6 +611,8 @@ def save_dataset_triptych(
     vmin = float(signal.min())
     vmax = float(signal.max())
     title_prefix = "True Synthetic Dataset" if dataset.meta.get("source") == "synthetic" else "True Dataset"
+    n_cells = int(dataset.S.shape[0])
+    title_prefix += f" (n={n_cells})"
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     _plot_spatial_dataset_heatmap(
@@ -356,6 +641,121 @@ def save_dataset_triptych(
         vmin=vmin,
         vmax=vmax,
     )
+    fig.tight_layout()
+    out_path = Path(out_path)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_celltype_dataset_plot(
+    dataset: DatasetBundle,
+    out_path: str | Path,
+) -> Path | None:
+    """Scatter plot of cells colored by their cell-type assignment."""
+    cell_type_labels = dataset.meta.get("cell_type_labels")
+    cell_type_names = dataset.meta.get("cell_type_names")
+    if cell_type_labels is None or cell_type_names is None:
+        return None
+
+    labels = np.asarray(cell_type_labels, dtype=np.int64)
+    S = np.asarray(dataset.S, dtype=np.float32)
+    n_types = len(cell_type_names)
+
+    cmap = plt.cm.get_cmap("tab20" if n_types > 10 else "tab10")
+    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+    for c in range(n_types):
+        mask = labels == c
+        if not np.any(mask):
+            continue
+        ax.scatter(
+            S[mask, 0],
+            S[mask, 1],
+            c=[cmap(c / max(n_types - 1, 1))],
+            s=_point_size(S),
+            label=cell_type_names[c],
+            alpha=0.7,
+            linewidths=0,
+        )
+    ax.set_title("Dataset Colored by Cell Type")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_aspect("equal")
+    ax.legend(
+        loc="center left",
+        bbox_to_anchor=(1.0, 0.5),
+        fontsize="x-small",
+        markerscale=2.0,
+        frameon=False,
+    )
+    fig.tight_layout()
+    out_path = Path(out_path)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_celltype_expression_plot(
+    dataset: DatasetBundle,
+    result: TestResult,
+    out_path: str | Path,
+) -> Path | None:
+    """Scatter plot of cells colored by mean predicted expression, labeled by cell type."""
+    cell_type_labels = dataset.meta.get("cell_type_labels")
+    cell_type_names = dataset.meta.get("cell_type_names")
+    pred_true = result.artifacts.get("pred_true")
+    if cell_type_labels is None or cell_type_names is None or pred_true is None:
+        return None
+
+    labels = np.asarray(cell_type_labels, dtype=np.int64)
+    S = np.asarray(dataset.S, dtype=np.float32)
+    preds = np.asarray(pred_true, dtype=np.float32)
+    signal = np.mean(np.abs(preds), axis=1)
+
+    n_types = len(cell_type_names)
+    cmap_cat = plt.cm.get_cmap("tab20" if n_types > 10 else "tab10")
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+    scatter = axes[0].scatter(
+        S[:, 0], S[:, 1],
+        c=signal,
+        cmap="Reds",
+        s=_point_size(S),
+        linewidths=0,
+        alpha=0.8,
+    )
+    axes[0].set_title("Predicted Expression (mean |pred|)")
+    axes[0].set_xlabel("x")
+    axes[0].set_ylabel("y")
+    axes[0].set_aspect("equal")
+    plt.colorbar(scatter, ax=axes[0], fraction=0.046, pad=0.04)
+
+    for c in range(n_types):
+        mask = labels == c
+        if not np.any(mask):
+            continue
+        axes[1].scatter(
+            S[mask, 0],
+            S[mask, 1],
+            c=[cmap_cat(c / max(n_types - 1, 1))],
+            s=_point_size(S),
+            label=cell_type_names[c],
+            alpha=0.7,
+            linewidths=0,
+        )
+    axes[1].set_title("Cell Types")
+    axes[1].set_xlabel("x")
+    axes[1].set_ylabel("y")
+    axes[1].set_aspect("equal")
+    axes[1].legend(
+        loc="center left",
+        bbox_to_anchor=(1.0, 0.5),
+        fontsize="x-small",
+        markerscale=2.0,
+        frameon=False,
+    )
+
     fig.tight_layout()
     out_path = Path(out_path)
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
@@ -409,6 +809,61 @@ def save_synthetic_true_curve_plot(
     return out_path
 
 
+def _format_stat_suffix(label: str, value: Any) -> str:
+    if value is None:
+        return label
+    try:
+        return f"{label}\n{float(value):.4g}"
+    except (TypeError, ValueError):
+        return label
+
+
+def _true_isodepth_panels_for_permutation_result(
+    dataset: DatasetBundle,
+    result: TestResult,
+    true_isodepth: np.ndarray,
+) -> list[tuple[np.ndarray, np.ndarray, str]]:
+    spatial = np.asarray(dataset.S, dtype=np.float32)
+    artifacts = result.artifacts
+    full_iso_depth = artifacts.get("true_isodepth_full_iso")
+    covariate_depth = artifacts.get("true_isodepth_covariate")
+    stat_covariate = artifacts.get("stat_covariate")
+
+    if full_iso_depth is not None:
+        return [
+            (
+                spatial,
+                np.asarray(full_iso_depth, dtype=np.float32),
+                _format_stat_suffix("Trained True Isodepth", result.stat_true),
+            ),
+            (
+                spatial,
+                true_isodepth,
+                _format_stat_suffix("Covariate Isodepth", stat_covariate),
+            ),
+        ]
+
+    n_cells = int(spatial.shape[0])
+    true_label = "Trained True Isodepth" if covariate_depth is not None else "True Data Isodepth"
+    true_label += f" (n={n_cells})"
+    panels = [
+        (
+            spatial,
+            true_isodepth,
+            _format_stat_suffix(true_label, result.stat_true),
+        )
+    ]
+    if covariate_depth is not None:
+        panels.append(
+            (
+                spatial,
+                np.asarray(covariate_depth, dtype=np.float32),
+                _format_stat_suffix("Covariate Isodepth", stat_covariate),
+            )
+        )
+    return panels
+
+
 def _save_permutation_triptych(
     dataset: DatasetBundle,
     result: TestResult,
@@ -419,25 +874,29 @@ def _save_permutation_triptych(
     highest_isodepth: np.ndarray,
     highest_S: np.ndarray,
 ) -> Path:
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    _plot_spatial_isodepth(
-        axes[0],
-        np.asarray(dataset.S, dtype=np.float32),
-        true_isodepth,
-        "True Data Isodepth",
+    panels = _true_isodepth_panels_for_permutation_result(dataset, result, true_isodepth)
+    panels.extend(
+        [
+            (
+                lowest_S,
+                lowest_isodepth,
+                f"Lowest Null Isodepth\n{float(result.artifacts.get('lowest_stat')):.4g}",
+            ),
+            (
+                highest_S,
+                highest_isodepth,
+                f"Highest Null Isodepth\n{float(result.artifacts.get('highest_stat')):.4g}",
+            ),
+        ]
     )
-    _plot_spatial_isodepth(
-        axes[1],
-        lowest_S,
-        lowest_isodepth,
-        f"Lowest Metric Isodepth\n{float(result.artifacts.get('lowest_stat')):.4g}",
-    )
-    _plot_spatial_isodepth(
-        axes[2],
-        highest_S,
-        highest_isodepth,
-        f"Highest Metric Isodepth\n{float(result.artifacts.get('highest_stat')):.4g}",
-    )
+    n_panels = len(panels)
+    n_cols = min(4, n_panels)
+    n_rows = int(np.ceil(n_panels / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows), squeeze=False)
+    for axis, (panel_S, panel_depth, title) in zip(axes.flat, panels):
+        _plot_spatial_isodepth(axis, panel_S, panel_depth, title)
+    for axis in axes.flat[n_panels:]:
+        axis.axis("off")
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -797,17 +1256,158 @@ def save_metric_distribution_plot(result: TestResult, out_path: str | Path) -> P
             plt.close(fig)
             return out_path
 
-    fig, ax = plt.subplots(1, 1, figsize=(6, 5))
-    ax.hist(np.asarray(result.stat_perm, dtype=np.float64), bins=30, color="lightsteelblue", edgecolor="black")
-    ax.axvline(result.stat_true, color="crimson", linestyle="--", label=f"Observed: {result.stat_true:.4g}")
-    if "lowest_stat" in result.artifacts:
-        ax.axvline(float(result.artifacts["lowest_stat"]), color="darkgreen", linestyle=":", label=f"Lowest: {float(result.artifacts['lowest_stat']):.4g}")
-    if "highest_stat" in result.artifacts:
-        ax.axvline(float(result.artifacts["highest_stat"]), color="darkorange", linestyle=":", label=f"Highest: {float(result.artifacts['highest_stat']):.4g}")
-    ax.set_title(f"Null Distribution\np-value = {result.p_value:.4g}")
+    stat_perm_arr = np.asarray(result.stat_perm, dtype=np.float64)
+    stat_cov = result.artifacts.get("stat_covariate")
+    p_cov = result.artifacts.get("p_value_covariate")
+    has_cov_dual = stat_cov is not None and p_cov is not None
+
+    fig, ax = plt.subplots(1, 1, figsize=(6.4, 5.2))
+    ax.hist(
+        stat_perm_arr,
+        bins=30,
+        color="lightsteelblue",
+        edgecolor="black",
+        label="Null (permutations)",
+    )
+    if has_cov_dual:
+        ax.axvline(
+            result.stat_true,
+            color="crimson",
+            linestyle="--",
+            linewidth=1.5,
+            label=f"Fully trained isodepth: {result.stat_true:.4g}",
+        )
+        ax.axvline(
+            float(stat_cov),
+            color="teal",
+            linestyle="--",
+            linewidth=1.5,
+            label=f"Covariate (midline) decoder: {float(stat_cov):.4g}",
+        )
+        ax.set_title(
+            "Null distribution\n"
+            f"p (fully trained) = {result.p_value:.4g}  |  p (covariate) = {float(p_cov):.4g}"
+        )
+    else:
+        ax.axvline(
+            result.stat_true,
+            color="crimson",
+            linestyle="--",
+            linewidth=1.5,
+            label=f"Observed: {result.stat_true:.4g}",
+        )
+        ax.set_title(f"Null distribution\np-value = {result.p_value:.4g}")
     ax.set_xlabel(result.metric)
     ax.set_ylabel("Count")
+    ax.legend(loc="upper right", framealpha=0.95)
     fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_combined_celltype_metric_distribution(
+    per_type_results: dict[str, dict],
+    cell_type_names: list[str],
+    out_path: str | Path,
+    *,
+    metric: str = "nll_gaussian_mse",
+) -> Path:
+    """Grid of null-distribution histograms, one panel per cell type."""
+    n = len(cell_type_names)
+    ncols = min(n, 4)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(5.5 * ncols, 4.0 * nrows),
+        squeeze=False,
+    )
+    for idx, type_name in enumerate(cell_type_names):
+        row, col = divmod(idx, ncols)
+        ax = axes[row][col]
+        data = per_type_results[type_name]
+        stat_perm = np.asarray(data["stat_perm"], dtype=np.float64)
+        stat_true = float(data["stat_true"])
+        p_value = float(data["p_value"])
+        n_cells = int(data["n_cells"])
+
+        ax.hist(stat_perm, bins=30, color="lightsteelblue", edgecolor="black",
+                label="Null (permutations)")
+        ax.axvline(stat_true, color="crimson", linestyle="--", linewidth=1.5,
+                   label=f"Observed: {stat_true:.4g}")
+        ax.set_title(f"{type_name} (n={n_cells})\np = {p_value:.4g}", fontsize=10)
+        ax.set_xlabel(metric, fontsize=9)
+        ax.set_ylabel("Count", fontsize=9)
+        ax.legend(fontsize=7, loc="upper right", framealpha=0.9)
+        ax.tick_params(labelsize=8)
+
+    for idx in range(n, nrows * ncols):
+        row, col = divmod(idx, ncols)
+        axes[row][col].set_visible(False)
+
+    fig.suptitle("Per-Cell-Type Null Distributions", fontsize=13, y=1.01)
+    fig.tight_layout()
+    out_path = Path(out_path)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_combined_celltype_isodepth_grid(
+    per_type_results: dict[str, dict],
+    cell_type_names: list[str],
+    out_path: str | Path,
+    *,
+    full_spatial: np.ndarray | None = None,
+) -> Path:
+    """Grid of true-data isodepth scatter plots, one panel per cell type."""
+    if full_spatial is not None:
+        tissue_limits = _spatial_axis_limits(full_spatial)
+    else:
+        all_coords = [
+            np.asarray(
+                per_type_results[name].get("S_original", per_type_results[name]["S"]),
+                dtype=np.float32,
+            )
+            for name in cell_type_names
+        ]
+        tissue_limits = _spatial_axis_limits(np.vstack(all_coords))
+
+    n = len(cell_type_names)
+    ncols = min(n, 4)
+    nrows = int(np.ceil(n / ncols))
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(5.5 * ncols, 4.5 * nrows),
+        squeeze=False,
+    )
+    for idx, type_name in enumerate(cell_type_names):
+        row, col = divmod(idx, ncols)
+        ax = axes[row][col]
+        data = per_type_results[type_name]
+        S_plot = np.asarray(
+            data.get("S_original", data["S"]),
+            dtype=np.float32,
+        )
+        true_isodepth = np.asarray(data["true_isodepth"], dtype=np.float32)
+        n_cells = int(data["n_cells"])
+        p_value = float(data["p_value"])
+
+        _plot_spatial_isodepth(
+            ax,
+            S_plot,
+            true_isodepth,
+            f"{type_name} (n={n_cells})\np = {p_value:.4g}",
+            spatial_limits=tissue_limits,
+        )
+
+    for idx in range(n, nrows * ncols):
+        row, col = divmod(idx, ncols)
+        axes[row][col].set_visible(False)
+
+    fig.suptitle("Per-Cell-Type Learned Isodepths (True Data)", fontsize=13, y=1.01)
+    fig.tight_layout()
+    out_path = Path(out_path)
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return out_path
@@ -1314,3 +1914,290 @@ def save_spatial_binned_density_plot(
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return out_path
+
+
+def _flatten_isodepth_for_axis(depth: np.ndarray) -> np.ndarray:
+    """Use the first latent dimension as the 1D isodepth axis."""
+    d = np.asarray(depth, dtype=np.float64)
+    if d.ndim == 1:
+        return d
+    if d.ndim == 2:
+        return np.asarray(d[:, 0], dtype=np.float64)
+    raise ValueError(f"Expected isodepth with ndim 1 or 2, got shape {d.shape}")
+
+
+def _safe_filename_fragment(text: str, *, max_len: int = 80) -> str:
+    cleaned = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(text))
+    cleaned = cleaned.strip("_") or "gene"
+    return cleaned[:max_len]
+
+
+def _gene_display_name(meta: dict[str, Any], gene_idx: int) -> str:
+    names = meta.get("var_names")
+    if isinstance(names, list) and 0 <= gene_idx < len(names):
+        return str(names[gene_idx])
+    return f"gene_{gene_idx}"
+
+
+def _expression_y_axis_label(meta: dict[str, Any]) -> str:
+    """Describe ``dataset.A`` columns (model input / observed expression space)."""
+    if meta.get("q") is not None:
+        return "Feature value (Poisson low-rank latent)"
+    if meta.get("feature_space") == "poisson_low_rank_latent":
+        return "Feature value (Poisson low-rank latent)"
+    parts: list[str] = []
+    if meta.get("log1p"):
+        parts.append("log₁p")
+    if meta.get("standardize_expression"):
+        parts.append("z-scored")
+    if parts:
+        return "Expression (" + ", ".join(parts) + ")"
+    return "Expression"
+
+
+def _top_genes_by_prediction_correlation(
+    A: np.ndarray,
+    pred: np.ndarray,
+    *,
+    top_k: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (gene_indices, pearson_r) for the top ``top_k`` genes by Pearson(A_g, pred_g)."""
+    A = np.asarray(A, dtype=np.float64)
+    pred = np.asarray(pred, dtype=np.float64)
+    if A.shape != pred.shape:
+        raise ValueError(f"A shape {A.shape} does not match pred shape {pred.shape}")
+    G = A.shape[1]
+    corrs = np.full(G, -np.inf, dtype=np.float64)
+    for g in range(G):
+        a_col = A[:, g]
+        p_col = pred[:, g]
+        if np.std(a_col) < 1e-12 or np.std(p_col) < 1e-12:
+            continue
+        corrs[g] = float(np.corrcoef(a_col, p_col)[0, 1])
+    order = np.argsort(-corrs)
+    k = min(int(top_k), G)
+    top_idx = order[:k]
+    return top_idx, corrs
+
+
+def _prediction_scenarios_for_selected_genes(result: TestResult) -> list[tuple[str, str, np.ndarray, np.ndarray]]:
+    """List (subdir_slug, panel_title, pred, isodepth) for top-gene plots."""
+    art = result.artifacts
+    pred_full_iso = art.get("pred_true_full_iso")
+    depth_full_iso = art.get("true_isodepth_full_iso")
+    pred_cov = art.get("pred_true_covariate")
+    depth_cov = art.get("true_isodepth_covariate")
+    pred_primary = art.get("pred_true")
+    depth_primary = art.get("true_isodepth")
+
+    scenarios: list[tuple[str, str, np.ndarray, np.ndarray]] = []
+
+    # Parallel midline: slot 0 is midline; separate full model artifacts are present.
+    if pred_full_iso is not None and depth_full_iso is not None:
+        if pred_primary is None or depth_primary is None:
+            return scenarios
+        scenarios.append(
+            (
+                "covariate_midline",
+                "Covariate (midline) — true slot",
+                np.asarray(pred_primary, dtype=np.float32),
+                np.asarray(depth_primary, dtype=np.float32),
+            )
+        )
+        scenarios.append(
+            (
+                "full_isodepth",
+                "Full isodepth (true layout, no covariate)",
+                np.asarray(pred_full_iso, dtype=np.float32),
+                np.asarray(depth_full_iso, dtype=np.float32),
+            )
+        )
+        return scenarios
+
+    # Covariate comparisons: primary = full learned model; covariate artifacts are separate.
+    if pred_cov is not None and depth_cov is not None:
+        if pred_primary is None or depth_primary is None:
+            return scenarios
+        scenarios.append(
+            (
+                "full_isodepth",
+                "Full isodepth (encoder + decoder)",
+                np.asarray(pred_primary, dtype=np.float32),
+                np.asarray(depth_primary, dtype=np.float32),
+            )
+        )
+        scenarios.append(
+            (
+                "covariate_midline",
+                "Covariate (midline)",
+                np.asarray(pred_cov, dtype=np.float32),
+                np.asarray(depth_cov, dtype=np.float32),
+            )
+        )
+        return scenarios
+
+    if pred_primary is not None and depth_primary is not None:
+        scenarios.append(
+            (
+                "primary",
+                "True-layout model",
+                np.asarray(pred_primary, dtype=np.float32),
+                np.asarray(depth_primary, dtype=np.float32),
+            )
+        )
+    return scenarios
+
+
+def _plot_gene_piecewise_linear(
+    ax,
+    x: np.ndarray,
+    y_obs: np.ndarray,
+    y_pred: np.ndarray,
+    *,
+    num_bins: int = 10,
+    pt_size: float = 50.0,
+    scatter_color: str = "mediumseagreen",
+    fit_color: str = "0.45",
+    fit_lw: float = 3.0,
+    bin_color: str = "0.45",
+    bin_lw: float = 2.5,
+    scatter_alpha: float = 0.65,
+) -> None:
+    """Scatter + model-prediction fit line + binned-mean horizontal segments.
+
+    Mirrors the GASTON ``plot_gene_pwlinear`` visual style for a single
+    piecewise-linear segment: colored scatter, overlaid regression curve
+    (from model predictions sorted by isodepth), and stepped horizontal
+    bars showing the mean observed expression within each isodepth bin.
+    """
+    sort_idx = np.argsort(x)
+    ax.scatter(x, y_obs, s=pt_size, alpha=scatter_alpha, c=scatter_color, zorder=1)
+
+    ax.plot(
+        x[sort_idx],
+        y_pred[sort_idx],
+        color=fit_color,
+        lw=fit_lw,
+        solid_capstyle="round",
+        zorder=3,
+    )
+
+    bin_edges = np.linspace(float(x.min()), float(x.max()), int(num_bins) + 1)
+    for i in range(int(num_bins)):
+        mask = (x >= bin_edges[i]) & (x < bin_edges[i + 1])
+        if i == int(num_bins) - 1:
+            mask |= x == bin_edges[i + 1]
+        if mask.sum() == 0:
+            continue
+        bin_mean = float(np.mean(y_obs[mask]))
+        ax.plot(
+            [bin_edges[i], bin_edges[i + 1]],
+            [bin_mean, bin_mean],
+            color=bin_color,
+            lw=bin_lw,
+            solid_capstyle="butt",
+            zorder=2,
+        )
+
+
+def save_selected_genes_expression_vs_isodepth(
+    dataset: DatasetBundle,
+    result: TestResult,
+    out_dir: str | Path,
+    *,
+    top_k: int = 5,
+    num_bins: int = 10,
+) -> Path | None:
+    """Plot top predicted genes (by per-gene Pearson) vs 1D isodepth; write under ``selected_genes/``.
+
+    Each per-gene figure uses a GASTON-inspired piecewise-linear style:
+    colored scatter points, the model prediction as a fit line (sorted by
+    isodepth), and horizontal segments showing binned mean expression.
+
+    Y-axis: observed expression in the same space as ``dataset.A``.
+    X-axis: first dimension of the model isodepth for that prediction path.
+
+    Returns the ``selected_genes`` directory path, or ``None`` if no usable predictions exist.
+    """
+    scenarios = _prediction_scenarios_for_selected_genes(result)
+    if not scenarios:
+        return None
+
+    out_dir = Path(out_dir)
+    selected_root = out_dir / "selected_genes"
+    selected_root.mkdir(parents=True, exist_ok=True)
+
+    y_label = _expression_y_axis_label(dataset.meta)
+    manifest: dict[str, Any] = {
+        "top_k": int(top_k),
+        "num_bins": int(num_bins),
+        "ranking": "per-gene Pearson correlation between observed expression and model prediction",
+        "y_axis": y_label,
+        "scenarios": [],
+    }
+
+    A = np.asarray(dataset.A, dtype=np.float64)
+    pt_size = max(8.0, _point_size(np.asarray(dataset.S, dtype=np.float32)))
+
+    for subdir, panel_title, pred, depth in scenarios:
+        pred = np.asarray(pred, dtype=np.float64)
+        depth = np.asarray(depth, dtype=np.float64)
+        if pred.shape[0] != A.shape[0] or pred.shape[1] != A.shape[1]:
+            continue
+        try:
+            x = _flatten_isodepth_for_axis(depth)
+        except ValueError:
+            continue
+        if x.shape[0] != A.shape[0]:
+            continue
+
+        top_idx, corrs = _top_genes_by_prediction_correlation(A, pred, top_k=top_k)
+        scenario_dir = selected_root / subdir
+        scenario_dir.mkdir(parents=True, exist_ok=True)
+
+        gene_entries: list[dict[str, Any]] = []
+        for rank, g in enumerate(top_idx):
+            r = float(corrs[int(g)])
+            y_obs = A[:, int(g)]
+            y_pred = pred[:, int(g)]
+            gene_name = _gene_display_name(dataset.meta, int(g))
+            stem = f"{int(rank):02d}_{int(g):04d}_{_safe_filename_fragment(gene_name)}_r{r:.4f}".replace(".", "p")
+            out_png = scenario_dir / f"{stem}.png"
+
+            fig, ax = plt.subplots(1, 1, figsize=(4, 2.5))
+            _plot_gene_piecewise_linear(
+                ax, x, y_obs, y_pred,
+                num_bins=num_bins,
+                pt_size=pt_size,
+            )
+            ax.set_xlabel("Isodepth", fontsize=11)
+            ax.set_ylabel(y_label, fontsize=11)
+            ax.set_title(f"{panel_title}\n{gene_name}  (r={r:.3f})", fontsize=11)
+            ax.tick_params(labelsize=10)
+            fig.tight_layout()
+            fig.savefig(out_png, dpi=200, bbox_inches="tight")
+            plt.close(fig)
+
+            gene_entries.append(
+                {
+                    "rank": int(rank),
+                    "gene_index": int(g),
+                    "gene_name": gene_name,
+                    "pearson_r": r,
+                    "filename": str(out_png.relative_to(selected_root)),
+                }
+            )
+
+        manifest["scenarios"].append(
+            {
+                "subdir": subdir,
+                "title": panel_title,
+                "genes": gene_entries,
+            }
+        )
+
+    manifest_path = selected_root / "manifest.json"
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    return selected_root

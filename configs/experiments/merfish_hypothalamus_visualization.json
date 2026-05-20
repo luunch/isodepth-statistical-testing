@@ -8,7 +8,7 @@
     "layer": null,
     "use_raw": false,
     "min_cells_per_gene": 1,
-    "standardize": false,
+    "standardize_expression": false,
     "log1p": true,
     "q": null,
     "max_cells": null,

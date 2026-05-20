@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import random
 import sys
 import time
 from collections.abc import Mapping
@@ -14,16 +13,21 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.optim as optim
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from analysis.plots import _plot_spatial_isodepth
 from data import load_dataset
+from data.schemas import TestConfig
 from experiments.configuration import build_run_config
-from methods.architectures import IsoDepthNet
-from methods.trainers import resolve_device
+from methods.metrics import (
+    canonicalize_metric_name,
+    permutation_p_value,
+)
+from methods.permutation import _extract_slot_isodepths
+from methods.trainers import resolve_device, train_parallel_isodepth_model
 
 
 DEFAULT_CONFIG_PATH = "configs/merfish_hypothalamus_batchsize_comparison.json"
@@ -35,24 +39,34 @@ class BatchSizeComparisonSpec:
     experiment_name: str
     base_config: Path
     output_root: Path
-    base_epochs: int
+    base_epochs: int | None
     batch_sizes: list[int]
     device: str | None = None
+    time_budget_sec: float | None = None
+    n_perms: int | None = None
+    n_reruns: int | None = None
 
     def validate(self) -> "BatchSizeComparisonSpec":
         if not self.experiment_name:
             raise ValueError("experiment_name is required")
         if not self.base_config.exists():
             raise ValueError(f"base_config does not exist: {self.base_config}")
-        if int(self.base_epochs) <= 0:
-            raise ValueError("base_epochs must be > 0")
+        if self.base_epochs is not None and int(self.base_epochs) <= 0:
+            raise ValueError("base_epochs must be > 0 when provided")
         if any(int(value) <= 0 for value in self.batch_sizes):
             raise ValueError("batch_sizes entries must be > 0")
+        if self.n_perms is not None and int(self.n_perms) <= 0:
+            raise ValueError("n_perms must be > 0 when provided")
+        if self.n_reruns is not None and int(self.n_reruns) <= 0:
+            raise ValueError("n_reruns must be > 0 when provided")
         self.base_config = self.base_config.resolve()
         self.output_root = self.output_root.resolve()
-        self.base_epochs = int(self.base_epochs)
+        self.base_epochs = None if self.base_epochs is None else int(self.base_epochs)
         self.batch_sizes = [int(value) for value in self.batch_sizes]
         self.device = None if self.device is None else str(self.device)
+        self.time_budget_sec = None if self.time_budget_sec is None else float(self.time_budget_sec)
+        self.n_perms = None if self.n_perms is None else int(self.n_perms)
+        self.n_reruns = None if self.n_reruns is None else int(self.n_reruns)
         return self
 
 
@@ -62,13 +76,6 @@ def _resolve_repo_path(value: str) -> Path:
         return path.resolve()
     return (REPO_ROOT / path).resolve()
 
-
-def _set_global_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
 
 
 def _extract_experiment_section(config_path: Path) -> dict[str, Any]:
@@ -84,20 +91,25 @@ def load_batchsize_comparison_spec(path: str | Path) -> BatchSizeComparisonSpec:
     spec_path = _resolve_repo_path(str(path))
     with spec_path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
+    raw_epochs = payload.get("base_epochs")
+    raw_time = payload.get("time")
     return BatchSizeComparisonSpec(
         experiment_name=str(payload["experiment_name"]),
         base_config=_resolve_repo_path(str(payload["base_config"])),
         output_root=_resolve_repo_path(str(payload["output_root"])),
-        base_epochs=int(payload["base_epochs"]),
+        base_epochs=None if raw_epochs is None else int(raw_epochs),
         batch_sizes=[int(value) for value in payload.get("batch_sizes", [512, 256])],
         device=payload.get("device"),
+        time_budget_sec=None if raw_time is None else float(raw_time),
+        n_perms=payload.get("n_perms"),
+        n_reruns=payload.get("n_reruns"),
     ).validate()
 
 
 def _resolve_base_epochs(experiment_section: Mapping[str, Any], test_epochs: int) -> tuple[int, str]:
-    """Epoch budget for the full-batch baseline and for scaling mini-batch runs.
+    """Epoch budget shared by full-batch and mini-batch runs (same count for all).
 
-    Precedence: ``experiment.base_epochs`` → ``experiment.epochs`` → ``test.epochs``.
+    Precedence: ``experiment.base_epochs`` -> ``experiment.epochs`` -> ``test.epochs``.
     """
     if experiment_section.get("base_epochs") is not None:
         value = int(experiment_section["base_epochs"])
@@ -106,6 +118,7 @@ def _resolve_base_epochs(experiment_section: Mapping[str, Any], test_epochs: int
         value = int(experiment_section["epochs"])
         return value, "experiment.epochs"
     return int(test_epochs), "test.epochs"
+
 
 
 def _resolve_batch_sizes(experiment_section: Mapping[str, Any]) -> list[int]:
@@ -123,7 +136,12 @@ def _resolve_batch_sizes(experiment_section: Mapping[str, Any]) -> list[int]:
     return sizes
 
 
-def _build_schedule(n_cells: int, base_epochs: int, batch_sizes: list[int]) -> list[dict[str, Any]]:
+def _build_schedule(
+    n_cells: int,
+    base_epochs: int,
+    batch_sizes: list[int],
+) -> list[dict[str, Any]]:
+    """Every regime shares the same epoch cap; only steps/epoch differ."""
     if n_cells <= 0:
         raise ValueError("n_cells must be positive")
     if base_epochs <= 0:
@@ -143,98 +161,53 @@ def _build_schedule(n_cells: int, base_epochs: int, batch_sizes: list[int]) -> l
         if batch_size <= 0:
             raise ValueError(f"experiment.batch_sizes entries must be > 0, got {batch_size}")
         steps_per_epoch = int(math.ceil(float(n_cells) / float(batch_size)))
-        effective_epochs = int(max(1, round(float(base_epochs) / float(steps_per_epoch))))
+        planned_u = int(base_epochs) * steps_per_epoch
         schedule.append(
             {
                 "label": f"batch_{batch_size}",
                 "batch_size": int(batch_size),
                 "steps_per_epoch": steps_per_epoch,
-                "effective_epochs": effective_epochs,
-                "planned_total_updates": int(effective_epochs * steps_per_epoch),
+                "effective_epochs": int(base_epochs),
+                "planned_total_updates": planned_u,
             }
         )
     return schedule
 
 
-def _train_single_setting(
+def _run_permutation_regime(
     S: np.ndarray,
     A: np.ndarray,
     *,
-    decoder: str,
-    lr: float,
-    patience: int,
+    test_config: TestConfig,
     device: torch.device,
-    seed: int,
-    effective_epochs: int,
-    sgd_batch_size: int,
+    label: str,
 ) -> dict[str, Any]:
-    _set_global_seed(seed)
-    n_cells, n_genes = A.shape
-    model = IsoDepthNet(n_genes, latent_dim=1, decoder_type=decoder).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr, foreach=False)
+    """Run the full parallel permutation framework for one batch-size regime.
 
-    s_all = torch.tensor(S, dtype=torch.float32, device=device)
-    a_all = torch.tensor(A, dtype=torch.float32, device=device)
-    minibatch_generator = torch.Generator(device="cpu")
-    minibatch_generator.manual_seed(seed)
-    resolved_batch = 0 if sgd_batch_size <= 0 else min(int(sgd_batch_size), int(n_cells))
+    Returns a dict with p_value, stat_true, stat_perm, true_isodepth, and timing info.
+    """
+    t0 = time.perf_counter()
+    model, training_outputs, s_batched_np = train_parallel_isodepth_model(S, A, test_config, device=device)
+    wall_time_sec = time.perf_counter() - t0
 
-    loss_history: list[float] = []
-    epoch_elapsed_sec: list[float] = []
-    best_loss = float("inf")
-    best_epoch = -1
-    patience_counter = 0
-    executed_epochs = 0
-    steps_per_epoch = 1 if resolved_batch <= 0 else int(math.ceil(float(n_cells) / float(resolved_batch)))
+    metric = canonicalize_metric_name(test_config.metric)
+    stat_true = float(training_outputs.stat_true)
+    stat_perm = training_outputs.stat_perm
+    p_value = permutation_p_value(metric, stat_true, stat_perm)
 
-    t_train0 = time.perf_counter()
-    for epoch in range(int(effective_epochs)):
-        if resolved_batch <= 0:
-            optimizer.zero_grad()
-            preds = model(s_all)
-            train_loss = torch.mean((preds - a_all) ** 2)
-            train_loss.backward()
-            optimizer.step()
-        else:
-            permutation = torch.randperm(n_cells, generator=minibatch_generator)
-            for start in range(0, n_cells, resolved_batch):
-                batch_indices = permutation[start : start + resolved_batch].to(device=device)
-                batch_s = s_all.index_select(0, batch_indices)
-                batch_a = a_all.index_select(0, batch_indices)
-                optimizer.zero_grad()
-                batch_preds = model(batch_s)
-                batch_loss = torch.mean((batch_preds - batch_a) ** 2)
-                batch_loss.backward()
-                optimizer.step()
-
-        with torch.no_grad():
-            full_preds = model(s_all)
-            full_loss = float(torch.mean((full_preds - a_all) ** 2).detach().cpu().item())
-        loss_history.append(full_loss)
-        epoch_elapsed_sec.append(float(time.perf_counter() - t_train0))
-        executed_epochs = epoch + 1
-
-        if full_loss < (best_loss - 1e-8):
-            best_loss = full_loss
-            best_epoch = epoch
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                break
-
-    cumulative_updates = [(i + 1) * steps_per_epoch for i in range(len(loss_history))]
+    slot_iso = _extract_slot_isodepths(model, s_batched_np, [0], device)
+    true_isodepth = slot_iso[0]
 
     return {
-        "loss_history": [float(value) for value in loss_history],
-        "epoch_elapsed_sec": [float(value) for value in epoch_elapsed_sec],
-        "cumulative_gradient_updates": [int(u) for u in cumulative_updates],
-        "best_loss": float(best_loss),
-        "best_epoch": int(best_epoch),
-        "executed_epochs": int(executed_epochs),
-        "actual_total_updates": int(executed_epochs * steps_per_epoch),
-        "steps_per_epoch": int(steps_per_epoch),
-        "resolved_batch_size": int(resolved_batch),
+        "label": label,
+        "p_value": float(p_value),
+        "stat_true": float(stat_true),
+        "stat_perm": stat_perm,
+        "true_isodepth": np.asarray(true_isodepth, dtype=np.float32),
+        "wall_time_sec": float(wall_time_sec),
+        "n_perms": int(test_config.n_perms),
+        "n_reruns": int(test_config.n_reruns),
+        "executed_epochs": int(test_config.epochs),
     }
 
 
@@ -244,8 +217,8 @@ def _render_loss_line_plot(
     title: str,
     xlabel: str,
     ylabel: str,
-    metadata_lines: list[str],
     out_path: Path,
+    ylim: tuple[float | None, float | None] | None = None,
 ) -> None:
     fig, ax = plt.subplots(figsize=(11.0, 7.0))
     for label, x_vals, y_vals in series:
@@ -253,76 +226,115 @@ def _render_loss_line_plot(
     ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
+    if ylim is not None:
+        lo, hi = ylim
+        if lo is not None and hi is not None:
+            ax.set_ylim(lo, hi)
+        elif lo is not None:
+            ax.set_ylim(bottom=lo)
+        elif hi is not None:
+            ax.set_ylim(top=hi)
     ax.grid(alpha=0.25, linewidth=0.6)
     ax.legend(loc="upper right")
-
-    fig.subplots_adjust(bottom=0.35)
-    metadata_text = "\n".join(metadata_lines)
-    fig.text(
-        0.01,
-        0.01,
-        metadata_text,
-        ha="left",
-        va="bottom",
-        fontsize=9,
-        family="monospace",
-    )
     fig.savefig(out_path, dpi=220, bbox_inches="tight")
     plt.close(fig)
 
 
-def _runtime_bar_labels(record: dict[str, Any]) -> str:
-    label = str(record.get("label", ""))
-    if label == "true_full_batch":
-        return "Full batch"
-    batch_size = record.get("batch_size")
-    if batch_size is not None:
-        return f"Batch {int(batch_size)}"
-    return label
-
-
-def _render_runtime_plot(
-    records: list[dict[str, Any]],
-    metadata_lines: list[str],
+def _render_isodepth_grid(
+    panels: list[tuple[str, np.ndarray]],
+    spatial: np.ndarray,
+    *,
+    title: str,
     out_path: Path,
 ) -> None:
-    labels = [_runtime_bar_labels(record) for record in records]
-    times_sec = [float(record["wall_time_sec"]) for record in records]
-
-    fig, ax = plt.subplots(figsize=(9.0, 6.0))
-    x_pos = np.arange(len(labels), dtype=np.float64)
-    n_bars = max(len(labels), 1)
-    bar_colors = plt.cm.tab10(np.linspace(0.0, 1.0, n_bars, endpoint=False))
-    bars = ax.bar(x_pos, times_sec, color=bar_colors, edgecolor="0.2", linewidth=0.8)
-    ax.set_xticks(x_pos)
-    ax.set_xticklabels(labels)
-    ax.set_ylabel("Wall time (seconds)")
-    ax.set_title("Training wall time by batch regime")
-    ax.grid(axis="y", alpha=0.25, linewidth=0.6)
-
-    ymax = max(times_sec) if times_sec else 1.0
-    for bar, seconds in zip(bars, times_sec):
-        ax.text(
-            bar.get_x() + bar.get_width() / 2.0,
-            bar.get_height() + 0.02 * ymax,
-            f"{seconds:.1f}s",
-            ha="center",
-            va="bottom",
-            fontsize=10,
-        )
-
-    fig.subplots_adjust(bottom=0.22)
-    metadata_text = "\n".join(metadata_lines)
-    fig.text(
-        0.01,
-        0.01,
-        metadata_text,
-        ha="left",
-        va="bottom",
-        fontsize=8,
-        family="monospace",
+    """One subplot per (label, isodepth) panel, all on the same `spatial` (N, 2) coordinates."""
+    if not panels:
+        return
+    n_panels = len(panels)
+    n_cols = min(n_panels, 4)
+    n_rows = int(math.ceil(n_panels / n_cols))
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(4.6 * n_cols, 4.0 * n_rows),
+        squeeze=False,
     )
-    fig.savefig(out_path, dpi=220, bbox_inches="tight")
+    coords = np.asarray(spatial, dtype=np.float32)
+    for index, (label, depth) in enumerate(panels):
+        ax = axes[index // n_cols][index % n_cols]
+        _plot_spatial_isodepth(ax, coords, np.asarray(depth, dtype=np.float32), label)
+    for extra in range(n_panels, n_rows * n_cols):
+        axes[extra // n_cols][extra % n_cols].axis("off")
+    fig.suptitle(title)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.97))
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _render_metric_distribution_grid(
+    regime_results: list[dict[str, Any]],
+    *,
+    metric: str,
+    title: str,
+    out_path: Path,
+) -> None:
+    """One subplot per regime showing null distribution histogram + true statistic line."""
+    n = len(regime_results)
+    n_cols = min(n, 3)
+    n_rows = int(math.ceil(n / n_cols))
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(5.5 * n_cols, 4.0 * n_rows),
+        squeeze=False,
+    )
+    for idx, record in enumerate(regime_results):
+        ax = axes[idx // n_cols][idx % n_cols]
+        stat_perm = np.asarray(record["stat_perm"], dtype=np.float64)
+        stat_true = float(record["stat_true"])
+        p_value = float(record["p_value"])
+        label = str(record["label"])
+
+        ax.hist(stat_perm, bins=30, alpha=0.7, color="steelblue", edgecolor="white", linewidth=0.5)
+        ax.axvline(stat_true, color="red", linewidth=2.0, linestyle="--",
+                   label=f"True: {stat_true:.4g}")
+        ax.set_title(f"{label}\np = {p_value:.4g}", fontsize=10)
+        ax.set_xlabel(metric)
+        ax.set_ylabel("Count")
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.2, linewidth=0.5)
+    for extra in range(n, n_rows * n_cols):
+        axes[extra // n_cols][extra % n_cols].axis("off")
+    fig.suptitle(title, fontsize=12)
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _render_pvalue_bar_chart(
+    regime_results: list[dict[str, Any]],
+    *,
+    title: str,
+    out_path: Path,
+) -> None:
+    """Bar chart of p-values across regimes."""
+    labels = [str(r["label"]) for r in regime_results]
+    p_values = [float(r["p_value"]) for r in regime_results]
+    fig, ax = plt.subplots(figsize=(max(8.0, 1.2 * len(labels)), 5.0))
+    bars = ax.bar(range(len(labels)), p_values, color="steelblue", edgecolor="white", linewidth=0.5)
+    ax.axhline(0.05, color="red", linewidth=1.5, linestyle="--", label="α = 0.05")
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
+    ax.set_ylabel("p-value")
+    ax.set_ylim(0, max(max(p_values) * 1.15, 0.1))
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(axis="y", alpha=0.25, linewidth=0.6)
+    for bar, pv in zip(bars, p_values):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.005,
+                f"{pv:.4g}", ha="center", va="bottom", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -332,24 +344,23 @@ def _sync_cuda_if_needed(device: torch.device) -> None:
 
 
 def _run_record_for_json(record: dict[str, Any]) -> dict[str, Any]:
-    """Scalars only — no per-epoch series (those live in the plot files)."""
     return {
         "label": record["label"],
         "batch_size": int(record["batch_size"]),
-        "effective_epochs": int(record["effective_epochs"]),
+        "effective_epochs": record.get("effective_epochs"),
         "steps_per_epoch": int(record["steps_per_epoch"]),
-        "planned_total_updates": int(record["planned_total_updates"]),
-        "executed_epochs": int(record["executed_epochs"]),
-        "actual_total_updates": int(record["actual_total_updates"]),
-        "best_loss": float(record["best_loss"]),
-        "best_epoch": int(record["best_epoch"]),
+        "p_value": float(record["p_value"]),
+        "stat_true": float(record["stat_true"]),
+        "stat_perm_mean": float(np.mean(record["stat_perm"])),
+        "stat_perm_std": float(np.std(record["stat_perm"])),
+        "n_perms": int(record["n_perms"]),
+        "n_reruns": int(record["n_reruns"]),
         "wall_time_sec": float(record["wall_time_sec"]),
-        "resolved_batch_size": int(record["resolved_batch_size"]),
     }
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Batch-size loss comparison: full batch vs mini-batches.")
+    parser = argparse.ArgumentParser(description="Batch-size comparison with permutation test per regime.")
     parser.add_argument(
         "--spec",
         type=str,
@@ -392,8 +403,10 @@ def main() -> None:
         run_name = str(args.run_name) if args.run_name else str(spec.experiment_name)
         out_dir = str(_resolve_repo_path(args.out_dir)) if args.out_dir else str(spec.output_root)
         experiment_section = {
-            "base_epochs": int(spec.base_epochs),
+            "base_epochs": spec.base_epochs,
             "batch_sizes": list(spec.batch_sizes),
+            "n_perms": spec.n_perms,
+            "n_reruns": spec.n_reruns,
         }
         run_config = replace(
             run_config,
@@ -406,7 +419,7 @@ def main() -> None:
             )
     else:
         config_path = _resolve_repo_path(args.config)
-        experiment_section = _extract_experiment_section(config_path)
+        experiment_section = dict(_extract_experiment_section(config_path))
         run_config = build_run_config(str(config_path), {})
         if args.run_name:
             run_config = replace(run_config, output=replace(run_config.output, run_name=args.run_name))
@@ -420,14 +433,25 @@ def main() -> None:
         experiment_section,
         int(run_config.test.epochs),
     )
+    if base_epochs <= 0:
+        raise ValueError(
+            "base_epochs is required (the parallel permutation trainer is epoch-based). "
+            "Set experiment.base_epochs, experiment.epochs, or rely on test.epochs in the base config."
+        )
+
+    n_perms = int(experiment_section.get("n_perms") or run_config.test.n_perms)
+    n_reruns = int(experiment_section.get("n_reruns") or run_config.test.n_reruns)
+    effective_epochs = int(base_epochs)
+
     schedule = _build_schedule(dataset.n_cells, base_epochs, batch_sizes)
 
-    print(f"Loaded dataset from: {run_config.data.h5ad}")
+    print(f"Loaded dataset from: {run_config.data.h5ad if run_config.data.source == 'h5ad' else run_config.data.source}")
     if spec_path is not None:
         print(f"Loaded experiment spec: {spec_path}")
     print(f"Requested device: {run_config.test.device}")
     print(f"n_cells={dataset.n_cells}, n_genes={dataset.n_genes}")
-    print(f"Base epoch budget: {base_epochs} (from {base_epochs_source})")
+    print(f"Epoch budget: {base_epochs} (from {base_epochs_source})")
+    print(f"Permutation framework: n_perms={n_perms}, n_reruns={n_reruns}")
     print(f"Mini-batch sizes to compare: {batch_sizes if batch_sizes else '(none — full batch only)'}")
     print("Computed schedule:")
     print(json.dumps(schedule, indent=2))
@@ -437,97 +461,121 @@ def main() -> None:
     device = resolve_device(run_config.test.device)
     print(f"Resolved device: {device}")
 
-    out_dir = Path(run_config.output.out_dir) / run_config.output.run_name
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir_path = Path(run_config.output.out_dir) / run_config.output.run_name
+    out_dir_path.mkdir(parents=True, exist_ok=True)
 
-    run_records: list[dict[str, Any]] = []
-    series_epoch: list[tuple[str, np.ndarray, np.ndarray]] = []
-    series_updates: list[tuple[str, np.ndarray, np.ndarray]] = []
-    series_time: list[tuple[str, np.ndarray, np.ndarray]] = []
+    regime_results: list[dict[str, Any]] = []
+    isodepth_panels: list[tuple[str, np.ndarray]] = []
+    metric = canonicalize_metric_name(run_config.test.metric)
+
     for item in schedule:
         label = str(item["label"])
-        seed_for_run = int(run_config.test.seed)
+        sgd_batch = int(item["batch_size"])
+
+        regime_config = replace(
+            run_config.test,
+            epochs=effective_epochs,
+            n_perms=n_perms,
+            n_reruns=n_reruns,
+            sgd_batch_size=sgd_batch if sgd_batch > 0 else None,
+        )
+
+        print(f"\n{'='*60}")
+        print(f"Running regime: {label} (sgd_batch_size={sgd_batch or 'full'})")
+        print(f"  epochs={effective_epochs}, n_perms={n_perms}, n_reruns={n_reruns}")
+        print(f"{'='*60}")
+
         _sync_cuda_if_needed(device)
-        t_wall0 = time.perf_counter()
-        train_summary = _train_single_setting(
+        result = _run_permutation_regime(
             dataset.S,
             dataset.A,
-            decoder=str(run_config.test.decoder),
-            lr=float(run_config.test.lr),
-            patience=int(run_config.test.patience),
+            test_config=regime_config,
             device=device,
-            seed=seed_for_run,
-            effective_epochs=int(item["effective_epochs"]),
-            sgd_batch_size=int(item["batch_size"]),
+            label=label,
         )
         _sync_cuda_if_needed(device)
-        wall_time_sec = float(time.perf_counter() - t_wall0)
-        train_summary["wall_time_sec"] = wall_time_sec
 
-        plot_label = f"{label} (batch={item['batch_size']}, epochs={item['effective_epochs']})"
-        losses = np.asarray(train_summary["loss_history"], dtype=np.float64)
-        n = len(losses)
-        epochs_x = np.arange(1, n + 1, dtype=np.float64)
-        updates_x = np.asarray(train_summary["cumulative_gradient_updates"], dtype=np.float64)
-        time_x = np.asarray(train_summary["epoch_elapsed_sec"], dtype=np.float64)
-        series_epoch.append((plot_label, epochs_x, losses))
-        series_updates.append((plot_label, updates_x, losses))
-        series_time.append((plot_label, time_x, losses))
-        run_records.append({**item, **train_summary})
-        print(f"{label}: wall_time_sec={wall_time_sec:.3f}")
+        result["batch_size"] = sgd_batch
+        result["steps_per_epoch"] = int(item["steps_per_epoch"])
+        result["effective_epochs"] = item["effective_epochs"]
+        regime_results.append(result)
 
-    metadata_lines = [
-        f"dataset={Path(str(run_config.data.h5ad)).name}",
-        f"n_cells={dataset.n_cells}, n_genes={dataset.n_genes}",
-        f"seed={run_config.test.seed}, lr={run_config.test.lr}, patience={run_config.test.patience}",
-        f"decoder={run_config.test.decoder}, loss=mse",
-        f"base_epochs={base_epochs} ({base_epochs_source}), baseline=batch_size=0 (full batch)",
-        "schedule="
-        + ", ".join(
-            [
-                f"{record['label']}:batch={record['batch_size']},epochs={record['effective_epochs']},"
-                f"steps/epoch={record['steps_per_epoch']},planned_updates={record['planned_total_updates']}"
-                for record in run_records
-            ]
-        ),
-    ]
+        panel_label = (
+            f"full batch (p={result['p_value']:.3g})"
+            if sgd_batch == 0
+            else f"batch={sgd_batch} (p={result['p_value']:.3g})"
+        )
+        isodepth_panels.append(
+            (panel_label, np.asarray(result["true_isodepth"], dtype=np.float32))
+        )
+        print(f"  -> p_value={result['p_value']:.4g}, stat_true={result['stat_true']:.4g}, "
+              f"wall_time={result['wall_time_sec']:.1f}s")
 
     stem = f"{run_config.output.run_name}_batchsize"
-    plot_epoch_path = out_dir / f"{stem}_loss_vs_epoch.png"
-    plot_updates_path = out_dir / f"{stem}_loss_vs_gradient_updates.png"
-    plot_time_path = out_dir / f"{stem}_loss_vs_time.png"
-    _render_loss_line_plot(
-        series_epoch,
-        title="Training loss vs epoch",
-        xlabel="Epoch",
-        ylabel="Training MSE loss",
-        metadata_lines=metadata_lines,
-        out_path=plot_epoch_path,
-    )
-    _render_loss_line_plot(
-        series_updates,
-        title="Training loss vs cumulative gradient updates",
-        xlabel="Cumulative gradient updates",
-        ylabel="Training MSE loss",
-        metadata_lines=metadata_lines,
-        out_path=plot_updates_path,
-    )
-    _render_loss_line_plot(
-        series_time,
-        title="Training loss vs elapsed wall time",
-        xlabel="Elapsed time (s)",
-        ylabel="Training MSE loss",
-        metadata_lines=metadata_lines,
-        out_path=plot_time_path,
+
+    # Metric distribution grid
+    plot_metric_dist_path = out_dir_path / f"{stem}_metric_distributions.png"
+    _render_metric_distribution_grid(
+        regime_results,
+        metric=metric,
+        title=f"Null distributions per batch-size regime ({metric})",
+        out_path=plot_metric_dist_path,
     )
 
-    runtime_plot_path = out_dir / f"{stem}_wall_time.png"
-    _render_runtime_plot(run_records, metadata_lines, runtime_plot_path)
+    # P-value bar chart
+    plot_pvalue_path = out_dir_path / f"{stem}_pvalues.png"
+    _render_pvalue_bar_chart(
+        regime_results,
+        title="Permutation test p-value per batch-size regime",
+        out_path=plot_pvalue_path,
+    )
+
+    # Isodepth grid
+    is_synthetic = str(run_config.data.source) == "synthetic"
+    true_isodepth_arr: np.ndarray | None = None
+    if is_synthetic:
+        raw_true = dataset.meta.get("synthetic_true_curve")
+        if raw_true is not None:
+            true_isodepth_arr = np.asarray(raw_true, dtype=np.float32).reshape(-1)
+
+    grid_panels: list[tuple[str, np.ndarray]] = []
+    if true_isodepth_arr is not None:
+        grid_panels.append(("True isodepth (synthetic)", true_isodepth_arr))
+    grid_panels.extend(isodepth_panels)
+    plot_isodepth_grid_path = out_dir_path / f"{stem}_learned_isodepths.png"
+    _render_isodepth_grid(
+        grid_panels,
+        np.asarray(dataset.S, dtype=np.float32),
+        title="Learned isodepth per regime"
+        + (" (with synthetic ground truth)" if true_isodepth_arr is not None else ""),
+        out_path=plot_isodepth_grid_path,
+    )
+
+    # NPZ with isodepths
+    isodepths_npz_path = out_dir_path / f"{stem}_learned_isodepths.npz"
+    npz_payload: dict[str, np.ndarray] = {
+        "S": np.asarray(dataset.S, dtype=np.float32),
+    }
+    for record in regime_results:
+        safe_key = str(record["label"]).replace(" ", "_")
+        npz_payload[f"isodepth__{safe_key}"] = np.asarray(record["true_isodepth"], dtype=np.float32)
+    if true_isodepth_arr is not None:
+        npz_payload["true_isodepth"] = true_isodepth_arr
+    np.savez(isodepths_npz_path, **npz_payload)
+
+    # JSON results
+    artifacts_payload: dict[str, str] = {
+        "metric_distributions": str(plot_metric_dist_path),
+        "pvalues_plot": str(plot_pvalue_path),
+        "learned_isodepths_plot": str(plot_isodepth_grid_path),
+        "learned_isodepths_data": str(isodepths_npz_path),
+    }
 
     results_payload = {
         "spec_path": None if spec_path is None else str(spec_path),
         "dataset": {
-            "h5ad": str(run_config.data.h5ad),
+            "source": str(run_config.data.source),
+            "h5ad": str(run_config.data.h5ad) if run_config.data.source == "h5ad" else None,
             "n_cells": int(dataset.n_cells),
             "n_genes": int(dataset.n_genes),
         },
@@ -536,29 +584,30 @@ def main() -> None:
             "lr": float(run_config.test.lr),
             "patience": int(run_config.test.patience),
             "decoder": str(run_config.test.decoder),
-            "base_epochs": int(base_epochs),
-            "base_epochs_source": base_epochs_source,
+            "epochs": int(effective_epochs),
+            "epochs_source": base_epochs_source,
+            "n_perms": int(n_perms),
+            "n_reruns": int(n_reruns),
+            "metric": str(metric),
             "batch_sizes": list(batch_sizes),
-            "loss": "mse",
             "device": str(device),
         },
-        "runs": [_run_record_for_json(r) for r in run_records],
-        "artifacts": {
-            "loss_vs_epoch": str(plot_epoch_path),
-            "loss_vs_gradient_updates": str(plot_updates_path),
-            "loss_vs_time": str(plot_time_path),
-            "runtime_plot": str(runtime_plot_path),
-        },
+        "runs": [_run_record_for_json(r) for r in regime_results],
+        "artifacts": artifacts_payload,
     }
-    json_path = out_dir / f"{run_config.output.run_name}_batchsize_comparison.json"
+    json_path = out_dir_path / f"{run_config.output.run_name}_batchsize_comparison.json"
     with json_path.open("w", encoding="utf-8") as handle:
         json.dump(results_payload, handle, indent=2)
 
-    print(f"Saved loss vs epoch: {plot_epoch_path}")
-    print(f"Saved loss vs gradient updates: {plot_updates_path}")
-    print(f"Saved loss vs time: {plot_time_path}")
-    print(f"Saved wall-time plot: {runtime_plot_path}")
+    print(f"\nSaved metric distributions: {plot_metric_dist_path}")
+    print(f"Saved p-value bar chart: {plot_pvalue_path}")
+    print(f"Saved learned isodepth grid: {plot_isodepth_grid_path}")
+    print(f"Saved learned isodepth arrays: {isodepths_npz_path}")
     print(f"Saved comparison JSON: {json_path}")
+    print("\nSummary:")
+    for record in regime_results:
+        print(f"  {record['label']:20s}  p={record['p_value']:.4g}  "
+              f"stat_true={record['stat_true']:.4g}  wall={record['wall_time_sec']:.1f}s")
 
 
 if __name__ == "__main__":
