@@ -233,8 +233,17 @@ def _build_celltype_overview_figure(
     )
 
     ax_expr = fig.add_subplot(gs[0, 0])
-    signal = np.mean(np.abs(np.asarray(dataset.A, dtype=np.float32)), axis=1)
-    plot_spatial_field(ax_expr, dataset.S, signal, cmap="Reds", limits=limits,
+    # Reload raw (unnormalized) expression so it isn't per-cell-type standardized
+    from data import load_dataset
+    from data.schemas import DataConfig
+    viz_raw = {k: meta[k] for k in DataConfig.__dataclass_fields__ if k in meta}
+    viz_raw["standardize_expression"] = False
+    viz_raw.pop("cell_type", None)
+    raw_ds = load_dataset(DataConfig(**viz_raw))
+    S_arr = np.asarray(raw_ds.S, dtype=np.float32)
+    A_arr = np.asarray(raw_ds.A, dtype=np.float32)[:S_arr.shape[0]]
+    signal = np.mean(np.abs(A_arr), axis=1)
+    plot_spatial_field(ax_expr, S_arr, signal, cmap="Reds", limits=limits,
                        title="", colorbar_label="Expression",
                        contours=False, point_scale=0.20)
     ax_expr.set_title("Mean expression", fontsize=_title_fs, fontstyle="italic", pad=3)
@@ -305,8 +314,6 @@ def _build_celltype_pertype_figure(
 
     from scipy.spatial import cKDTree
 
-    labels = "abcdefghijklmnopqrstuvwxyz"
-
     for type_idx, type_name in enumerate(ct_names):
         td = per_type[type_name]
         row = type_idx // pairs_per_row
@@ -352,8 +359,6 @@ def _build_celltype_pertype_figure(
                        transform=ax_sp.transAxes, fontsize=5)
             _strip_spatial_axes(ax_sp, limits)
 
-        add_panel_label(ax_sp, labels[type_idx * 2])
-
         is_bottom = (row == n_rows - 1) or (type_idx + pairs_per_row >= n_types)
         is_left_ecdf = (pair_col == 0)
 
@@ -365,7 +370,6 @@ def _build_celltype_pertype_figure(
             q_value=q_val,
             title="",
         )
-        add_panel_label(ax_ec, labels[type_idx * 2 + 1])
 
         if not is_bottom:
             ax_ec.set_xlabel("")

@@ -12,10 +12,11 @@ from analysis.plots import (
     save_combined_celltype_isodepth_grid,
     save_combined_celltype_metric_distribution,
     save_dataset_triptych,
+    save_gene_expression_vs_coordinates_comparison,
+    save_gene_expression_vs_isodepth_plot,
     save_isodepth_triptych,
     save_metric_distribution_plot,
     save_perturbation_delta_pvalue_plot,
-    save_selected_genes_expression_vs_isodepth,
     save_synthetic_true_curve_plot,
     save_subset_fraction_pvalue_plot,
     save_true_rerun_isodepth_grid,
@@ -192,7 +193,6 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
     if method in {
         "parallel_permutation",
         "cross_validation",
-        "exact_existence",
         "full_retraining",
         "comparison_perturbation_test",
         "perturbation_test",
@@ -202,8 +202,6 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
         test_keys.add("n_perms")
     if method == "cross_validation":
         test_keys.add("train_fraction")
-    if method == "exact_existence":
-        test_keys |= {"max_spatial_dims", "alpha"}
     if method in {"comparison_perturbation_test", "perturbation_test"}:
         test_keys |= {"n_nulls", "batch_size", "delta", "perturb_target"}
     elif method in {"comparison_subsampling_test", "subsampling_test"}:
@@ -236,7 +234,6 @@ def _method_artifact_keys(method_name: str) -> set[str]:
     if method_name in {
         "parallel_permutation",
         "cross_validation",
-        "exact_existence",
         "full_retraining",
         "subsampling_test",
     }:
@@ -245,6 +242,7 @@ def _method_artifact_keys(method_name: str) -> set[str]:
             "true_isodepth",
             "stat_covariate",
             "p_value_covariate",
+            "pred_true",
             "pred_true_covariate",
             "true_isodepth_covariate",
             "pred_true_full_iso",
@@ -260,8 +258,6 @@ def _method_artifact_keys(method_name: str) -> set[str]:
                 "test_size",
                 "observed_test_loss",
             }
-        if method_name == "exact_existence":
-            extra |= {"selected_spatial_dims", "tested_spatial_dims", "step_summaries", "alpha", "max_spatial_dims"}
         return shared | extra
     if method_name == "perturbation_test":
         return shared | {
@@ -309,6 +305,7 @@ def _save_single_type_outputs(
     type_dir: Path,
     *,
     metric: str = "nll_gaussian_mse",
+    decoder_df: int | None = None,
 ) -> dict[str, str]:
     """Generate the standard plot set for one cell type in separate mode."""
     S_c = np.asarray(type_data["S"], dtype=np.float32)
@@ -366,11 +363,46 @@ def _save_single_type_outputs(
     p_dist = save_metric_distribution_plot(subset_result, type_dir / f"{type_name}_metric_distribution.png")
     paths["metric_distribution_plot"] = str(p_dist)
 
-    p_genes = save_selected_genes_expression_vs_isodepth(
-        subset_dataset, subset_result, type_dir, top_k=5,
-    )
-    if p_genes is not None:
-        paths["selected_genes_dir"] = str(p_genes)
+    # Save per-type isodepth arrays to NPZ for offline regeneration.
+    iso_raw = type_data.get("true_isodepth")
+    cov_raw = type_data.get("true_isodepth_covariate")
+    if iso_raw is not None:
+        save_dict: dict[str, Any] = {
+            "true_isodepth": np.asarray(iso_raw, dtype=np.float32),
+            "A": np.asarray(type_data["A"], dtype=np.float32),
+        }
+        if cov_raw is not None:
+            save_dict["true_isodepth_covariate"] = np.asarray(cov_raw, dtype=np.float32)
+        npz_path = type_dir / f"{type_name}_isodepths.npz"
+        np.savez_compressed(npz_path, **save_dict)
+        paths["isodepths_npz"] = str(npz_path)
+
+    # Gene expression vs isodepth/covariate summary plot (quantile bins).
+    if iso_raw is not None:
+        cov_label = str(dataset_meta.get("covariate_obs_key") or "covariate")
+        fake_result: TestResult = TestResult(
+            method_name="parallel_permutation",
+            metric=metric,
+            p_value=float(type_data["p_value"]),
+            stat_true=float(type_data["stat_true"]),
+            stat_perm=np.asarray(type_data["stat_perm"], dtype=np.float64),
+            runtime_sec=0.0,
+            n_cells=int(S_c.shape[0]),
+            n_genes=int(A_c.shape[1]),
+            config={},
+            artifacts={
+                "true_isodepth": iso_raw,
+                "true_isodepth_covariate": cov_raw,
+                "pred_true": type_data.get("pred_true"),
+                "pred_true_covariate": type_data.get("pred_true_covariate"),
+            },
+        ).validate()
+        _save_gene_expression_summary_plots(
+            subset_dataset, fake_result, type_name, type_dir, paths,
+            isodepth_label="Isodepth",
+            covariate_label=cov_label,
+            decoder_df=decoder_df,
+        )
 
     model_c = type_data.get("model")
     training_metadata = getattr(model_c, "training_metadata", None)
@@ -397,6 +429,99 @@ def _save_single_type_outputs(
                 paths["true_rerun_isodepth_grid_plot"] = str(p_rerun)
 
     return paths
+
+
+def _save_gene_expression_summary_plots(
+    dataset: DatasetBundle,
+    result: TestResult,
+    run_name: str,
+    out_dir: Path,
+    artifact_paths: dict[str, str],
+    *,
+    isodepth_label: str = "Isodepth",
+    covariate_label: str | None = None,
+    decoder_df: int | None = None,
+) -> None:
+    """Generate gene-expression-vs-coordinate summary plots from saved isodepths.
+
+    Uses ``true_isodepth`` (and optionally ``true_isodepth_covariate``) from
+    ``result.artifacts``.  When ``pred_true`` / ``pred_true_covariate`` are
+    also present in ``result.artifacts`` (either from training or a rerun), the
+    decoder predictions are passed to the plot so the fit curve reflects the
+    actual learned (possibly non-linear) decoder rather than a polynomial
+    approximation.
+
+    When ``decoder_df`` is set (1 for linear, 2 for quadratic …) an F-test is
+    run for every gene and significant genes (BH q < 0.05) are written to CSVs
+    beside the PNG.
+    """
+    iso_raw = result.artifacts.get("true_isodepth")
+    if iso_raw is None:
+        return
+    iso = np.asarray(iso_raw, dtype=np.float64).reshape(-1)
+
+    pred_iso_raw = result.artifacts.get("pred_true")
+    pred_cov_raw = result.artifacts.get("pred_true_covariate")
+    pred_iso = np.asarray(pred_iso_raw, dtype=np.float64) if pred_iso_raw is not None else None
+    pred_cov = np.asarray(pred_cov_raw, dtype=np.float64) if pred_cov_raw is not None else None
+
+    cov_raw = result.artifacts.get("true_isodepth_covariate")
+    cov_lbl = covariate_label or "Covariate"
+    if cov_raw is not None:
+        cov = np.asarray(cov_raw, dtype=np.float64).reshape(-1)
+        try:
+            p = save_gene_expression_vs_coordinates_comparison(
+                dataset, iso, cov,
+                out_dir / f"{run_name}_gene_expression_vs_coordinates.png",
+                isodepth_label=isodepth_label,
+                covariate_label=cov_lbl,
+                pred_isodepth=pred_iso,
+                pred_covariate=pred_cov,
+                decoder_df=decoder_df,
+            )
+            artifact_paths["gene_expression_plot"] = str(p)
+        except Exception:
+            pass
+    else:
+        try:
+            p = save_gene_expression_vs_isodepth_plot(
+                dataset, iso,
+                out_dir / f"{run_name}_gene_expression_vs_isodepth.png",
+                coord_label=isodepth_label,
+                decoder_preds=pred_iso,
+                decoder_df=decoder_df,
+            )
+            artifact_paths["gene_expression_plot"] = str(p)
+        except Exception:
+            pass
+
+
+def _decoder_df_from_config(decoder: str | None) -> int | None:
+    """Return the F-test model degrees of freedom for the given decoder type.
+
+    Only well-defined for parametric decoders:
+      ``"linear"``    → 1 (y = w·z + b; one slope parameter)
+      ``"quadratic"`` → 2 (y = w₁·z + w₂·z² + b; two slope parameters)
+    All other decoders (``"nn"``, None, …) return None → F-test skipped.
+    """
+    if decoder == "linear":
+        return 1
+    if decoder == "quadratic":
+        return 2
+    return None
+
+
+def _resolve_covariate_label(run_config: RunConfig) -> str:
+    """Human-readable label for the covariate coordinate axis."""
+    cov = run_config.test.covariate
+    if cov is None:
+        return "Covariate"
+    if cov.type == "midline":
+        return "Midline"
+    if cov.is_obs_key and cov.type:
+        return str(cov.type).capitalize()
+    return "Covariate"
+
 
 
 def save_standardized_outputs(
@@ -442,9 +567,11 @@ def save_standardized_outputs(
     )
     artifact_paths["metric_distribution_plot"] = str(distribution_plot_path)
 
-    selected_genes_dir = save_selected_genes_expression_vs_isodepth(dataset, result, out_dir, top_k=5)
-    if selected_genes_dir is not None:
-        artifact_paths["selected_genes_dir"] = str(selected_genes_dir)
+    _save_gene_expression_summary_plots(
+        dataset, result, run_config.output.run_name, out_dir, artifact_paths,
+        covariate_label=_resolve_covariate_label(run_config),
+        decoder_df=_decoder_df_from_config(getattr(run_config.test, "decoder", None)),
+    )
 
     subset_fraction_plot_path = save_subset_fraction_pvalue_plot(
         result,
@@ -540,6 +667,12 @@ def _save_separate_celltype_outputs(
     per_type_summaries: dict[str, dict[str, Any]] = {}
     per_type_artifact_paths: dict[str, dict[str, str]] = {}
 
+    # For cell-type separate mode the latent is always 1D, so an F-test with
+    # df_model=1 is always well-defined regardless of decoder architecture.
+    # This produces per-cell-type sig-gene CSVs for both isodepth and covariate
+    # decoders whenever their predictions are available in type_data.
+    _ct_decoder_df = 1
+
     for type_name in cell_type_names:
         type_data = per_type_results[type_name]
         safe_name = type_name.replace(" ", "_").replace("/", "_")
@@ -548,6 +681,7 @@ def _save_separate_celltype_outputs(
         type_artifact_paths = _save_single_type_outputs(
             safe_name, type_data, dataset.meta, type_dir,
             metric=result.metric,
+            decoder_df=_ct_decoder_df,
         )
         per_type_artifact_paths[type_name] = type_artifact_paths
         per_type_summaries[type_name] = {

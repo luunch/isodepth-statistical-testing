@@ -12,6 +12,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from data.schemas import CovariateConfig, DatasetBundle, TestConfig
+from data.transforms import zscore_covariate
 from methods.architectures import MidlineLatent, ParallelIsoDepthNet
 from methods.permutation import run_parallel_permutation_method
 from methods.trainers import resolve_device, train_batched_isodepth_model
@@ -30,10 +31,14 @@ class TestMidlineLatent(unittest.TestCase):
         z = m(s)
         x0 = s[0, :, 0]
         med0 = x0.median()
-        self.assertTrue(torch.allclose(z[0, :, 0], (x0 - med0).abs()))
+        depth0 = (x0 - med0).abs()
+        expected0 = ((depth0 - depth0.mean()) / depth0.std(unbiased=False)).unsqueeze(-1)
+        self.assertTrue(torch.allclose(z[0], expected0))
         x1 = s[1, :, 0]
         med1 = x1.median()
-        self.assertTrue(torch.allclose(z[1, :, 0], (x1 - med1).abs()))
+        depth1 = (x1 - med1).abs()
+        expected1 = ((depth1 - depth1.mean()) / depth1.std(unbiased=False)).unsqueeze(-1)
+        self.assertTrue(torch.allclose(z[1], expected1))
 
 
 class TestMidlineTraining(unittest.TestCase):
@@ -64,7 +69,8 @@ class TestMidlineTraining(unittest.TestCase):
         self.assertEqual(d_b.shape, (2, 8, 1))
         x = s_t[0, :, 0]
         med = x.median()
-        expected0 = (x - med).abs().unsqueeze(-1).cpu().numpy()
+        depth = (x - med).abs()
+        expected0 = ((depth - depth.mean()) / depth.std(unbiased=False)).unsqueeze(-1).cpu().numpy()
         np.testing.assert_allclose(d_b[0], expected0, rtol=0, atol=1e-5)
 
     def test_parallel_permutation_covariate_trains_full_batch_then_covariate_decoder(self) -> None:
@@ -98,5 +104,6 @@ class TestMidlineTraining(unittest.TestCase):
         self.assertNotIn("true_isodepth_full_iso", result.artifacts)
 
         x_t = torch.tensor(s[:, 0], dtype=torch.float32)
-        expected_midline = (x_t - x_t.median()).abs().numpy()
+        depth = (x_t - x_t.median()).abs().numpy()
+        expected_midline = zscore_covariate(depth)
         np.testing.assert_allclose(result.artifacts["true_isodepth_covariate"], expected_midline, rtol=0, atol=1e-5)

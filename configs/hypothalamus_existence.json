@@ -10,9 +10,8 @@
     "min_cells_per_gene": 1,
     "standardize_expression": true,
     "standardize_coordinates": true,
-    "log1p": false,
+    "log1p": true,
     "max_cells": null,
-    "q": 10,
     "seed": 0
   },
   "test": {
@@ -21,17 +20,17 @@
     "covariate": "midline",
     "n_perms": 99,
     "epochs": 500,
-    "n_reruns": 10,
+    "n_reruns": 30,
     "sgd_batch_size": 128,
     "lr": 0.001,
     "seed": 42,
     "device": "cuda",
-    "decoder": "nn",
+    "decoder": "quadratic",
     "verbose": true
   },
   "output": {
     "out_dir": "results",
-    "run_name": "hypothalamus_existence",
+    "run_name": "hypothalamus_existence_quadratic",
     "save_preds": false,
     "save_perm_stats": true
   }}

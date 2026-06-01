@@ -111,7 +111,6 @@ Supported `test.method` values:
 
 - `parallel_permutation`
 - `cross_validation`
-- `exact_existence`
 - `full_retraining`
 - `comparison_perturbation_test`
 - `perturbation_test`
@@ -131,7 +130,7 @@ Run the bundled example config:
 
 ```bash
 python run_permutation.py \
-  --config configs/noise_exact_existence.json
+  --config configs/noise_existence.json
 ```
 
 Run a config with CLI overrides:
@@ -214,13 +213,12 @@ This option is intended for `h5ad` count-valued inputs and is not supported for 
 - `--k`: legacy shorthand for the Fourier frequency band when `--mode fourier`. It maps to `k_min = 1` and `k_max = k`, and the generator samples a coupled 2D Fourier basis over terms of the form `cos(2π(k1 x + k2 y))` and `sin(2π(k1 x + k2 y))`.
 - `data.dependent_xy`: Fourier-only boolean flag. `true` uses the coupled basis `k1 x + k2 y`; `false` uses independent `x`-only and `y`-only sine/cosine terms.
 
-- `--method`: test method. Supported values are `parallel_permutation`, `cross_validation`, `exact_existence`, `full_retraining`, `comparison_perturbation_test`, `perturbation_test`, `comparison_subsampling_test`, `subsampling_test`.
+- `--method`: test method. Supported values are `parallel_permutation`, `cross_validation`, `full_retraining`, `comparison_perturbation_test`, `perturbation_test`, `comparison_subsampling_test`, `subsampling_test`.
 - `--metric`: one of `nll_gaussian_mse`, `mse`, `pearson_corr_mean`, `spearman_corr_mean`.
 - `--n-perms`: number of perturbations for `comparison_perturbation_test` and `perturbation_test`, number of random subset draws per fraction for `subsampling_test` and `comparison_subsampling_test`, or number of permutations for existence-style methods.
 - `--train-fraction`: train-set fraction for `cross_validation`. The remaining cells define the held-out test statistic.
 - `--n-reruns`: number of parallel reruns trained per dataset instance inside the batched GASTON model. The minimum training reconstruction loss is selected independently for the observed dataset and every transformed/null dataset. Default is `30`.
-- `--max-spatial-dims`: maximum latent spatial dimension tested by `exact_existence`.
-- `--alpha`: one-sided permutation significance threshold for `exact_existence`. Default is `0.05`.
+- `--alpha`: one-sided permutation significance threshold. Default is `0.05`.
 - `--n-nulls`: number of null datasets for `comparison_perturbation_test` and `comparison_subsampling_test`. This field is ignored by the direct transformed-data methods.
 - `--epochs`: training epochs for learned-model methods.
 - `--lr`: learning rate.
@@ -277,35 +275,6 @@ The result JSON includes these standard fields:
 - `n_genes`
 - `config`
 - `artifacts`
-
-## Exact Existence Test
-
-`exact_existence` estimates the exact number of spatial dimensions supported by the data.
-
-- Start from `k = 0`, where the baseline model has no spatial bottleneck and predicts expression from a decoder-only constant representation.
-- For each step `k -> k + 1`, fit paired batched models on the observed dataset and the same coordinate permutations using latent dimensions `k` and `k + 1`.
-- Compute the observed loss improvement `L_k - L_{k+1}` and compare it to the permutation null distribution of paired improvements.
-- Continue while the one-sided p-value is below `alpha`; stop at the first non-significant step.
-
-Key config fields for `exact_existence`:
-
-- `test.max_spatial_dims`
-- `test.alpha`
-- `test.n_perms`
-- `test.decoder`, with `linear` or `nn` (default `nn`)
-- `test.n_reruns`
-- `test.metric`, restricted to `mse` or `nll_gaussian_mse`
-
-Saved artifacts include:
-
-- `selected_spatial_dims`
-- `tested_spatial_dims`
-- `step_summaries`
-
-Plots for `exact_existence`:
-
-- The metric distribution figure contains one histogram row per tested dimension.
-- The isodepth figure contains one row per tested dimension and shows all latent coordinates for the true fit, the least-improving permutation, and the most-improving permutation.
 
 ## Comparison Perturbation Test
 

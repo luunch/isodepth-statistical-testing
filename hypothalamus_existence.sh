@@ -23,6 +23,6 @@ mamba activate isodepth_env
 # Step 4: Prepend the conda-packaged CUDA libraries expected by this torch build.
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib/python3.10/site-packages/nvidia/nvjitlink/lib:$CONDA_PREFIX/lib/python3.10/site-packages/nvidia/cusparse/lib:$CONDA_PREFIX/lib/python3.10/site-packages/nvidia/cublas/lib:$CONDA_PREFIX/lib/python3.10/site-packages/nvidia/cusolver/lib:$CONDA_PREFIX/lib/python3.10/site-packages/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH}"
 
-# Step 5: Run the mouse hippocampus existence permutation test with q=10 and an NN decoder.
+# Step 5: Run the hypothalamus existence permutation test.
 python run_permutation.py \
-  --config configs/hypothalamus_celltype_existence.json
+  --config configs/hypothalamus_existence.json

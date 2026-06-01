@@ -15,6 +15,7 @@ from methods.trainers.isodepth import (
     get_training_metadata,
     train_batched_isodepth_model,
     train_celltype_parallel_isodepth_model,
+    train_fixed_covariate_model,
     train_isodepth_model,
     train_parallel_isodepth_model,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "run_with_cuda_oom_retry",
     "train_batched_isodepth_model",
     "train_celltype_parallel_isodepth_model",
+    "train_fixed_covariate_model",
     "train_isodepth_model",
     "train_parallel_isodepth_model",
 ]

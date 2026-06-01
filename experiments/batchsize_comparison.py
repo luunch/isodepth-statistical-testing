@@ -18,7 +18,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from analysis.plots import _plot_spatial_isodepth
+from scipy.stats import spearmanr
+
+from analysis.plots import _bias_detection_pearson, _plot_spatial_isodepth
 from data import load_dataset
 from data.schemas import TestConfig
 from experiments.configuration import build_run_config
@@ -27,11 +29,13 @@ from methods.metrics import (
     permutation_p_value,
 )
 from methods.permutation import _extract_slot_isodepths
-from methods.trainers import resolve_device, train_parallel_isodepth_model
+from methods.trainers import get_training_metadata, resolve_device, train_parallel_isodepth_model
 
 
 DEFAULT_CONFIG_PATH = "configs/merfish_hypothalamus_batchsize_comparison.json"
 DEFAULT_SPEC_PATH = "configs/experiments/batchsize_comparison.json"
+# Upper bound on the epoch loop when training until time_budget_sec elapses.
+_TIME_MODE_EPOCH_CAP = 10_000_000
 
 
 @dataclass
@@ -59,6 +63,8 @@ class BatchSizeComparisonSpec:
             raise ValueError("n_perms must be > 0 when provided")
         if self.n_reruns is not None and int(self.n_reruns) <= 0:
             raise ValueError("n_reruns must be > 0 when provided")
+        if self.time_budget_sec is not None and float(self.time_budget_sec) <= 0:
+            raise ValueError("time_budget_sec must be > 0 when provided")
         self.base_config = self.base_config.resolve()
         self.output_root = self.output_root.resolve()
         self.base_epochs = None if self.base_epochs is None else int(self.base_epochs)
@@ -92,7 +98,7 @@ def load_batchsize_comparison_spec(path: str | Path) -> BatchSizeComparisonSpec:
     with spec_path.open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     raw_epochs = payload.get("base_epochs")
-    raw_time = payload.get("time")
+    raw_time = payload.get("time_budget_sec", payload.get("time"))
     return BatchSizeComparisonSpec(
         experiment_name=str(payload["experiment_name"]),
         base_config=_resolve_repo_path(str(payload["base_config"])),
@@ -106,8 +112,20 @@ def load_batchsize_comparison_spec(path: str | Path) -> BatchSizeComparisonSpec:
     ).validate()
 
 
+def _resolve_time_budget_sec(experiment_section: Mapping[str, Any]) -> float | None:
+    if experiment_section.get("time_budget_sec") is not None:
+        value = float(experiment_section["time_budget_sec"])
+    elif experiment_section.get("time") is not None:
+        value = float(experiment_section["time"])
+    else:
+        return None
+    if value <= 0:
+        raise ValueError("time_budget_sec must be > 0 when provided")
+    return value
+
+
 def _resolve_base_epochs(experiment_section: Mapping[str, Any], test_epochs: int) -> tuple[int, str]:
-    """Epoch budget shared by full-batch and mini-batch runs (same count for all).
+    """Full-batch gradient-update budget (mini-batch regimes are scaled to match).
 
     Precedence: ``experiment.base_epochs`` -> ``experiment.epochs`` -> ``test.epochs``.
     """
@@ -136,42 +154,83 @@ def _resolve_batch_sizes(experiment_section: Mapping[str, Any]) -> list[int]:
     return sizes
 
 
-def _build_schedule(
+def _steps_per_epoch(n_cells: int, batch_size: int) -> int:
+    if batch_size <= 0:
+        return 1
+    return int(math.ceil(float(n_cells) / float(batch_size)))
+
+
+def _epochs_for_equal_updates(base_updates: int, steps_per_epoch: int) -> int:
+    if steps_per_epoch <= 1:
+        return int(base_updates)
+    return max(1, int(math.ceil(float(base_updates) / float(steps_per_epoch))))
+
+
+def _build_regime_list(batch_sizes: list[int]) -> list[dict[str, Any]]:
+    regimes: list[dict[str, Any]] = [
+        {"label": "true_full_batch", "batch_size": 0},
+    ]
+    for batch_size in batch_sizes:
+        regimes.append({"label": f"batch_{batch_size}", "batch_size": int(batch_size)})
+    return regimes
+
+
+def _build_fixed_update_schedule(
     n_cells: int,
-    base_epochs: int,
+    base_updates: int,
     batch_sizes: list[int],
 ) -> list[dict[str, Any]]:
-    """Every regime shares the same epoch cap; only steps/epoch differ."""
-    if n_cells <= 0:
-        raise ValueError("n_cells must be positive")
-    if base_epochs <= 0:
-        raise ValueError("base_epochs must be positive")
-
+    """Fixed update budget per regime (used when time_budget_sec is not set)."""
     schedule: list[dict[str, Any]] = []
-    schedule.append(
-        {
-            "label": "true_full_batch",
-            "batch_size": 0,
-            "steps_per_epoch": 1,
-            "effective_epochs": int(base_epochs),
-            "planned_total_updates": int(base_epochs),
-        }
-    )
-    for batch_size in batch_sizes:
-        if batch_size <= 0:
-            raise ValueError(f"experiment.batch_sizes entries must be > 0, got {batch_size}")
-        steps_per_epoch = int(math.ceil(float(n_cells) / float(batch_size)))
-        planned_u = int(base_epochs) * steps_per_epoch
+    for regime in _build_regime_list(batch_sizes):
+        batch_size = int(regime["batch_size"])
+        steps = _steps_per_epoch(n_cells, batch_size) if batch_size > 0 else 1
+        effective_epochs = (
+            int(base_updates) if batch_size == 0 else _epochs_for_equal_updates(base_updates, steps)
+        )
         schedule.append(
             {
-                "label": f"batch_{batch_size}",
-                "batch_size": int(batch_size),
-                "steps_per_epoch": steps_per_epoch,
-                "effective_epochs": int(base_epochs),
-                "planned_total_updates": planned_u,
+                **regime,
+                "steps_per_epoch": steps,
+                "effective_epochs": effective_epochs,
+                "planned_total_updates": int(effective_epochs) * steps,
             }
         )
     return schedule
+
+
+def _resolve_regime_test_config(
+    run_config_test: TestConfig,
+    *,
+    batch_size: int,
+    n_perms: int,
+    n_reruns: int,
+    n_cells: int,
+    base_updates: int,
+    time_budget_sec: float | None,
+    record_loss_history: bool = False,
+) -> TestConfig:
+    if time_budget_sec is not None:
+        return replace(
+            run_config_test,
+            epochs=_TIME_MODE_EPOCH_CAP,
+            n_perms=n_perms,
+            n_reruns=n_reruns,
+            sgd_batch_size=batch_size if batch_size > 0 else None,
+            max_wall_time_sec=float(time_budget_sec),
+            record_loss_history=record_loss_history,
+        )
+    steps = _steps_per_epoch(n_cells, batch_size) if batch_size > 0 else 1
+    effective_epochs = base_updates if batch_size == 0 else _epochs_for_equal_updates(base_updates, steps)
+    return replace(
+        run_config_test,
+        epochs=int(effective_epochs),
+        n_perms=n_perms,
+        n_reruns=n_reruns,
+        sgd_batch_size=batch_size if batch_size > 0 else None,
+        max_wall_time_sec=None,
+        record_loss_history=record_loss_history,
+    )
 
 
 def _run_permutation_regime(
@@ -197,6 +256,14 @@ def _run_permutation_regime(
 
     slot_iso = _extract_slot_isodepths(model, s_batched_np, [0], device)
     true_isodepth = slot_iso[0]
+    metadata = get_training_metadata(model)
+    executed_epochs = int(metadata.get("executed_epochs") or test_config.epochs)
+    executed_gradient_steps = int(
+        metadata.get("executed_gradient_steps") or executed_epochs
+    )
+    loss_history = metadata.get("loss_history")
+    loss_history_elapsed_sec = metadata.get("loss_history_elapsed_sec")
+    loss_history_gradient_updates = metadata.get("loss_history_gradient_updates")
 
     return {
         "label": label,
@@ -207,8 +274,72 @@ def _run_permutation_regime(
         "wall_time_sec": float(wall_time_sec),
         "n_perms": int(test_config.n_perms),
         "n_reruns": int(test_config.n_reruns),
-        "executed_epochs": int(test_config.epochs),
+        "executed_epochs": executed_epochs,
+        "executed_gradient_steps": executed_gradient_steps,
+        "stopped_by_time": bool(metadata.get("stopped_by_time", False)),
+        "loss_history": None if loss_history is None else np.asarray(loss_history, dtype=np.float64),
+        "loss_history_elapsed_sec": None
+        if loss_history_elapsed_sec is None
+        else np.asarray(loss_history_elapsed_sec, dtype=np.float64),
+        "loss_history_gradient_updates": None
+        if loss_history_gradient_updates is None
+        else np.asarray(loss_history_gradient_updates, dtype=np.int64),
     }
+
+
+def _correlation_to_synthetic(
+    learned: np.ndarray,
+    true: np.ndarray,
+) -> tuple[float, float]:
+    learned_flat = np.asarray(learned, dtype=np.float64).reshape(-1)
+    true_flat = np.asarray(true, dtype=np.float64).reshape(-1)
+    pearson = _bias_detection_pearson(learned_flat, true_flat)
+    if learned_flat.size != true_flat.size or learned_flat.size < 2:
+        return pearson, float("nan")
+    spearman = float(spearmanr(learned_flat, true_flat).correlation)
+    return pearson, spearman
+
+
+def _resolve_synthetic_true_isodepth(dataset_meta: Mapping[str, Any], *, is_synthetic: bool) -> np.ndarray | None:
+    if not is_synthetic:
+        return None
+    raw_true = dataset_meta.get("synthetic_true_curve")
+    if raw_true is None:
+        return None
+    return np.asarray(raw_true, dtype=np.float32).reshape(-1)
+
+
+def _loss_plot_label(record: dict[str, Any]) -> str:
+    batch_size = int(record.get("batch_size", 0))
+    if batch_size == 0:
+        return "full batch"
+    return f"batch={batch_size}"
+
+
+def _build_loss_plot_series(
+    regime_results: list[dict[str, Any]],
+) -> tuple[
+    list[tuple[str, np.ndarray, np.ndarray]],
+    list[tuple[str, np.ndarray, np.ndarray]],
+    list[tuple[str, np.ndarray, np.ndarray]],
+]:
+    series_epoch: list[tuple[str, np.ndarray, np.ndarray]] = []
+    series_updates: list[tuple[str, np.ndarray, np.ndarray]] = []
+    series_time: list[tuple[str, np.ndarray, np.ndarray]] = []
+    for record in regime_results:
+        losses = record.get("loss_history")
+        if losses is None or len(losses) == 0:
+            continue
+        plot_label = _loss_plot_label(record)
+        loss_arr = np.asarray(losses, dtype=np.float64)
+        n = len(loss_arr)
+        epochs_x = np.arange(1, n + 1, dtype=np.float64)
+        updates_x = np.asarray(record["loss_history_gradient_updates"], dtype=np.float64)
+        time_x = np.asarray(record["loss_history_elapsed_sec"], dtype=np.float64)
+        series_epoch.append((plot_label, epochs_x, loss_arr))
+        series_updates.append((plot_label, updates_x, loss_arr))
+        series_time.append((plot_label, time_x, loss_arr))
+    return series_epoch, series_updates, series_time
 
 
 def _render_loss_line_plot(
@@ -311,6 +442,38 @@ def _render_metric_distribution_grid(
     plt.close(fig)
 
 
+def _render_correlation_bar_chart(
+    regime_results: list[dict[str, Any]],
+    *,
+    title: str,
+    out_path: Path,
+) -> None:
+    """Bar chart of Pearson r vs synthetic ground truth across regimes."""
+    labels = [str(r["label"]) for r in regime_results]
+    pearson_values = [float(r["synthetic_pearson"]) for r in regime_results]
+    fig, ax = plt.subplots(figsize=(max(8.0, 1.2 * len(labels)), 5.0))
+    bars = ax.bar(range(len(labels)), pearson_values, color="seagreen", edgecolor="white", linewidth=0.5)
+    ax.set_xticks(range(len(labels)))
+    ax.set_xticklabels(labels, rotation=30, ha="right", fontsize=9)
+    ax.set_ylabel("Pearson r vs synthetic isodepth")
+    ax.set_ylim(-1.05, 1.05)
+    ax.axhline(0.0, color="0.4", linewidth=0.8)
+    ax.set_title(title)
+    ax.grid(axis="y", alpha=0.25, linewidth=0.6)
+    for bar, value in zip(bars, pearson_values):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + (0.03 if value >= 0 else -0.07),
+            f"{value:.3f}",
+            ha="center",
+            va="bottom" if value >= 0 else "top",
+            fontsize=8,
+        )
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _render_pvalue_bar_chart(
     regime_results: list[dict[str, Any]],
     *,
@@ -347,8 +510,11 @@ def _run_record_for_json(record: dict[str, Any]) -> dict[str, Any]:
     return {
         "label": record["label"],
         "batch_size": int(record["batch_size"]),
-        "effective_epochs": record.get("effective_epochs"),
-        "steps_per_epoch": int(record["steps_per_epoch"]),
+        "executed_epochs": record.get("executed_epochs"),
+        "executed_gradient_steps": record.get("executed_gradient_steps"),
+        "stopped_by_time": bool(record.get("stopped_by_time", False)),
+        "steps_per_epoch": record.get("steps_per_epoch"),
+        "planned_total_updates": record.get("planned_total_updates"),
         "p_value": float(record["p_value"]),
         "stat_true": float(record["stat_true"]),
         "stat_perm_mean": float(np.mean(record["stat_perm"])),
@@ -356,6 +522,8 @@ def _run_record_for_json(record: dict[str, Any]) -> dict[str, Any]:
         "n_perms": int(record["n_perms"]),
         "n_reruns": int(record["n_reruns"]),
         "wall_time_sec": float(record["wall_time_sec"]),
+        "synthetic_pearson": record.get("synthetic_pearson"),
+        "synthetic_spearman": record.get("synthetic_spearman"),
     }
 
 
@@ -407,6 +575,7 @@ def main() -> None:
             "batch_sizes": list(spec.batch_sizes),
             "n_perms": spec.n_perms,
             "n_reruns": spec.n_reruns,
+            "time_budget_sec": spec.time_budget_sec,
         }
         run_config = replace(
             run_config,
@@ -441,21 +610,35 @@ def main() -> None:
 
     n_perms = int(experiment_section.get("n_perms") or run_config.test.n_perms)
     n_reruns = int(experiment_section.get("n_reruns") or run_config.test.n_reruns)
-    effective_epochs = int(base_epochs)
-
-    schedule = _build_schedule(dataset.n_cells, base_epochs, batch_sizes)
+    time_budget_sec = _resolve_time_budget_sec(experiment_section)
+    base_updates = int(base_epochs)
+    use_time_budget = time_budget_sec is not None
+    n_regimes = 1 + len(batch_sizes)
 
     print(f"Loaded dataset from: {run_config.data.h5ad if run_config.data.source == 'h5ad' else run_config.data.source}")
     if spec_path is not None:
         print(f"Loaded experiment spec: {spec_path}")
     print(f"Requested device: {run_config.test.device}")
     print(f"n_cells={dataset.n_cells}, n_genes={dataset.n_genes}")
-    print(f"Epoch budget: {base_epochs} (from {base_epochs_source})")
     print(f"Permutation framework: n_perms={n_perms}, n_reruns={n_reruns}")
+    if use_time_budget:
+        print(
+            f"Training mode: run until {time_budget_sec:.0f}s per regime "
+            f"({time_budget_sec / 3600.0:.2f}h); {n_regimes} regimes "
+            f"(~{time_budget_sec * n_regimes / 3600.0:.2f}h total if each uses the full budget)"
+        )
+    else:
+        print(f"Training mode: fixed update budget = {base_updates} (from {base_epochs_source})")
     print(f"Mini-batch sizes to compare: {batch_sizes if batch_sizes else '(none — full batch only)'}")
-    print("Computed schedule:")
-    print(json.dumps(schedule, indent=2))
+    regimes = _build_regime_list(batch_sizes)
     if args.dry_run:
+        if use_time_budget:
+            print("Regimes (each trains until time_budget_sec elapses):")
+            print(json.dumps(regimes, indent=2))
+        else:
+            schedule = _build_fixed_update_schedule(dataset.n_cells, base_updates, batch_sizes)
+            print("Fixed update schedule (equal gradient steps per regime):")
+            print(json.dumps(schedule, indent=2))
         return
 
     device = resolve_device(run_config.test.device)
@@ -467,22 +650,37 @@ def main() -> None:
     regime_results: list[dict[str, Any]] = []
     isodepth_panels: list[tuple[str, np.ndarray]] = []
     metric = canonicalize_metric_name(run_config.test.metric)
+    is_synthetic = str(run_config.data.source) == "synthetic"
+    true_isodepth_arr = _resolve_synthetic_true_isodepth(dataset.meta, is_synthetic=is_synthetic)
 
-    for item in schedule:
+    for item in regimes:
         label = str(item["label"])
         sgd_batch = int(item["batch_size"])
-
-        regime_config = replace(
+        steps_per_epoch = _steps_per_epoch(dataset.n_cells, sgd_batch) if sgd_batch > 0 else 1
+        regime_config = _resolve_regime_test_config(
             run_config.test,
-            epochs=effective_epochs,
+            batch_size=sgd_batch,
             n_perms=n_perms,
             n_reruns=n_reruns,
-            sgd_batch_size=sgd_batch if sgd_batch > 0 else None,
+            n_cells=int(dataset.n_cells),
+            base_updates=base_updates,
+            time_budget_sec=time_budget_sec,
+            record_loss_history=True,
         )
 
         print(f"\n{'='*60}")
         print(f"Running regime: {label} (sgd_batch_size={sgd_batch or 'full'})")
-        print(f"  epochs={effective_epochs}, n_perms={n_perms}, n_reruns={n_reruns}")
+        if use_time_budget:
+            print(
+                f"  max_wall_time_sec={time_budget_sec:.0f}, steps/epoch={steps_per_epoch}, "
+                f"n_perms={n_perms}, n_reruns={n_reruns}"
+            )
+        else:
+            print(
+                f"  epochs={regime_config.epochs}, steps/epoch={steps_per_epoch}, "
+                f"planned_updates={int(regime_config.epochs) * steps_per_epoch}, "
+                f"n_perms={n_perms}, n_reruns={n_reruns}"
+            )
         print(f"{'='*60}")
 
         _sync_cuda_if_needed(device)
@@ -496,8 +694,13 @@ def main() -> None:
         _sync_cuda_if_needed(device)
 
         result["batch_size"] = sgd_batch
-        result["steps_per_epoch"] = int(item["steps_per_epoch"])
-        result["effective_epochs"] = item["effective_epochs"]
+        result["steps_per_epoch"] = steps_per_epoch
+        if not use_time_budget:
+            result["planned_total_updates"] = int(regime_config.epochs) * steps_per_epoch
+        if true_isodepth_arr is not None:
+            pearson, spearman = _correlation_to_synthetic(result["true_isodepth"], true_isodepth_arr)
+            result["synthetic_pearson"] = float(pearson)
+            result["synthetic_spearman"] = float(spearman)
         regime_results.append(result)
 
         panel_label = (
@@ -505,13 +708,51 @@ def main() -> None:
             if sgd_batch == 0
             else f"batch={sgd_batch} (p={result['p_value']:.3g})"
         )
+        if result.get("synthetic_pearson") is not None:
+            panel_label += f", r={result['synthetic_pearson']:.3f}"
         isodepth_panels.append(
             (panel_label, np.asarray(result["true_isodepth"], dtype=np.float32))
         )
-        print(f"  -> p_value={result['p_value']:.4g}, stat_true={result['stat_true']:.4g}, "
-              f"wall_time={result['wall_time_sec']:.1f}s")
+        corr_msg = ""
+        if result.get("synthetic_pearson") is not None:
+            corr_msg = (
+                f", pearson={result['synthetic_pearson']:.4g}, "
+                f"spearman={result['synthetic_spearman']:.4g}"
+            )
+        print(
+            f"  -> p_value={result['p_value']:.4g}, stat_true={result['stat_true']:.4g}, "
+            f"wall_time={result['wall_time_sec']:.1f}s, "
+            f"updates={result['executed_gradient_steps']}{corr_msg}"
+        )
 
     stem = f"{run_config.output.run_name}_batchsize"
+
+    series_epoch, series_updates, series_time = _build_loss_plot_series(regime_results)
+    plot_epoch_path = out_dir_path / f"{stem}_loss_vs_epoch.png"
+    plot_updates_path = out_dir_path / f"{stem}_loss_vs_gradient_updates.png"
+    plot_time_path = out_dir_path / f"{stem}_loss_vs_time.png"
+    if series_epoch:
+        _render_loss_line_plot(
+            series_epoch,
+            title="Training loss vs epoch (true layout, slot 0)",
+            xlabel="Epoch",
+            ylabel="Training MSE loss",
+            out_path=plot_epoch_path,
+        )
+        _render_loss_line_plot(
+            series_updates,
+            title="Training loss vs cumulative gradient updates (true layout, slot 0)",
+            xlabel="Cumulative gradient updates",
+            ylabel="Training MSE loss",
+            out_path=plot_updates_path,
+        )
+        _render_loss_line_plot(
+            series_time,
+            title="Training loss vs elapsed wall time (true layout, slot 0)",
+            xlabel="Elapsed time (s)",
+            ylabel="Training MSE loss",
+            out_path=plot_time_path,
+        )
 
     # Metric distribution grid
     plot_metric_dist_path = out_dir_path / f"{stem}_metric_distributions.png"
@@ -531,13 +772,6 @@ def main() -> None:
     )
 
     # Isodepth grid
-    is_synthetic = str(run_config.data.source) == "synthetic"
-    true_isodepth_arr: np.ndarray | None = None
-    if is_synthetic:
-        raw_true = dataset.meta.get("synthetic_true_curve")
-        if raw_true is not None:
-            true_isodepth_arr = np.asarray(raw_true, dtype=np.float32).reshape(-1)
-
     grid_panels: list[tuple[str, np.ndarray]] = []
     if true_isodepth_arr is not None:
         grid_panels.append(("True isodepth (synthetic)", true_isodepth_arr))
@@ -550,6 +784,17 @@ def main() -> None:
         + (" (with synthetic ground truth)" if true_isodepth_arr is not None else ""),
         out_path=plot_isodepth_grid_path,
     )
+
+    plot_synthetic_corr_path: Path | None = None
+    if true_isodepth_arr is not None and all(
+        record.get("synthetic_pearson") is not None for record in regime_results
+    ):
+        plot_synthetic_corr_path = out_dir_path / f"{stem}_synthetic_correlations.png"
+        _render_correlation_bar_chart(
+            regime_results,
+            title="Pearson correlation to synthetic isodepth per batch-size regime",
+            out_path=plot_synthetic_corr_path,
+        )
 
     # NPZ with isodepths
     isodepths_npz_path = out_dir_path / f"{stem}_learned_isodepths.npz"
@@ -570,6 +815,12 @@ def main() -> None:
         "learned_isodepths_plot": str(plot_isodepth_grid_path),
         "learned_isodepths_data": str(isodepths_npz_path),
     }
+    if series_epoch:
+        artifacts_payload["loss_vs_epoch"] = str(plot_epoch_path)
+        artifacts_payload["loss_vs_gradient_updates"] = str(plot_updates_path)
+        artifacts_payload["loss_vs_time"] = str(plot_time_path)
+    if plot_synthetic_corr_path is not None:
+        artifacts_payload["synthetic_correlations_plot"] = str(plot_synthetic_corr_path)
 
     results_payload = {
         "spec_path": None if spec_path is None else str(spec_path),
@@ -584,8 +835,11 @@ def main() -> None:
             "lr": float(run_config.test.lr),
             "patience": int(run_config.test.patience),
             "decoder": str(run_config.test.decoder),
-            "epochs": int(effective_epochs),
-            "epochs_source": base_epochs_source,
+            "training_mode": "time_budget_per_regime" if use_time_budget else "fixed_updates",
+            "base_updates": None if use_time_budget else int(base_updates),
+            "base_updates_source": None if use_time_budget else base_epochs_source,
+            "time_budget_sec": time_budget_sec,
+            "time_budget_per_regime": True,
             "n_perms": int(n_perms),
             "n_reruns": int(n_reruns),
             "metric": str(metric),
@@ -593,6 +847,7 @@ def main() -> None:
             "device": str(device),
         },
         "runs": [_run_record_for_json(r) for r in regime_results],
+        "synthetic_ground_truth_available": true_isodepth_arr is not None,
         "artifacts": artifacts_payload,
     }
     json_path = out_dir_path / f"{run_config.output.run_name}_batchsize_comparison.json"
@@ -601,13 +856,28 @@ def main() -> None:
 
     print(f"\nSaved metric distributions: {plot_metric_dist_path}")
     print(f"Saved p-value bar chart: {plot_pvalue_path}")
+    if series_epoch:
+        print(f"Saved loss vs epoch: {plot_epoch_path}")
+        print(f"Saved loss vs gradient updates: {plot_updates_path}")
+        print(f"Saved loss vs time: {plot_time_path}")
+    if plot_synthetic_corr_path is not None:
+        print(f"Saved synthetic correlation bar chart: {plot_synthetic_corr_path}")
     print(f"Saved learned isodepth grid: {plot_isodepth_grid_path}")
     print(f"Saved learned isodepth arrays: {isodepths_npz_path}")
     print(f"Saved comparison JSON: {json_path}")
     print("\nSummary:")
     for record in regime_results:
-        print(f"  {record['label']:20s}  p={record['p_value']:.4g}  "
-              f"stat_true={record['stat_true']:.4g}  wall={record['wall_time_sec']:.1f}s")
+        corr_suffix = ""
+        if record.get("synthetic_pearson") is not None:
+            corr_suffix = (
+                f"  pearson={record['synthetic_pearson']:.4g}  "
+                f"spearman={record['synthetic_spearman']:.4g}"
+            )
+        print(
+            f"  {record['label']:20s}  p={record['p_value']:.4g}  "
+            f"stat_true={record['stat_true']:.4g}  wall={record['wall_time_sec']:.1f}s  "
+            f"updates={record['executed_gradient_steps']}{corr_suffix}"
+        )
 
 
 if __name__ == "__main__":

@@ -34,6 +34,16 @@ def _zscore_expression(a: np.ndarray) -> np.ndarray:
     return np.asarray((a - mu) / (sigma + 1e-8), dtype=np.float32)
 
 
+def zscore_covariate(values: np.ndarray) -> np.ndarray:
+    """Per-cell z-score of a 1D covariate on the supplied cell subset."""
+    v = np.asarray(values, dtype=np.float32).reshape(-1)
+    mu = float(v.mean())
+    sigma = float(v.std())
+    if sigma < 1e-8:
+        return np.zeros_like(v, dtype=np.float32)
+    return np.asarray((v - mu) / sigma, dtype=np.float32)
+
+
 def log1p_expression(a: np.ndarray) -> np.ndarray:
     expression = np.asarray(a, dtype=np.float32)
     if np.any(expression < 0):
@@ -168,5 +178,65 @@ def apply_expression_transforms(
     if return_metadata:
         metadata["log1p"] = bool(log1p)
         metadata["standardize_expression"] = bool(standardize_expression)
+        return transformed, metadata
+    return transformed
+
+
+def apply_expression_transforms_by_celltype(
+    a: np.ndarray,
+    cell_type_labels: np.ndarray,
+    *,
+    min_cells_per_gene: int = 0,
+    log1p: bool = False,
+    standardize_expression: bool = True,
+    q: int | None = None,
+    seed: int = 0,
+    return_metadata: bool = False,
+) -> np.ndarray | tuple[np.ndarray, dict[str, Any]]:
+    """Apply expression transforms with Poisson ``q`` embedding computed per cell type.
+
+    Gene filtering uses the full matrix so all types share the same gene columns.
+    When ``q`` is set, ``poisson_low_rank_factorization`` and optional z-scoring run
+    independently within each cell-type subset (rows are written back in original order).
+    """
+    if q is None:
+        raise ValueError("apply_expression_transforms_by_celltype requires q to be set")
+
+    filtered, keep_mask = _filter_genes_by_min_cells(a, min_cells_per_gene=min_cells_per_gene)
+    labels = np.asarray(cell_type_labels, dtype=np.int64)
+    if labels.shape[0] != filtered.shape[0]:
+        raise ValueError(
+            f"cell_type_labels length {labels.shape[0]} != expression rows {filtered.shape[0]}"
+        )
+
+    if log1p:
+        raise ValueError("log1p cannot be combined with q because the Poisson low-rank factorization expects counts")
+
+    n_cell_types = int(labels.max()) + 1 if labels.size else 0
+    latent_dim = 2 * int(q)
+    transformed = np.empty((filtered.shape[0], latent_dim), dtype=np.float32)
+
+    for type_index in range(n_cell_types):
+        mask = labels == type_index
+        if not np.any(mask):
+            continue
+        counts_c = np.asarray(filtered[mask], dtype=np.float32)
+        latent_c, _ = poisson_low_rank_factorization(counts_c, q=q, seed=int(seed) + type_index)
+        if standardize_expression:
+            latent_c = _zscore_expression(latent_c)
+        transformed[mask] = np.asarray(latent_c, dtype=np.float32)
+
+    metadata: dict[str, Any] = {
+        "gene_keep_mask": keep_mask,
+        "representation": "poisson_low_rank_latent",
+        "q": int(q),
+        "latent_dim": latent_dim,
+        "q_by_celltype": True,
+        "feature_names": [f"poisson_latent_{idx + 1}" for idx in range(latent_dim)],
+        "log1p": bool(log1p),
+        "standardize_expression": bool(standardize_expression),
+    }
+    transformed = np.asarray(transformed, dtype=np.float32)
+    if return_metadata:
         return transformed, metadata
     return transformed

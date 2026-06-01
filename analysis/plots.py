@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 from pathlib import Path
 from typing import Any
@@ -8,7 +9,8 @@ import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 from matplotlib import colors as mcolors
 import numpy as np
-from scipy.stats import gaussian_kde
+from scipy.stats import f as _f_dist
+from scipy.stats import gaussian_kde, linregress, spearmanr
 
 from data.schemas import DatasetBundle, TestResult
 
@@ -531,15 +533,6 @@ def _plot_spatial_signed_difference(ax, S: np.ndarray, diff: np.ndarray, title: 
     plt.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04, label="Isodepth difference")
 
 
-def _as_dimension_matrix(values: np.ndarray) -> np.ndarray:
-    array = np.asarray(values, dtype=np.float32)
-    if array.ndim == 1:
-        return array.reshape(-1, 1)
-    if array.ndim == 2:
-        return array
-    raise ValueError(f"Expected isodepth array with 1 or 2 dimensions, got shape {array.shape}")
-
-
 def _overlay_subsampling(ax, S: np.ndarray, subset_mask: np.ndarray | None) -> None:
     if subset_mask is None:
         return
@@ -1007,53 +1000,6 @@ def _save_subsampling_triptych(
     return out_path
 
 
-def _save_exact_existence_triptych(
-    dataset: DatasetBundle,
-    result: TestResult,
-    out_path: Path,
-) -> Path | None:
-    rows = result.artifacts.get("dimension_plot_rows")
-    if not isinstance(rows, list) or not rows:
-        return None
-
-    spatial = np.asarray(dataset.S, dtype=np.float32)
-    panels: list[tuple[np.ndarray, np.ndarray, str]] = []
-
-    for row in rows:
-        dim = int(row["tested_dim"])
-        true_depths = _as_dimension_matrix(row["true_isodepth"])
-        low_depths = _as_dimension_matrix(row["lowest_isodepth"])
-        high_depths = _as_dimension_matrix(row["highest_isodepth"])
-        low_S = np.asarray(row["lowest_S"], dtype=np.float32)
-        high_S = np.asarray(row["highest_S"], dtype=np.float32)
-        labels = list(row.get("dimension_labels") or [f"d{i + 1}" for i in range(dim)])
-        for dim_index in range(dim):
-            label = labels[dim_index] if dim_index < len(labels) else f"d{dim_index + 1}"
-            title_suffix = (
-                f"dim {dim}\np={float(row['p_value']):.4g}"
-                if dim_index == 0
-                else f"dim {dim}"
-            )
-            panels.append((spatial, true_depths[:, dim_index], f"True {label}\n{title_suffix}"))
-            panels.append((low_S, low_depths[:, dim_index], f"Lowest {label}\n{float(row['lowest_stat']):.4g}"))
-            panels.append((high_S, high_depths[:, dim_index], f"Highest {label}\n{float(row['highest_stat']):.4g}"))
-
-    n_cols = min(3, max(len(panels), 1))
-    n_rows = int(np.ceil(len(panels) / n_cols))
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows), squeeze=False)
-
-    for axis, (panel_S, panel_depth, panel_title) in zip(axes.flat, panels):
-        _plot_spatial_isodepth(axis, panel_S, panel_depth, panel_title)
-
-    for axis in axes.flat[len(panels):]:
-        axis.axis("off")
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return out_path
-
-
 def save_true_rerun_isodepth_grid(
     dataset: DatasetBundle,
     rerun_isodepths: np.ndarray,
@@ -1124,9 +1070,6 @@ def save_isodepth_triptych(
     lowest_S = result.artifacts.get("lowest_S")
     highest_isodepth = result.artifacts.get("highest_isodepth")
     highest_S = result.artifacts.get("highest_S")
-    if result.method_name == "exact_existence":
-        out_path = Path(out_path)
-        return _save_exact_existence_triptych(dataset, result, out_path)
     if (
         true_isodepth is None
         or lowest_isodepth is None
@@ -1179,36 +1122,6 @@ def save_isodepth_triptych(
 
 def save_metric_distribution_plot(result: TestResult, out_path: str | Path) -> Path:
     out_path = Path(out_path)
-    if result.method_name == "exact_existence":
-        step_summaries = result.artifacts.get("step_summaries")
-        if isinstance(step_summaries, dict) and step_summaries:
-            ordered_keys = sorted(step_summaries.keys(), key=lambda value: int(value))
-            fig, axes = plt.subplots(len(ordered_keys), 1, figsize=(6, 4 * len(ordered_keys)), squeeze=False)
-            for ax, key in zip(axes[:, 0], ordered_keys):
-                summary = step_summaries[key]
-                stat_perm = np.asarray(summary["null_distribution"], dtype=np.float64)
-                if "observed_delta" in summary:
-                    stat_true = float(summary["observed_delta"])
-                    title = f"k={int(summary['tested_dim']) - 1} -> {int(summary['tested_dim'])}"
-                    xlabel = "Loss Reduction Scale"
-                    label = f"Observed Reduction-Scale Stat: {stat_true:.4g}"
-                else:
-                    stat_true = float(summary["observed_stat"])
-                    title = "Existence Test"
-                    xlabel = result.metric
-                    label = f"Observed: {stat_true:.4g}"
-                p_value = float(summary["p_value"])
-                significance = "significant" if bool(summary["significant"]) else "not significant"
-                ax.hist(stat_perm, bins=30, color="lightsteelblue", edgecolor="black")
-                ax.axvline(stat_true, color="crimson", linestyle="--", label=label)
-                ax.set_title(f"{title}\np-value = {p_value:.4g} ({significance})")
-                ax.set_xlabel(xlabel)
-                ax.set_ylabel("Count")
-                ax.legend()
-            fig.tight_layout()
-            fig.savefig(out_path, dpi=200, bbox_inches="tight")
-            plt.close(fig)
-            return out_path
     if result.method_name in {"comparison_perturbation_test", "perturbation_test"}:
         delta_summaries = result.artifacts.get("delta_summaries")
         if isinstance(delta_summaries, dict) and delta_summaries:
@@ -1871,6 +1784,7 @@ def save_spatial_pointcloud_kde_plot(
     return out_path
 
 
+
 def save_spatial_binned_density_plot(
     S: np.ndarray,
     out_path: str | Path,
@@ -1955,249 +1869,413 @@ def _expression_y_axis_label(meta: dict[str, Any]) -> str:
     return "Expression"
 
 
-def _top_genes_by_prediction_correlation(
+# ---------------------------------------------------------------------------
+# Gene expression vs isodepth / covariate — summary comparison plots
+# ---------------------------------------------------------------------------
+
+
+def _ftest_decoder_pvalues(
     A: np.ndarray,
-    pred: np.ndarray,
-    *,
-    top_k: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return (gene_indices, pearson_r) for the top ``top_k`` genes by Pearson(A_g, pred_g)."""
-    A = np.asarray(A, dtype=np.float64)
-    pred = np.asarray(pred, dtype=np.float64)
-    if A.shape != pred.shape:
-        raise ValueError(f"A shape {A.shape} does not match pred shape {pred.shape}")
-    G = A.shape[1]
-    corrs = np.full(G, -np.inf, dtype=np.float64)
-    for g in range(G):
-        a_col = A[:, g]
-        p_col = pred[:, g]
-        if np.std(a_col) < 1e-12 or np.std(p_col) < 1e-12:
-            continue
-        corrs[g] = float(np.corrcoef(a_col, p_col)[0, 1])
-    order = np.argsort(-corrs)
-    k = min(int(top_k), G)
-    top_idx = order[:k]
-    return top_idx, corrs
+    preds: np.ndarray,
+    df_model: int,
+) -> np.ndarray:
+    """F-test p-value per gene: does the decoder explain significant variance?
 
+    Parameters
+    ----------
+    A : (n_cells, G) observed expression (z-scored).
+    preds : (n_cells, G) decoder-predicted expression.
+    df_model : effective number of model parameters minus intercept (1 for a
+        linear decoder, 2 for quadratic, 3 for cubic, etc.).
 
-def _prediction_scenarios_for_selected_genes(result: TestResult) -> list[tuple[str, str, np.ndarray, np.ndarray]]:
-    """List (subdir_slug, panel_title, pred, isodepth) for top-gene plots."""
-    art = result.artifacts
-    pred_full_iso = art.get("pred_true_full_iso")
-    depth_full_iso = art.get("true_isodepth_full_iso")
-    pred_cov = art.get("pred_true_covariate")
-    depth_cov = art.get("true_isodepth_covariate")
-    pred_primary = art.get("pred_true")
-    depth_primary = art.get("true_isodepth")
-
-    scenarios: list[tuple[str, str, np.ndarray, np.ndarray]] = []
-
-    # Parallel midline: slot 0 is midline; separate full model artifacts are present.
-    if pred_full_iso is not None and depth_full_iso is not None:
-        if pred_primary is None or depth_primary is None:
-            return scenarios
-        scenarios.append(
-            (
-                "covariate_midline",
-                "Covariate (midline) — true slot",
-                np.asarray(pred_primary, dtype=np.float32),
-                np.asarray(depth_primary, dtype=np.float32),
-            )
-        )
-        scenarios.append(
-            (
-                "full_isodepth",
-                "Full isodepth (true layout, no covariate)",
-                np.asarray(pred_full_iso, dtype=np.float32),
-                np.asarray(depth_full_iso, dtype=np.float32),
-            )
-        )
-        return scenarios
-
-    # Covariate comparisons: primary = full learned model; covariate artifacts are separate.
-    if pred_cov is not None and depth_cov is not None:
-        if pred_primary is None or depth_primary is None:
-            return scenarios
-        scenarios.append(
-            (
-                "full_isodepth",
-                "Full isodepth (encoder + decoder)",
-                np.asarray(pred_primary, dtype=np.float32),
-                np.asarray(depth_primary, dtype=np.float32),
-            )
-        )
-        scenarios.append(
-            (
-                "covariate_midline",
-                "Covariate (midline)",
-                np.asarray(pred_cov, dtype=np.float32),
-                np.asarray(depth_cov, dtype=np.float32),
-            )
-        )
-        return scenarios
-
-    if pred_primary is not None and depth_primary is not None:
-        scenarios.append(
-            (
-                "primary",
-                "True-layout model",
-                np.asarray(pred_primary, dtype=np.float32),
-                np.asarray(depth_primary, dtype=np.float32),
-            )
-        )
-    return scenarios
-
-
-def _plot_gene_piecewise_linear(
-    ax,
-    x: np.ndarray,
-    y_obs: np.ndarray,
-    y_pred: np.ndarray,
-    *,
-    num_bins: int = 10,
-    pt_size: float = 50.0,
-    scatter_color: str = "mediumseagreen",
-    fit_color: str = "0.45",
-    fit_lw: float = 3.0,
-    bin_color: str = "0.45",
-    bin_lw: float = 2.5,
-    scatter_alpha: float = 0.65,
-) -> None:
-    """Scatter + model-prediction fit line + binned-mean horizontal segments.
-
-    Mirrors the GASTON ``plot_gene_pwlinear`` visual style for a single
-    piecewise-linear segment: colored scatter, overlaid regression curve
-    (from model predictions sorted by isodepth), and stepped horizontal
-    bars showing the mean observed expression within each isodepth bin.
+    Returns
+    -------
+    pvalues : (G,) array of raw F-test p-values.
     """
-    sort_idx = np.argsort(x)
-    ax.scatter(x, y_obs, s=pt_size, alpha=scatter_alpha, c=scatter_color, zorder=1)
+    A = np.asarray(A, dtype=np.float64)
+    preds = np.asarray(preds, dtype=np.float64)
+    n, G = A.shape
+    df_error = n - df_model - 1
+    if df_error <= 0:
+        return np.ones(G, dtype=np.float64)
 
-    ax.plot(
-        x[sort_idx],
-        y_pred[sort_idx],
-        color=fit_color,
-        lw=fit_lw,
-        solid_capstyle="round",
-        zorder=3,
+    y_mean = A.mean(axis=0)                         # (G,)
+    sst = np.sum((A - y_mean) ** 2, axis=0)         # total SS
+    sse = np.sum((A - preds) ** 2, axis=0)          # residual SS
+    ssr = np.maximum(sst - sse, 0.0)                # explained SS (clamp ≥ 0)
+
+    # Guard against degenerate genes (zero variance)
+    safe_sse = np.where(sse > 0, sse, np.finfo(float).tiny)
+    f_stat = (ssr / df_model) / (safe_sse / df_error)
+    pvalues = 1.0 - _f_dist.cdf(f_stat, df_model, df_error)
+    # Genes with zero total variance → p = 1
+    pvalues = np.where(sst > 0, pvalues, 1.0)
+    return pvalues.astype(np.float64)
+
+
+def _bh_qvalues(pvalues: np.ndarray) -> np.ndarray:
+    """Benjamini–Hochberg q-values from an array of p-values."""
+    pvalues = np.asarray(pvalues, dtype=np.float64)
+    G = len(pvalues)
+    if G == 0:
+        return pvalues.copy()
+    order = np.argsort(pvalues)
+    ranks = np.arange(1, G + 1, dtype=np.float64)
+    q_sorted = pvalues[order] * G / ranks
+    # Enforce monotonicity from right to left
+    q_sorted = np.minimum.accumulate(q_sorted[::-1])[::-1]
+    q = np.empty(G, dtype=np.float64)
+    q[order] = np.clip(q_sorted, 0.0, 1.0)
+    return q
+
+
+def _save_sig_genes_csv(
+    out_path: Path,
+    gene_names: list[str],
+    pvalues: np.ndarray,
+    qvalues: np.ndarray,
+    q_threshold: float = 0.05,
+) -> Path | None:
+    """Write significant genes (q < q_threshold) to a CSV file.
+
+    Columns: gene, p_value, q_value — sorted by p_value ascending.
+    Returns the path written, or None if no genes pass the threshold.
+    """
+    sig_mask = qvalues < q_threshold
+    if not sig_mask.any():
+        return None
+    rows = sorted(
+        [
+            (gene_names[g], float(pvalues[g]), float(qvalues[g]))
+            for g in range(len(gene_names))
+            if sig_mask[g]
+        ],
+        key=lambda r: r[1],
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["gene", "p_value", "q_value"])
+        writer.writerows(rows)
+    return out_path
+
+
+def _gene_spearman_rhos(A: np.ndarray, coord: np.ndarray) -> np.ndarray:
+    """Spearman ρ between every gene column of A and coord. Shape (G,)."""
+    A = np.asarray(A, dtype=np.float64)
+    coord = np.asarray(coord, dtype=np.float64).reshape(-1)
+    G = A.shape[1]
+    rhos = np.zeros(G, dtype=np.float64)
+    for g in range(G):
+        r, _ = spearmanr(A[:, g], coord)
+        rhos[g] = float(r) if np.isfinite(r) else 0.0
+    return rhos
+
+
+def _top_genes_by_abs_rho(rhos: np.ndarray, n_top: int) -> np.ndarray:
+    """Indices of top n_top genes by |ρ|, descending."""
+    return np.argsort(-np.abs(rhos))[: min(int(n_top), int(rhos.size))]
+
+
+def _plot_gene_binned_vs_coord(
+    ax,
+    expr_col: np.ndarray,
+    coord: np.ndarray,
+    gene_name: str,
+    xlabel: str,
+    *,
+    n_bins: int = 20,
+    min_bin_cells: int = 3,
+    rho: float | None = None,
+    color: Any = "steelblue",
+    max_cells_scatter: int = 2000,
+    decoder_preds: np.ndarray | None = None,
+    show_background_cells: bool = False,
+) -> None:
+    """Per-bin mean dots + decoder fit curve, with optional per-cell background scatter.
+
+    When ``decoder_preds`` is provided (model decoder predictions for this gene,
+    shape ``(n_cells,)``), the fit curve is drawn by sorting cells by coordinate
+    and plotting the decoder output — capturing the true (possibly non-linear)
+    learned relationship.  When ``decoder_preds`` is None, a degree-3 polynomial
+    is fit to the per-bin means as a non-linear trend approximation, falling
+    back to linear regression when fewer than 4 bins are available.
+
+    Set ``show_background_cells=True`` to overlay a subsampled per-cell scatter
+    (useful for visualising per-cell noise alongside the bin means).
+    """
+    expr_col = np.asarray(expr_col, dtype=np.float64).reshape(-1)
+    coord = np.asarray(coord, dtype=np.float64).reshape(-1)
+    n_cells = len(coord)
+
+    # --- optional per-cell scatter (subsampled so large datasets don't slow down) ---
+    if show_background_cells:
+        if n_cells <= max_cells_scatter:
+            sc_idx = np.arange(n_cells)
+        else:
+            rng = np.random.default_rng(0)
+            sc_idx = rng.choice(n_cells, size=max_cells_scatter, replace=False)
+        ax.scatter(
+            coord[sc_idx], expr_col[sc_idx],
+            s=2, alpha=0.12, c="0.65", linewidths=0, zorder=1,
+            rasterized=True,
+        )
+
+    # --- quantile-based bin means (equal cell count per bin) ---
+    bin_edges = np.unique(np.quantile(coord, np.linspace(0.0, 1.0, n_bins + 1)))
+    actual_n = max(len(bin_edges) - 1, 1)
+    if len(bin_edges) < 2:
+        bin_edges = np.array([float(coord.min()), float(coord.max())])
+    bin_idx = np.clip(np.digitize(coord, bin_edges) - 1, 0, actual_n - 1)
+
+    centers: list[float] = []
+    means: list[float] = []
+    for b in range(actual_n):
+        mask = bin_idx == b
+        if int(mask.sum()) < min_bin_cells:
+            continue
+        centers.append(float(np.mean(coord[mask])))
+        means.append(float(np.mean(expr_col[mask])))
+
+    if centers:
+        ax.scatter(
+            centers, means,
+            s=40, color=color, alpha=0.95, linewidths=0.4,
+            edgecolors="white", zorder=3,
+        )
+
+    # --- fit curve: model decoder predictions or polynomial through bin means ---
+    if decoder_preds is not None:
+        dp = np.asarray(decoder_preds, dtype=np.float64).reshape(-1)
+        sort_idx = np.argsort(coord)
+        ax.plot(
+            coord[sort_idx], dp[sort_idx],
+            color="0.20", linewidth=1.8, alpha=0.9, zorder=4,
+        )
+    elif len(centers) >= 4:
+        # Degree-3 polynomial through bin means — captures non-linear trend
+        # without requiring model weights at regen time.
+        deg = min(3, len(centers) - 1)
+        poly = np.poly1d(np.polyfit(centers, means, deg))
+        fit_x = np.linspace(float(coord.min()), float(coord.max()), 300)
+        ax.plot(fit_x, poly(fit_x), color="0.20", linewidth=1.8, alpha=0.9, zorder=4)
+    else:
+        slope, intercept, *_ = linregress(coord, expr_col)
+        fit_x = np.array([float(coord.min()), float(coord.max())])
+        ax.plot(fit_x, slope * fit_x + intercept, color="0.20", linewidth=1.8, alpha=0.9, zorder=4)
+
+    title = gene_name
+    if rho is not None:
+        title += f"\nρ={rho:.3f} (per cell)"
+    ax.set_title(title, fontsize=9)
+    ax.set_xlabel(xlabel, fontsize=8)
+    ax.set_ylabel("Expression (z-scored)", fontsize=8)
+    ax.tick_params(labelsize=7)
+    ax.grid(alpha=0.15, linewidth=0.4)
+
+
+def save_gene_expression_vs_isodepth_plot(
+    dataset: "DatasetBundle",
+    isodepth: np.ndarray,
+    out_path: str | Path,
+    *,
+    n_top_genes: int = 5,
+    n_bins: int = 20,
+    min_bin_cells: int = 3,
+    coord_label: str = "Isodepth",
+    decoder_preds: np.ndarray | None = None,
+    decoder_df: int | None = None,
+) -> Path:
+    """Top n_top_genes genes (by |Spearman ρ| with isodepth) as binned mean
+    expression vs isodepth.
+
+    ``decoder_preds`` (n_cells, G): when provided the fit curve uses the decoder
+    output sorted by isodepth.  ``decoder_df`` triggers an F-test across all G
+    genes; significant genes (BH q < 0.05) are saved to
+    ``<stem>_isodepth_sig_genes.csv`` beside the PNG.
+    """
+    out_path = Path(out_path)
+    A = np.asarray(dataset.A, dtype=np.float64)
+    coord = np.asarray(isodepth, dtype=np.float64).reshape(-1)
+    G = A.shape[1]
+
+    var_names = dataset.meta.get("var_names")
+    gene_names: list[str] = (
+        [str(var_names[i]) for i in range(G)] if var_names else [f"gene_{i}" for i in range(G)]
     )
 
-    bin_edges = np.linspace(float(x.min()), float(x.max()), int(num_bins) + 1)
-    for i in range(int(num_bins)):
-        mask = (x >= bin_edges[i]) & (x < bin_edges[i + 1])
-        if i == int(num_bins) - 1:
-            mask |= x == bin_edges[i + 1]
-        if mask.sum() == 0:
-            continue
-        bin_mean = float(np.mean(y_obs[mask]))
-        ax.plot(
-            [bin_edges[i], bin_edges[i + 1]],
-            [bin_mean, bin_mean],
-            color=bin_color,
-            lw=bin_lw,
-            solid_capstyle="butt",
-            zorder=2,
+    rhos = _gene_spearman_rhos(A, coord)
+    top_idx = _top_genes_by_abs_rho(rhos, n_top_genes)
+    n_top = len(top_idx)
+
+    colors = plt.cm.tab10(np.linspace(0.0, 0.9, max(n_top, 1)))
+    fig, axes = plt.subplots(1, n_top, figsize=(4.0 * n_top, 3.6), squeeze=False)
+
+    for col, gene_idx in enumerate(top_idx):
+        dp = (
+            np.asarray(decoder_preds, dtype=np.float64)[:, gene_idx]
+            if decoder_preds is not None else None
+        )
+        _plot_gene_binned_vs_coord(
+            axes[0, col], A[:, gene_idx], coord,
+            gene_names[gene_idx], coord_label,
+            n_bins=n_bins, min_bin_cells=min_bin_cells,
+            rho=float(rhos[gene_idx]), color=colors[col],
+            decoder_preds=dp,
         )
 
+    fig.suptitle(f"Top {n_top} genes by |Spearman ρ| with {coord_label}", fontsize=11)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
-def save_selected_genes_expression_vs_isodepth(
-    dataset: DatasetBundle,
-    result: TestResult,
-    out_dir: str | Path,
+    # --- F-test significance CSV ---
+    if decoder_df is not None:
+        if decoder_preds is not None:
+            fitted = np.asarray(decoder_preds, dtype=np.float64)
+        else:
+            fitted = np.stack(
+                [
+                    np.poly1d(np.polyfit(coord, A[:, g], decoder_df))(coord)
+                    for g in range(G)
+                ],
+                axis=1,
+            )
+        pvals = _ftest_decoder_pvalues(A, fitted, df_model=decoder_df)
+        qvals = _bh_qvalues(pvals)
+        csv_path = out_path.parent / (out_path.stem + "_isodepth_sig_genes.csv")
+        _save_sig_genes_csv(csv_path, gene_names, pvals, qvals)
+
+    return out_path
+
+
+def save_gene_expression_vs_coordinates_comparison(
+    dataset: "DatasetBundle",
+    isodepth: np.ndarray,
+    covariate_isodepth: np.ndarray,
+    out_path: str | Path,
     *,
-    top_k: int = 5,
-    num_bins: int = 10,
-) -> Path | None:
-    """Plot top predicted genes (by per-gene Pearson) vs 1D isodepth; write under ``selected_genes/``.
+    n_top_genes: int = 5,
+    n_bins: int = 20,
+    min_bin_cells: int = 3,
+    isodepth_label: str = "Isodepth",
+    covariate_label: str = "Covariate",
+    pred_isodepth: np.ndarray | None = None,
+    pred_covariate: np.ndarray | None = None,
+    decoder_df: int | None = None,
+) -> Path:
+    """4-row × n_top_genes comparison grid.
 
-    Each per-gene figure uses a GASTON-inspired piecewise-linear style:
-    colored scatter points, the model prediction as a fit line (sorted by
-    isodepth), and horizontal segments showing binned mean expression.
+    Row 0: top isodepth genes vs isodepth
+    Row 1: top isodepth genes vs covariate  (ρ shown vs covariate)
+    Row 2: top covariate genes vs covariate
+    Row 3: top covariate genes vs isodepth  (ρ shown vs isodepth)
 
-    Y-axis: observed expression in the same space as ``dataset.A``.
-    X-axis: first dimension of the model isodepth for that prediction path.
+    When ``pred_isodepth`` / ``pred_covariate`` are provided (model decoder
+    predictions, shape ``(n_cells, G)``), the fit curve for each panel uses the
+    corresponding decoder output sorted by the x-axis coordinate, faithfully
+    representing the learned (possibly non-linear) decoder function.  Otherwise
+    a degree-3 polynomial fit through the per-bin means is used as a non-linear
+    trend approximation.
 
-    Returns the ``selected_genes`` directory path, or ``None`` if no usable predictions exist.
+    When ``decoder_df`` is set (e.g. 1 for a linear decoder, 2 for quadratic)
+    an F-test is run across **all** genes for each decoder model and significant
+    genes (Benjamini–Hochberg q < 0.05) are written to CSVs beside the PNG:
+    ``<stem>_isodepth_sig_genes.csv`` and/or ``<stem>_covariate_sig_genes.csv``.
+    When ``pred_isodepth``/``pred_covariate`` is None but ``decoder_df`` is set,
+    a fresh polynomial of degree ``decoder_df`` is fitted to the raw per-cell
+    data for every gene so that the F-test covers all genes, not just the
+    displayed top-k.
+
+    Scatter dots are per-bin means with quantile-based (equal-count) bins.
     """
-    scenarios = _prediction_scenarios_for_selected_genes(result)
-    if not scenarios:
-        return None
-
-    out_dir = Path(out_dir)
-    selected_root = out_dir / "selected_genes"
-    selected_root.mkdir(parents=True, exist_ok=True)
-
-    y_label = _expression_y_axis_label(dataset.meta)
-    manifest: dict[str, Any] = {
-        "top_k": int(top_k),
-        "num_bins": int(num_bins),
-        "ranking": "per-gene Pearson correlation between observed expression and model prediction",
-        "y_axis": y_label,
-        "scenarios": [],
-    }
-
+    out_path = Path(out_path)
     A = np.asarray(dataset.A, dtype=np.float64)
-    pt_size = max(8.0, _point_size(np.asarray(dataset.S, dtype=np.float32)))
+    iso = np.asarray(isodepth, dtype=np.float64).reshape(-1)
+    cov = np.asarray(covariate_isodepth, dtype=np.float64).reshape(-1)
+    G = A.shape[1]
 
-    for subdir, panel_title, pred, depth in scenarios:
-        pred = np.asarray(pred, dtype=np.float64)
-        depth = np.asarray(depth, dtype=np.float64)
-        if pred.shape[0] != A.shape[0] or pred.shape[1] != A.shape[1]:
-            continue
-        try:
-            x = _flatten_isodepth_for_axis(depth)
-        except ValueError:
-            continue
-        if x.shape[0] != A.shape[0]:
-            continue
+    var_names = dataset.meta.get("var_names")
+    gene_names: list[str] = (
+        [str(var_names[i]) for i in range(G)] if var_names else [f"gene_{i}" for i in range(G)]
+    )
 
-        top_idx, corrs = _top_genes_by_prediction_correlation(A, pred, top_k=top_k)
-        scenario_dir = selected_root / subdir
-        scenario_dir.mkdir(parents=True, exist_ok=True)
+    rhos_iso = _gene_spearman_rhos(A, iso)
+    rhos_cov = _gene_spearman_rhos(A, cov)
+    top_iso = _top_genes_by_abs_rho(rhos_iso, n_top_genes)
+    top_cov = _top_genes_by_abs_rho(rhos_cov, n_top_genes)
+    n_top = max(len(top_iso), len(top_cov))
 
-        gene_entries: list[dict[str, Any]] = []
-        for rank, g in enumerate(top_idx):
-            r = float(corrs[int(g)])
-            y_obs = A[:, int(g)]
-            y_pred = pred[:, int(g)]
-            gene_name = _gene_display_name(dataset.meta, int(g))
-            stem = f"{int(rank):02d}_{int(g):04d}_{_safe_filename_fragment(gene_name)}_r{r:.4f}".replace(".", "p")
-            out_png = scenario_dir / f"{stem}.png"
+    iso_colors = plt.cm.Blues(np.linspace(0.45, 0.85, max(len(top_iso), 1)))
+    cov_colors = plt.cm.Greens(np.linspace(0.45, 0.85, max(len(top_cov), 1)))
 
-            fig, ax = plt.subplots(1, 1, figsize=(4, 2.5))
-            _plot_gene_piecewise_linear(
-                ax, x, y_obs, y_pred,
-                num_bins=num_bins,
-                pt_size=pt_size,
+    # (gene_indices, rhos_to_display, coordinate, x_label, colors, pred_array)
+    # pred_array shape: (n_cells, G) or None
+    row_specs = [
+        (top_iso, rhos_iso, iso, isodepth_label, iso_colors, pred_isodepth),
+        (top_iso, rhos_cov, cov, covariate_label, iso_colors, pred_covariate),
+        (top_cov, rhos_cov, cov, covariate_label, cov_colors, pred_covariate),
+        (top_cov, rhos_iso, iso, isodepth_label, cov_colors, pred_isodepth),
+    ]
+    row_titles = [
+        f"Top {len(top_iso)} isodepth genes — vs {isodepth_label}",
+        f"Top {len(top_iso)} isodepth genes — vs {covariate_label}",
+        f"Top {len(top_cov)} covariate genes — vs {covariate_label}",
+        f"Top {len(top_cov)} covariate genes — vs {isodepth_label}",
+    ]
+
+    fig, axes = plt.subplots(4, n_top, figsize=(4.0 * n_top, 3.6 * 4), squeeze=False)
+
+    for row_idx, (gene_indices, rhos_for_row, coord, xlabel, colors, preds) in enumerate(row_specs):
+        for col, gene_idx in enumerate(gene_indices):
+            dp = (
+                np.asarray(preds, dtype=np.float64)[:, gene_idx]
+                if preds is not None else None
             )
-            ax.set_xlabel("Isodepth", fontsize=11)
-            ax.set_ylabel(y_label, fontsize=11)
-            ax.set_title(f"{panel_title}\n{gene_name}  (r={r:.3f})", fontsize=11)
-            ax.tick_params(labelsize=10)
-            fig.tight_layout()
-            fig.savefig(out_png, dpi=200, bbox_inches="tight")
-            plt.close(fig)
-
-            gene_entries.append(
-                {
-                    "rank": int(rank),
-                    "gene_index": int(g),
-                    "gene_name": gene_name,
-                    "pearson_r": r,
-                    "filename": str(out_png.relative_to(selected_root)),
-                }
+            _plot_gene_binned_vs_coord(
+                axes[row_idx, col], A[:, gene_idx], coord,
+                gene_names[gene_idx], xlabel,
+                n_bins=n_bins, min_bin_cells=min_bin_cells,
+                rho=float(rhos_for_row[gene_idx]), color=colors[col],
+                decoder_preds=dp,
             )
-
-        manifest["scenarios"].append(
-            {
-                "subdir": subdir,
-                "title": panel_title,
-                "genes": gene_entries,
-            }
+        for col in range(len(gene_indices), n_top):
+            axes[row_idx, col].set_visible(False)
+        axes[row_idx, 0].set_ylabel(
+            f"Mean expression\n({row_titles[row_idx]})", fontsize=8
         )
 
-    manifest_path = selected_root / "manifest.json"
-    with open(manifest_path, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2)
+    fig.suptitle(
+        f"Gene expression vs learned coordinates\n({isodepth_label} | {covariate_label})",
+        fontsize=12, y=1.005,
+    )
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
 
-    return selected_root
+    # --- F-test significance CSVs ---
+    if decoder_df is not None:
+        stem = out_path.parent / out_path.stem
+        for preds_arr, label in [
+            (pred_isodepth, "isodepth"),
+            (pred_covariate, "covariate"),
+        ]:
+            if preds_arr is not None:
+                fitted = np.asarray(preds_arr, dtype=np.float64)
+            else:
+                # Fit a fresh polynomial of degree decoder_df to ALL genes on
+                # the relevant coordinate so the F-test covers every gene.
+                coord_for_fit = iso if label == "isodepth" else cov
+                fitted = np.stack(
+                    [
+                        np.poly1d(np.polyfit(coord_for_fit, A[:, g], decoder_df))(coord_for_fit)
+                        for g in range(G)
+                    ],
+                    axis=1,
+                )
+            pvals = _ftest_decoder_pvalues(A, fitted, df_model=decoder_df)
+            qvals = _bh_qvalues(pvals)
+            csv_path = Path(f"{stem}_{label}_sig_genes.csv")
+            _save_sig_genes_csv(csv_path, gene_names, pvals, qvals)
+
+    return out_path

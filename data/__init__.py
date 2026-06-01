@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import numpy as np
 
 from data.schemas import DataConfig, DatasetBundle
 
 
-def load_h5ad_dataset_from_config(config: DataConfig) -> DatasetBundle:
+def load_h5ad_dataset_from_config(
+    config: DataConfig,
+    *,
+    covariate_obs_key: Optional[str] = None,
+) -> DatasetBundle:
     from data.h5ad_loader import load_dataset_from_config as _impl
 
-    return _impl(config)
+    return _impl(config, covariate_obs_key=covariate_obs_key)
 
 
 def load_h5ad_dataset(**kwargs) -> DatasetBundle:
@@ -49,11 +55,31 @@ def _standardize_coordinates_inplace(dataset: DatasetBundle) -> DatasetBundle:
     return dataset
 
 
-def load_dataset(config: DataConfig) -> DatasetBundle:
+def load_dataset(config: DataConfig, *, covariate=None) -> DatasetBundle:
+    """Load a dataset from ``config``.
+
+    Parameters
+    ----------
+    config:
+        Data configuration.
+    covariate:
+        Optional :class:`~data.schemas.CovariateConfig`.  When set and the covariate
+        is an obs-key type (not ``"midline"``), the corresponding ``adata.obs`` column
+        is extracted and stored in ``dataset.meta["covariate_values"]``.  Raises
+        ``ValueError`` if the key is absent from the h5ad file.
+    """
     config.validate()
+    covariate_obs_key: Optional[str] = None
+    if covariate is not None and getattr(covariate, "is_obs_key", False):
+        covariate_obs_key = covariate.type
     if config.source == "h5ad":
-        dataset = load_h5ad_dataset_from_config(config)
+        dataset = load_h5ad_dataset_from_config(config, covariate_obs_key=covariate_obs_key)
     elif config.source == "synthetic":
+        if covariate_obs_key is not None:
+            raise ValueError(
+                f"test.covariate obs key '{covariate_obs_key}' is only supported with "
+                "data.source='h5ad'; synthetic data does not have an obs table."
+            )
         dataset = generate_synthetic_dataset(config)
     else:
         raise ValueError(f"Unsupported data source '{config.source}'")

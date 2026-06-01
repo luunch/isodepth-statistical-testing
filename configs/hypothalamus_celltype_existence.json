@@ -16,9 +16,10 @@
   "test": {
     "method": "parallel_permutation",
     "metric": "nll_gaussian_mse",
+    "covariate": "midline",
     "n_perms": 999,
     "epochs": 500,
-    "n_reruns": 30,
+    "n_reruns": 10,
     "sgd_batch_size": 128,
     "lr": 0.001,
     "patience": 0,
@@ -29,7 +30,7 @@
   },
   "output": {
     "out_dir": "results",
-    "run_name": "hypothalamus_separated_celltype_128sgd_batch_size_500epochs",
+    "run_name": "hypothalamus_separated_celltype_quadratic",
     "save_preds": false,
     "save_perm_stats": true
   }

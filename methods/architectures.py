@@ -5,12 +5,36 @@ import torch
 import torch.nn as nn
 
 
-SUPPORTED_DECODER_TYPES = {"linear", "nn"}
+SUPPORTED_DECODER_TYPES = {"linear", "nn", "quadratic"}
+
+
+class QuadraticDecoder(nn.Module):
+    """Polynomial degree-2 decoder: output = Linear([z; z²]) + b."""
+
+    def __init__(self, latent_dim: int, G: int):
+        super().__init__()
+        self.linear = nn.Linear(2 * latent_dim, G)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.linear(torch.cat([z, z ** 2], dim=-1))
+
+
+class ParallelQuadraticDecoder(nn.Module):
+    """Batched (M parallel) polynomial degree-2 decoder."""
+
+    def __init__(self, M: int, latent_dim: int, G: int):
+        super().__init__()
+        self.linear = ParallelLinear(M, 2 * latent_dim, G)
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        return self.linear(torch.cat([z, z ** 2], dim=-1))
 
 
 def _build_decoder(latent_dim: int, G: int, *, decoder_type: str) -> nn.Module:
     if decoder_type == "linear":
         return nn.Linear(latent_dim, G)
+    if decoder_type == "quadratic":
+        return QuadraticDecoder(latent_dim, G)
     if decoder_type == "nn":
         return nn.Sequential(
             nn.Linear(latent_dim, 20),
@@ -27,6 +51,8 @@ def _build_decoder(latent_dim: int, G: int, *, decoder_type: str) -> nn.Module:
 def _build_parallel_decoder(M: int, latent_dim: int, G: int, *, decoder_type: str) -> nn.Module:
     if decoder_type == "linear":
         return ParallelLinear(M, latent_dim, G)
+    if decoder_type == "quadratic":
+        return ParallelQuadraticDecoder(M, latent_dim, G)
     if decoder_type == "nn":
         return nn.Sequential(
             ParallelLinear(M, latent_dim, 20),
@@ -96,7 +122,7 @@ class ParallelIsoDepthNet(nn.Module):
 
 
 class MidlineLatent(nn.Module):
-    """Fixed 1D depth per layout: c = median(x), d(x, y) = |x - c| (no learnable parameters).
+    """Fixed 1D depth per layout: c = median(x), d(x, y) = |x - c|, z-scored across cells.
 
     Expects ``x`` as column 0 of spatial coordinates. One median per batch row ``m`` (parallel models).
     """
@@ -108,7 +134,10 @@ class MidlineLatent(nn.Module):
     def forward(self, s: torch.Tensor) -> torch.Tensor:
         x = s[..., 0]
         med = x.median(dim=1).values.unsqueeze(1)
-        return (x - med).abs().unsqueeze(-1)
+        depth = (x - med).abs()
+        mu = depth.mean(dim=1, keepdim=True)
+        sigma = depth.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-8)
+        return ((depth - mu) / sigma).unsqueeze(-1)
 
 
 class MidlineLatentSingle(nn.Module):
@@ -121,7 +150,12 @@ class MidlineLatentSingle(nn.Module):
     def forward(self, s: torch.Tensor) -> torch.Tensor:
         x = s[:, 0]
         med = x.median()
-        return (x - med).abs().unsqueeze(-1)
+        depth = (x - med).abs()
+        mu = depth.mean()
+        sigma = depth.std(unbiased=False)
+        if float(sigma) < 1e-8:
+            return torch.zeros((s.shape[0], 1), device=s.device, dtype=s.dtype)
+        return ((depth - mu) / sigma).unsqueeze(-1)
 
 
 class HybridMidlineLatent(nn.Module):
@@ -188,6 +222,7 @@ class CellTypeIsoDepthNet(nn.Module):
     def __init__(self, n_cell_types: int, G: int, latent_dim: int = 1, decoder_type: str = "nn"):
         super().__init__()
         self.n_cell_types = int(n_cell_types)
+        self.G = int(G)
         self.latent_dim = int(latent_dim)
         self.decoder_type = str(decoder_type)
         self.encoder = nn.Sequential(
@@ -204,7 +239,7 @@ class CellTypeIsoDepthNet(nn.Module):
 
     def forward(self, x: torch.Tensor, cell_type_indices: torch.Tensor) -> torch.Tensor:
         latent = self.encoder(x)
-        N, G = x.shape[0], self.decoders[0][-1].out_features if isinstance(self.decoders[0], nn.Sequential) else self.decoders[0].out_features
+        N, G = x.shape[0], self.G
         output = torch.zeros(N, G, device=x.device, dtype=x.dtype)
         for c in range(self.n_cell_types):
             mask = cell_type_indices == c
@@ -299,3 +334,76 @@ class DecoderOnlyNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.decoder(self.encoder(x))
+
+
+class FixedLatentSingle(nn.Module):
+    """Fixed per-cell latent values read from an obs column.
+
+    The stored ``latent_values`` buffer (shape ``(N, 1)``) is returned unchanged for
+    every forward call; the spatial coordinate input is ignored.  This mirrors
+    ``MidlineLatentSingle`` but uses data-driven values instead of computing
+    ``|x - median(x)|`` from coordinates.
+    """
+
+    def __init__(self, values: np.ndarray) -> None:
+        super().__init__()
+        v = torch.tensor(np.asarray(values, dtype=np.float32).reshape(-1, 1))
+        self.register_buffer("latent_values", v)
+        self.latent_dim = 1
+
+    def forward(self, s: torch.Tensor) -> torch.Tensor:
+        return self.latent_values
+
+
+class DecoderOnlyNetFixed(nn.Module):
+    """Decoder-only model whose encoder is a fixed obs-column latent (``FixedLatentSingle``).
+
+    Suitable for any pre-computed per-cell covariate stored in ``adata.obs``.  Only the
+    decoder weights are updated during training; the latent values are frozen buffers.
+    """
+
+    def __init__(
+        self,
+        G: int,
+        values: np.ndarray,
+        latent_dim: int = 1,
+        decoder_type: str = "nn",
+    ) -> None:
+        super().__init__()
+        if int(latent_dim) != 1:
+            raise ValueError("DecoderOnlyNetFixed requires latent_dim=1.")
+        self.latent_dim = 1
+        self.decoder_type = str(decoder_type)
+        self.encoder = FixedLatentSingle(values)
+        self.decoder = _build_decoder(self.latent_dim, G, decoder_type=self.decoder_type)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.decoder(self.encoder(x))
+
+
+class ParallelDecoderOnlyNetFixed(nn.Module):
+    """``n_reruns`` parallel decoder-only models sharing one fixed obs-column latent."""
+
+    def __init__(
+        self,
+        M: int,
+        G: int,
+        values: np.ndarray,
+        *,
+        latent_dim: int = 1,
+        decoder_type: str = "nn",
+    ) -> None:
+        super().__init__()
+        if int(latent_dim) != 1:
+            raise ValueError("ParallelDecoderOnlyNetFixed requires latent_dim=1.")
+        self.M = int(M)
+        self.latent_dim = 1
+        self.decoder_type = str(decoder_type)
+        self.encoder = FixedLatentSingle(values)
+        self.decoder = _build_parallel_decoder(self.M, self.latent_dim, G, decoder_type=self.decoder_type)
+
+    def forward(self, x: torch.Tensor | None = None) -> torch.Tensor:
+        del x
+        latent = self.encoder.latent_values
+        batched_latent = latent.unsqueeze(0).expand(self.M, -1, -1)
+        return self.decoder(batched_latent)

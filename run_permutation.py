@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 
 from data import load_dataset
 from experiments.configuration import build_run_config, save_standardized_outputs
@@ -34,6 +33,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-raw", dest="use_raw", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--no-use-raw", dest="use_raw", action="store_false", default=argparse.SUPPRESS)
     parser.add_argument("--min-cells-per-gene", type=int, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--top-var-genes",
+        dest="top_var_genes",
+        type=int,
+        default=argparse.SUPPRESS,
+        help="Keep only the top-N scanpy highly variable genes (0 = use all genes; h5ad only)",
+    )
     parser.add_argument("--log1p", dest="log1p", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--no-log1p", dest="log1p", action="store_false", default=argparse.SUPPRESS)
     parser.add_argument(
@@ -76,7 +82,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--n-perms", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--train-fraction", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--n-reruns", type=int, default=argparse.SUPPRESS)
-    parser.add_argument("--max-spatial-dims", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--alpha", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--n-nulls", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--epochs", type=int, default=argparse.SUPPRESS)
@@ -125,9 +130,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--covariate-type",
         dest="covariate_type",
-        choices=["midline"],
         default=argparse.SUPPRESS,
-        help="Fixed bottleneck covariate: midline uses d(x,y)=|x-median(x)|; only the decoder is trained.",
+        help=(
+            "Fixed bottleneck covariate type.  Use 'midline' for d(x,y)=|x-median(x)| "
+            "(computed from coordinates), or any obs column name to read per-cell latent "
+            "values from adata.obs[<key>] in the h5ad file."
+        ),
     )
     return parser
 
@@ -146,6 +154,7 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict:
         "layer": "layer",
         "use_raw": "use_raw",
         "min_cells_per_gene": "min_cells_per_gene",
+        "top_var_genes": "top_var_genes",
         "log1p": "log1p",
         "standardize_expression": "standardize_expression",
         "standardize_coordinates": "standardize_coordinates",
@@ -168,7 +177,6 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict:
         "n_perms": "n_perms",
         "train_fraction": "train_fraction",
         "n_reruns": "n_reruns",
-        "max_spatial_dims": "max_spatial_dims",
         "alpha": "alpha",
         "n_nulls": "n_nulls",
         "epochs": "epochs",
@@ -222,11 +230,10 @@ def main() -> None:
     cli_overrides = _build_cli_overrides(args)
     run_config = build_run_config(args.config, cli_overrides)
 
-    dataset = load_dataset(run_config.data)
+    dataset = load_dataset(run_config.data, covariate=run_config.test.covariate)
     result = run_permutation_method(dataset, run_config.test)
     payload, result_path = save_standardized_outputs(dataset, result, run_config)
 
-    print(json.dumps(payload, indent=2))
     print(f"Saved outputs to: {result_path.parent}")
 
 

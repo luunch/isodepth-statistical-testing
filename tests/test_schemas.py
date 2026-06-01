@@ -480,15 +480,6 @@ class TestSubsetSelectionSchema(unittest.TestCase):
 
 
 class TestCovariateSchema(unittest.TestCase):
-    def test_midline_rejects_exact_existence(self) -> None:
-        with self.assertRaises(ValueError):
-            TestConfig(
-                method="exact_existence",
-                metric="mse",
-                n_perms=5,
-                covariate=CovariateConfig(type="midline"),
-            ).validate()
-
     def test_unknown_covariate_type_rejected(self) -> None:
         with self.assertRaises(ValueError):
             CovariateConfig(type="unknown").validate()

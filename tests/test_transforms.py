@@ -12,13 +12,28 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data.transforms import apply_expression_transforms, filter_genes_by_min_cells
+from data.transforms import (
+    apply_expression_transforms,
+    apply_expression_transforms_by_celltype,
+    filter_genes_by_min_cells,
+    zscore_covariate,
+)
 
 
 HAS_TORCH = importlib.util.find_spec("torch") is not None
 
 
 class TestBasicTransforms(unittest.TestCase):
+    def test_zscore_covariate_unit_std(self) -> None:
+        values = np.asarray([0.84, 0.86, 0.88, 0.90, 0.92], dtype=np.float32)
+        normalized = zscore_covariate(values)
+        self.assertAlmostEqual(float(normalized.mean()), 0.0, places=5)
+        self.assertAlmostEqual(float(normalized.std()), 1.0, places=5)
+
+    def test_zscore_covariate_constant_returns_zeros(self) -> None:
+        values = np.full(10, 0.5, dtype=np.float32)
+        np.testing.assert_allclose(zscore_covariate(values), np.zeros(10, dtype=np.float32))
+
     def test_filter_genes_by_min_cells_drops_underexpressed_genes(self) -> None:
         a = np.asarray(
             [
@@ -148,6 +163,40 @@ class TestPoissonLowRankTransform(unittest.TestCase):
         )
 
         np.testing.assert_allclose(latent_a, latent_b, atol=1e-6)
+
+    def test_q_by_celltype_runs_independently_per_type(self) -> None:
+        counts = np.asarray(
+            [
+                [10.0, 0.0, 1.0, 0.0],
+                [12.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 15.0],
+                [0.0, 0.0, 2.0, 14.0],
+            ],
+            dtype=np.float32,
+        )
+        labels = np.asarray([0, 0, 1, 1], dtype=np.int64)
+
+        per_type, meta = apply_expression_transforms_by_celltype(
+            counts,
+            labels,
+            standardize_expression=True,
+            q=1,
+            seed=3,
+            return_metadata=True,
+        )
+        global_latent, _ = apply_expression_transforms(
+            counts,
+            standardize_expression=True,
+            q=1,
+            seed=3,
+            return_metadata=True,
+        )
+
+        self.assertEqual(per_type.shape, (4, 2))
+        self.assertTrue(meta["q_by_celltype"])
+        self.assertFalse(np.allclose(per_type, global_latent, atol=1e-4))
+        np.testing.assert_allclose(per_type[labels == 0].mean(axis=0), np.zeros(2), atol=1e-5)
+        np.testing.assert_allclose(per_type[labels == 1].mean(axis=0), np.zeros(2), atol=1e-5)
 
 
 if __name__ == "__main__":

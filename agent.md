@@ -1,75 +1,63 @@
-# AGENT.md
+# Agent notes — isodepth-statistical-testing
 
+## GPU memory model (parallel_permutation)
+- The batched trainer trains `M = (n_perms + 1) * n_reruns` independent models at once
+  (e.g. 99 perms + 1 true, 30 reruns => 3000 parallel models).
+- Dominant VRAM terms scale with `M * cells * genes`:
+  - decoder output-layer weights `ParallelLinear(M, 20, G)` => `(M, G, 20)` (x4 with grad+Adam m/v),
+  - per-minibatch activations `(M, sgd_batch_size, G)` plus an equal-size squared-error buffer,
+  - finalize forward chunks 128 *models* but over ALL cells: `(128, N, G)`.
+- Expression matrix `A` is NOT duplicated per model — `broadcast_a` keeps a single `(N, G)` tensor
+  (see `train_batched_isodepth_model`). Only trainable weights + per-model outputs replicate.
+- Reruns (`n_reruns`) are an optimization-robustness multiplier (pick best train loss), NOT
+  statistically required — lowering it is the cheapest memory win. Permutations ARE required.
+- On `torch.cuda.OutOfMemoryError`, `train_parallel_isodepth_model` auto-halves into chunks and
+  prints `[OOM split] Trying N chunks ...`; run still succeeds but very slowly.
 
-## Environment Setup
-Commands to activate testing enviroment:
-```bash
-conda activate isodepth_env
-```
-Currently running files will not work as this environment has no gpu setup.
+## Gene subsetting
+- `data.top_var_genes` (DataConfig, int, default 0, h5ad-only) keeps the top-N scanpy highly
+  variable genes via `sc.pp.highly_variable_genes(adata, flavor="seurat", n_top_genes=N)`, then
+  subsets `adata[:, highly_variable]` right after read (so X/layers/var_names stay aligned).
+  `0` = use all genes; `N >= n_genes` warns and keeps all. Requires `scanpy` (installed in
+  `isodepth_env`). CLI: `--top-var-genes N`. Implemented in `data/h5ad_loader.py`.
+- `flavor="seurat"` expects log-transformed input; for raw counts the statistically correct
+  flavor is `seurat_v3` (not currently wired up).
+- The old `data.highly_variable_only` boolean (read a precomputed `adata.var['highly_variable']`
+  column) was removed in favor of `top_var_genes`.
+- Only `min_cells_per_gene` and `top_var_genes` control gene subsetting.
 
-## 1. Purpose
-This folder is a research workflow to define a statistical test for determining when spatial transcriptomic genetic variation has arisen via random chance or due to some intrinsic quality of the data. We also aim to establish a biological gradient of this genetic variation. Core literature on this method of encoding an isodepth is GASTON and GASTON-mix. We replicate the architectures of these neural networks to define an isodepth on our data.
+## Env
+- conda env: `isodepth_env` (`source ~/miniforge3/etc/profile.d/conda.sh && conda activate isodepth_env`).
+- `torch` import in this env is slow (~seconds); a hang at import is usually just that, not a crash.
+- No `pytest` in the env; run tests with `python -m unittest tests.test_<name>`.
 
-## 2. Allowed Actions
-- Modify code in: ./analysis, ./data, ./experiments, ./methods, ./validation, ./tests
-- Create new files in: ./analysis, ./data, ./experiments, ./methods, ./validation, ./tests, ./configs
-- Run commands: NEED TO FURTHER SPECIFY
-- Install dependencies: yes/no
+## Removed: `exact_existence` method
+- The iterative dimension-selection test method `exact_existence` (and its `test.max_spatial_dims`
+  config field + `--max-spatial-dims` CLI flag) was fully removed from schemas, `methods/permutation.py`
+  (`run_exact_existence_method` + `_summarize_exact_existence_*` + now-unused `_delta_p_value`/
+  `_select_low_high_indices` helpers), `analysis/plots.py` (`_save_exact_existence_triptych` + the
+  unused `_as_dimension_matrix`), `experiments/configuration.py`, `run_permutation.py`, README, and tests.
+  `test.alpha` was kept (still a valid config field; used by the existence-sigma experiments).
+- Pre-existing unrelated test failure: `tests/test_schemas.py::test_unknown_covariate_type_rejected`
+  fails because of a separate working-tree `CovariateConfig` refactor (validate now only rejects empty
+  strings, since any non-empty string is treated as a valid `obs` key). Not caused by the removal.
 
-## 3. Forbidden Actions
-- Do not modify: ./data/h5ad/
-- Do not access: ./data/h5ad/
-- Do not use:
-
-## 4. Development Workflow
-1. Understand the task
-2. Identify relevant files
-3. Make minimal changes 
-4. Run tests
-5. Ensure formatting/linting passes
-
-## 5. Coding Standards
-
-## 6. Testing Requirements
-
-## 7. Project Structure
-Explain key directories and what lives where.
-
-## 8. Common Tasks
-
-## 9. Reusable Investigation Notes
-- **`test.covariate.type: midline`**: `parallel_permutation` now runs the ordinary full learned encoder+decoder batch for the true layout plus all permutation nulls (`covariate=None` internally for that parallel batch). It then trains the midline covariate decoder-only model separately on the true layout and reports `stat_covariate` / `p_value_covariate` against the same learned permutation null. Artifacts use `true_isodepth` / `pred_true` for the full learned true model and `true_isodepth_covariate` / `pred_true_covariate` for the midline model. The metric distribution figure shows both true-reference lines and p-values (no min/max null lines). Requires `latent_dim == 1`; incompatible with `exact_existence`.
-- `TestConfig.decoder` defaults to `nn`; override with `linear` when comparing to linear-decoder runs.
-- `configs/mouse_hippocampus_existence.json` currently omits `data.q`, while prior successful hippocampus existence and perturbation runs used `q: 10`, yielding a 20-dimensional Poisson low-rank latent feature space instead of full gene expression.
-- For single-run Slurm wrappers around `run_permutation.py`, prefer CLI overrides instead of cloning configs when only `q`, `decoder`, or `run_name` change; invoke it as `python run_permutation.py`, not `python -m run_permutation.py`.
-- Slurm wrappers that import `torch` need the conda-packaged CUDA libs prepended in `LD_LIBRARY_PATH`, with `nvjitlink` before `cusparse`; otherwise imports can fail with `libcusparse.so.12: undefined symbol __nvJitLinkComplete_12_4`.
-- `methods/trainers/isodepth.py` trains all `n_perms + 1` permutation models in parallel for `parallel_permutation`, so GPU memory grows with both permutation count and feature dimension; raw-gene hippocampus runs are therefore much more memory-sensitive than the `q: 10` configs.
-- When `n_reruns > 1`, `save_standardized_outputs` now emits a square-grid PNG of the true-data rerun isodepths using the trainer metadata key `true_rerun_isodepths`; it does not attempt to plot reruns for every permutation/null model.
-- `cross_validation` reuses the same coordinate-permutation null as `parallel_permutation`, but trains every batched model on a shared train-mask and computes the observed/null statistic from the complementary held-out test mask.
-- Existence sweep/analysis modules now treat `parallel_permutation` and `cross_validation` as interchangeable base/result methods; they should preserve the configured existence method instead of rewriting it during sweep expansion.
-- The h5ad preprocessing pipeline now supports `data.log1p`; it applies `log(1 + x)` after gene filtering and before z-scoring, and it is intentionally rejected when `data.q` is set because the Poisson low-rank transform expects count-scale inputs.
-- **`experiments/isodepth_bias_detection.py`** compares learned isodepths on true vs permuted coordinates (same coordinate null across runs) to surface dataset / coordinate-structure bias under the chosen network; it forces `n_reruns = 1`, requires `sgd_batch_size = 0`, accepts `epochs` override and `devices` (`cuda` / `cpu`) and plots one column per permutation slot with device rows plus a raw-scale Δ row when two devices are listed. Spec: `configs/experiments/isodepth_bias_detection.json`; runner `python -m experiments.isodepth_bias_detection --spec ...`.
-- **CUDA device selection** (`methods/trainers/gpu_selection.py`): `resolve_device("cuda")` and `resolve_device("auto")` query `nvidia-smi` for free memory and pick the least-used visible GPU (respects `CUDA_VISIBLE_DEVICES`). `run_permutation.py` wraps the full test in `run_with_cuda_oom_retry`: on `torch.cuda.OutOfMemoryError`, it clears cache and retries on the next ranked GPU. Explicit `cuda:N` still tries other GPUs after OOM, with `cuda:N` first. Override minimum free memory via `resolve_device(..., min_free_mib=...)`. If `nvidia-smi` is unavailable, behavior falls back to `cuda:0`.
-- **Cell-type separate GPU memory**: `_run_celltype_separate_parallel_permutation` calls `offload_module_to_cpu` after each per-type training block (and after the together model), deletes the permuted-coordinate batch tensor, and runs `torch.cuda.empty_cache()`. Spearman / plotting use CPU-resident models; `extract_model_isodepth` infers input device from model parameters.
-- **Cell-type separate scheduling**: types run in descending cell-count order (largest first). OOM retry is per cell type (and for the together model), not a full-run restart. Terminal logs `Cell type i/N: <name> (n cells)` when each type starts.
-- **Expression target broadcasting**: `train_batched_isodepth_model` stores a single `(N, G)` tensor for expression targets (A) on GPU when `a_batched` is not supplied (the standard permutation path), instead of repeating it `total_models` times. Broadcasting via `unsqueeze(0)` in `_compute_reconstruction_loss_per_model` yields identical loss/gradients. Callers that pass a custom per-slot `a_batched` (perturbation, subsampling) still get the full `(M, N, G)` path. Saves ~`total_models × N × G × 4` bytes of VRAM.
-- **`patience` default is 0** (no early stopping). When `patience=0`, the per-epoch full-forward for loss tracking, `best_state` snapshots, and the restore are all skipped — the model runs for exactly `epochs` epochs and uses final-epoch weights. Set `patience > 0` to re-enable early stopping with best-state restore. This also eliminates the ~`(M, N, G)` transient GPU spike each epoch from the patience check forward pass.
-- **Chunked post-training finalize** (`BatchedTrainingOutputs` in `methods/trainers/isodepth.py`): after training, `train_batched_isodepth_model` / `train_parallel_isodepth_model` no longer materialize `(total_models, N, G)` predictions on GPU. Instead they chunk slot forwards for rerun selection + per-model metrics, then store only `pred_true`, `pred_best_null`, `pred_worst_null`, and `model_metrics` (length `n_perms + 1`). `ParallelIsoDepthNet` / `HybridMidlineParallelNet` / `ParallelCellTypeIsoDepthNet` have fixed per-slot weights (`ParallelLinear`); chunked finalize must use `_forward_parallel_model_slice` / `_forward_parallel_celltype_slice` (row slices of weights), not `model(x[start:stop])`. Callers use `training_outputs.model_metrics` directly (replaces `compute_metric_batch` on full prediction stacks). Cross-validation passes `metric_loss_mask_batched=test_mask` so metrics are computed on held-out cells while training still uses `loss_mask_batched=train_mask`.
-- **`train_parallel_isodepth_model` / `train_celltype_parallel_isodepth_model` return 3-tuple**: `(model, BatchedTrainingOutputs, s_batched_np)`. The third element is the `(n_perms + 1, N, 2)` coordinate array used for training (auto-generated or passed-in). Callers reuse it for post-training isodepth extraction and coordinate lookups instead of re-calling `_build_permuted_coordinate_batch` (which would redundantly rebuild the same RNG-seeded permutations on GPU).
-- **`_extract_slot_isodepths`** (in `methods/permutation.py`): replaces the old `_extract_batched_isodepth` for the common case where only 3 specific slots (true, best null, worst null) are needed. Uses `extract_model_isodepth` per unique index so each forward pass respects the compact model's parallel slot structure (`ParallelLinear` enforces batch dim = n_models). Avoids the full `(M, N, latent_dim)` GPU allocation.
-- **`_encoder_expects_batched_spatial_input`** now also returns `True` when the model has an `M` attribute (the general marker for parallel models), not only for the three concrete `isinstance` checks. This makes `extract_model_isodepth` work with any model that advertises a parallel slot count via `M`.
-- **`data.standardize_coordinates`** (default `true`, applies to both `h5ad` and `synthetic` sources): when true, `data/__init__.py::load_dataset` z-scores `dataset.S` per axis (subtract mean, divide by std with eps fallback) right after loading and records `coord_mean`, `coord_std`, and `coordinate_standardization='zscore'` in `dataset.meta`. Useful for raw MERFISH-scale coordinates that would otherwise saturate the MLP encoder; mirrors the `data.standardize_expression` (expression z-score) convention.
-- **`data.standardize_expression`** (default `true`, was previously named `data.standardize`): renamed everywhere — schema field, JSON config key, function kwarg in `apply_expression_transforms`, `load_h5ad_dataset`, `dataset.meta["standardize_expression"]`, CLI flags `--standardize-expression` / `--no-standardize-expression`. The internal helper formerly called `standardize_expression(a)` in `data/transforms.py` was renamed to `_zscore_expression(a)` to avoid shadowing the kwarg. No backward-compat alias for the old `standardize` key — old configs must be updated.
-- **Coord-scale bias diagnosis (hypothalamus)**: with raw MERFISH coords (order ~10³) the first `Linear(2 → H)` layer drives pre-activations to ±10³·‖w‖, putting ReLUs in their "always on" half-plane and collapsing the encoder to an effectively affine map of `(x, y)`. The recovered isodepth is then just the dominant axis of the point cloud (looks like a clean midline gradient) and is essentially independent of the labels — which is exactly what `experiments/isodepth_bias_detection.py` exposed via near-1.0 inter-permutation Pearson on `configs/hypothalamus_existence.json`. Setting `data.standardize_coordinates: true` restores ReLU expressivity (inputs ≈ N(0,1) per axis), drops permutation Pearson to ~0, and the true-slot field becomes lumpy because the gene expression actually lacks a single dominant smooth gradient. Lesson: the "pretty" raw-coord midline was an underfitting artifact, not signal — always z-score coords for `h5ad` MERFISH-scale datasets before drawing conclusions about isodepth shape, and use the bias-detection cross-correlation matrix as the canonical sanity check.
-- **`data.sampling_bias`** is a mapping (synthetic only): `{"type": "uniform"}` for Lebesgue-uniform sampling on the spatial mask, `{"type": "normal", "variance": σ}` for an isotropic Gaussian centered at `(0.5, 0.5)` with covariance `σ · I_2`, or `{"type": "anisotropic_normal", "variance": [σ_x², σ_y²]}` for a diagonal Gaussian `diag(σ_x², σ_y²)` (use small `σ_x` ≪ `σ_y` for midline-style strips). All Gaussian variants rejection-sample into the shape mask intersected with `[0, 1]^2`. Legacy bare-string `"uniform"` is still accepted. Implemented in `data/schemas.py::SamplingBiasConfig`, `data/synthetic.py::_sample_normal_on_shape`, and `data/synthetic.py::_sample_anisotropic_normal_on_shape`. `dataset.meta["sampling_bias"]` is the mapping form (`{"type": ...}` plus `"variance"` when applicable; list-valued for anisotropic).
-- `experiments/isodepth_bias_detection.py` saves the synthetic ground-truth isodepth when `data.source == "synthetic"`: `{name}_synthetic_true_isodepth.npz` (keys `S`, `true_isodepth`) and `{name}_synthetic_true_isodepth.png`; paths are recorded in the result JSON under `synthetic_true_isodepth_path` / `synthetic_true_isodepth_plot`.
-- `export_gaston_true_isodepth.py` now aims to mirror `configs/mouse_hippocampus_existence.json` as closely as possible: it uses the CA1 h5ad defaults, separates `data_seed` and `train_seed` (defaulting to `0` and `42`), exports the `true_isodepth` from the `parallel_permutation` true-model slot rather than a standalone fit, and disables the older extra `q`-space/coordinate z-scoring unless `--rescale-q-inputs` is explicitly requested.
-- In the current `/weka` mount, Python processes may not be able to create new files under the repo-local `results/` tree even though code edits succeed there; `export_gaston_true_isodepth.py` therefore falls back to `/tmp/isodepth_export/` when the requested default output location is read-only and explicit output paths were not supplied.
-- Minibatch cell training (`test.sgd_batch_size > 0`) can optionally use `torch.optim.lr_scheduler.CosineAnnealingLR` stepped once per minibatch optimizer step when `test.sgd_cosine_lr_decay` is true. Default `sgd_cosine_t_max_steps` is `epochs * ceil(n_cells / sgd_batch_size)`; set `sgd_cosine_eta_min` (must be in `[0, lr]`) to control the floor.
-- **`save_standardized_outputs`** also creates **`selected_genes/`** under the run output directory. When `pred_true` and `true_isodepth` exist in the test result, it saves the top five genes by per-gene Pearson correlation between `dataset.A` and the model prediction, as scatter plots (y = expression in the same space as the model input, x = first isodepth dimension). With midline covariate artifacts, it writes separate subfolders `covariate_midline` and `full_isodepth`. See `selected_genes/manifest.json`.
-- **Gene-expression spatial colormaps** (`analysis/plots.py`): Per-gene panels use white/low → dark/high sequential ramps (`expression_colormap_for_index`). Aggregate signals (e.g. **`save_dataset_triptych`** mean absolute expression over genes from `run_permutation.py`) use **`DEFAULT_EXPRESSION_AGGREGATE_COLORMAP`** (`Reds`). Isodepth / latent plots still use their own scales (e.g. viridis).
-- **`experiments/batchsize_comparison.py`** also saves the final learned isodepth (encoder output on full `dataset.S`) for every regime — full batch + each entry of `experiment.batch_sizes` — into `{run_name}_batchsize_learned_isodepths.png` (one spatial-scatter subplot per regime, viridis with red contour lines via `analysis/plots._plot_spatial_isodepth`) plus a sibling `.npz` (`S`, `isodepth__<label>` per regime). When `data.source == "synthetic"` and `dataset.meta["synthetic_true_curve"]` is present (radial / fourier / noise modes), the figure prepends a "True isodepth (synthetic)" panel and the `.npz` adds `true_isodepth`. Both paths are recorded under `artifacts.learned_isodepths_plot` / `artifacts.learned_isodepths_data` in the comparison JSON.
-- **Manifest config snapshots**: All four sweep runners (`existence_sigma_sweep`, `fourier_kmax_sweep`, `fourier_kmax_existence_perturbation_sweep`, `real_data_existence_consistency_sweep`) now embed a `"config_snapshot"` key in `manifest.json` containing the full raw JSON of both the experiment spec file and all referenced base config files. This is built by `experiments/configuration.py::build_manifest_config_snapshot(spec_path, base_config_paths)`. The snapshot is included when a `spec_path` is passed to the sweep runner (always the case from CLI `main()` via `--spec`).
-- **Cell-type separate mode** (`data.cell_type: "separate"`): trains an independent `ParallelIsoDepthNet` (encoder + decoder) per cell type, with within-type-only coordinate permutations. Produces per-cell-type p-values, null distributions, and full plot sets (isodepth triptych, dataset triptych, metric distribution, selected genes, rerun grid) in `results/{run_name}/{TypeName}/` subdirectories. `data.cell_type` accepts `false` (default, no cell types), `true`/`"together"` (shared encoder + per-type decoders), or `"separate"`. The property `DataConfig.cell_type_mode` returns `"none"`, `"together"`, or `"separate"`. `data.min_cells_per_celltype` (default 1) filters out cell types with fewer cells at load time (data loader stage, before expression transforms); `meta["cell_type_mode"]` propagated to `DatasetBundle.meta`. Dispatch: `run_parallel_permutation_method` checks `meta["cell_type_mode"] == "separate"` before the `meta["cell_type_labels"] is not None` (together) branch. Example config: `configs/hypothalamus_celltype_separate_existence.json`.
-- **MERFISH visualization**: `experiments/merfish_hypothalamus_visualization.py` loads `configs/experiments/merfish_hypothalamus_visualization.json`, applies the same spatial coordinate null shuffles as `parallel_permutation` (torch `randperm` on CPU), and writes per-gene PNGs plus `resolved_genes.json`. Combined multi-gene figures use one colorbar per panel so hues can differ while the numeric scale stays shared. Each run also saves **`spatial_principal_coordinates.png`** (PCA on cell positions only: PC1/PC2 gradient fill + contour lines; path recorded in JSON). Default output folders when `--out-dir` is omitted: JSON `visualization.out_dir` (typically `results/merfishhypothalamus_visualization/`); `results/merfish_hypothalamus_visualization_nocontour/` if `--no-contour`; `results/merfish_hypothalamus_visualization_nozero/` if `--hide-zero-expression` or `"hide_zero_expression": true` under `visualization`; `results/merfish_hypothalamus_visualization_nocontour_nozero/` if both. Hide-zero skips drawing near-zero cells (`|value|<=1e-15`); filenames gain a `_nozero` suffix when that mode is on. Use `--out-dir` to override. It does not call `run_permutation.py` or train models.
+## Rerun-count experiment (`experiments/rerun_convergence.py`)
+- Quantifies how many `n_reruns` an isodepth fit actually needs. Trains `R` reruns (default 100)
+  concurrently on the SAME unpermuted dataset (`n_perms=0`, `patience=0`, `covariate=None`) via
+  `train_parallel_isodepth_model`, then Monte-Carlo subsamples `k` of `R` reruns (`--n-subsamples`,
+  default 100) for each `k=1..R`, taking the min training loss per draw and averaging => expected
+  best-of-k loss curve. Outputs ONE graph to `results/<run_name>_rerun_convergence/`.
+- Owns `n_reruns`/`n_perms`/`patience`; all other settings (epochs, lr, q, decoder, device, seed)
+  come from the `--config`. CLI overrides: `--n-reruns --n-subsamples --epochs --max-cells --q
+  --seed --device --out-dir --run-name`. Run as a script: `python experiments/rerun_convergence.py
+  --config ...` (the file inserts REPO_ROOT into sys.path; `python -m experiments.rerun_convergence`
+  also works only when cwd is the repo root since there is no `experiments/__init__.py`).
+- Math justification: rerun selection uses the unmasked training MSE, and the existence statistic
+  `nll_gaussian_mse` is a strictly monotonic transform of that same MSE, so best-of-k behaviour is
+  fully determined by the per-rerun MSE vector (`train_loss_per_rerun`). Pure analysis/plot helpers
+  live in `analysis/rerun_convergence.py` (`expected_min_loss_curve`, `render_expected_min_loss_figure`).
+- Sandbox note: the repo `results/` tree is on the `/weka/scratch` mount, which the agent shell
+  sandbox sees as root-owned/read-only; real runs as `ajain71` write there fine. To produce an
+  agent-side demo figure, pass `--out-dir` under `/weka/home/ajain71` or run the shell with full
+  permissions. Quick CPU smoke test: `--config configs/radial.json --device cpu --epochs 100`.

@@ -8,6 +8,7 @@ import torch
 from scipy.stats import spearmanr
 
 from data.schemas import DatasetBundle, TestConfig, TestResult
+from data.transforms import zscore_covariate
 from methods.metrics import (
     canonicalize_metric_name,
     compute_metric,
@@ -28,6 +29,7 @@ from methods.trainers import (
     resolve_device,
     run_with_cuda_oom_retry,
     train_celltype_parallel_isodepth_model,
+    train_fixed_covariate_model,
     train_isodepth_model,
     train_parallel_isodepth_model,
 )
@@ -36,6 +38,82 @@ from methods.trainers import (
 def _covariate_type_midline(config: TestConfig) -> bool:
     cov = getattr(config, "covariate", None)
     return cov is not None and getattr(cov, "type", None) == "midline"
+
+
+def _covariate_type_obs_key(config: TestConfig) -> bool:
+    """True when the covariate is a labeled obs-column key (not midline, not None)."""
+    cov = getattr(config, "covariate", None)
+    return cov is not None and getattr(cov, "is_obs_key", False)
+
+
+def _has_covariate(config: TestConfig) -> bool:
+    cov = getattr(config, "covariate", None)
+    return cov is not None and getattr(cov, "type", None) is not None
+
+
+def _obs_covariate_values(dataset: DatasetBundle, config: TestConfig) -> np.ndarray:
+    cov_values = dataset.meta.get("covariate_values")
+    if cov_values is None:
+        obs_key = config.covariate.type
+        raise ValueError(
+            f"test.covariate obs key '{obs_key}' was specified but "
+            "dataset.meta['covariate_values'] is missing.  "
+            "Ensure load_dataset is called with covariate=config.covariate so the "
+            "obs column is extracted during data loading."
+        )
+    return np.asarray(cov_values, dtype=np.float32)
+
+
+def _train_covariate_artifacts(
+    S: np.ndarray,
+    A: np.ndarray,
+    config: TestConfig,
+    device: torch.device,
+    metric: str,
+    stat_perm: np.ndarray,
+    *,
+    covariate_values: np.ndarray | None = None,
+    model_label: str = "covariate decoder",
+) -> dict[str, object]:
+    """Train a decoder-only covariate model on a cell subset and compare to ``stat_perm``."""
+    if _covariate_type_midline(config):
+        covariate_model, pred_covariate = train_isodepth_model(
+            S,
+            A,
+            config,
+            device=device,
+            model_label=model_label,
+        )
+        stat_covariate = float(compute_metric(metric, A, pred_covariate))
+        return {
+            "stat_covariate": stat_covariate,
+            "p_value_covariate": float(permutation_p_value(metric, stat_covariate, stat_perm)),
+            "pred_true_covariate": np.asarray(pred_covariate, dtype=np.float32),
+            "true_isodepth_covariate": np.asarray(
+                _extract_isodepth_from_model(covariate_model, S, device), dtype=np.float32
+            ),
+        }
+    if _covariate_type_obs_key(config):
+        if covariate_values is None:
+            obs_key = config.covariate.type
+            raise ValueError(
+                f"test.covariate obs key '{obs_key}' was specified but covariate_values is missing."
+            )
+        _, pred_covariate = train_fixed_covariate_model(
+            covariate_values,
+            A,
+            config,
+            device=device,
+            model_label=model_label,
+        )
+        stat_covariate = float(compute_metric(metric, A, pred_covariate))
+        return {
+            "stat_covariate": stat_covariate,
+            "p_value_covariate": float(permutation_p_value(metric, stat_covariate, stat_perm)),
+            "pred_true_covariate": np.asarray(pred_covariate, dtype=np.float32),
+            "true_isodepth_covariate": zscore_covariate(covariate_values),
+        }
+    return {}
 
 
 def _extract_isodepth_from_model(model, S: np.ndarray, device: torch.device) -> np.ndarray:
@@ -91,10 +169,6 @@ def _select_extreme_index(metric: str, stat_perm: np.ndarray) -> int:
     return int(np.argmax(stat_perm))
 
 
-def _select_low_high_indices(stat_perm: np.ndarray) -> tuple[int, int]:
-    return int(np.argmin(stat_perm)), int(np.argmax(stat_perm))
-
-
 def _build_permuted_coordinate_batch(
     S: np.ndarray,
     *,
@@ -138,11 +212,6 @@ def _build_train_test_masks(
     return train_mask, test_mask
 
 
-def _delta_p_value(stat_true: float, stat_perm: np.ndarray) -> float:
-    stat_perm = np.asarray(stat_perm, dtype=np.float64)
-    return float((1 + np.sum(stat_perm <= stat_true)) / (stat_perm.size + 1))
-
-
 def _format_isodepth_for_artifact(isodepth: np.ndarray) -> np.ndarray:
     arr = np.asarray(isodepth, dtype=np.float32)
     if arr.ndim == 2 and arr.shape[1] == 1:
@@ -164,116 +233,6 @@ def _rerun_index_and_loss(model, index: int) -> tuple[int, float]:
         int(metadata["best_rerun_index_per_model"][index]),
         float(metadata["best_train_loss_per_model"][index]),
     )
-
-
-def _summarize_exact_existence_step(
-    dataset: DatasetBundle,
-    s_batched_np: np.ndarray,
-    losses_k: np.ndarray,
-    losses_k_plus_1: np.ndarray,
-    tested_dim: int,
-    *,
-    model_k,
-    model_k_plus_1,
-    device: torch.device,
-) -> dict[str, object]:
-    stat_true = float(losses_k_plus_1[0] - losses_k[0])
-    stat_perm = np.asarray(losses_k_plus_1[1:] - losses_k[1:], dtype=np.float64)
-    p_value = _delta_p_value(stat_true, stat_perm)
-    low_idx, high_idx = _select_low_high_indices(stat_perm)
-    slot_iso = _extract_slot_isodepths(
-        model_k_plus_1, s_batched_np, [0, low_idx + 1, high_idx + 1], device,
-    )
-    true_isodepth = np.asarray(slot_iso[0], dtype=np.float32)
-    lowest_isodepth = np.asarray(slot_iso[low_idx + 1], dtype=np.float32)
-    highest_isodepth = np.asarray(slot_iso[high_idx + 1], dtype=np.float32)
-    lowest_S = np.asarray(s_batched_np[low_idx + 1], dtype=np.float32)
-    highest_S = np.asarray(s_batched_np[high_idx + 1], dtype=np.float32)
-    true_rerun_index_k, true_train_loss_k = _rerun_index_and_loss(model_k, 0)
-    true_rerun_index_k_plus_1, true_train_loss_k_plus_1 = _rerun_index_and_loss(model_k_plus_1, 0)
-    lowest_rerun_index, lowest_train_loss = _rerun_index_and_loss(model_k_plus_1, low_idx + 1)
-    highest_rerun_index, highest_train_loss = _rerun_index_and_loss(model_k_plus_1, high_idx + 1)
-    return {
-        "tested_dim": int(tested_dim),
-        "previous_dim": int(tested_dim - 1),
-        "test_type": "dimension_increase",
-        "stat_true": stat_true,
-        "stat_perm": stat_perm,
-        "p_value": p_value,
-        "significant": bool(p_value < 0.05),
-        "loss_k_true": float(losses_k[0]),
-        "loss_k_plus_1_true": float(losses_k_plus_1[0]),
-        "true_isodepth": true_isodepth,
-        "lowest_isodepth": lowest_isodepth,
-        "lowest_S": lowest_S,
-        "lowest_stat": float(stat_perm[low_idx]),
-        "lowest_perm_index": int(low_idx),
-        "highest_isodepth": highest_isodepth,
-        "highest_S": highest_S,
-        "highest_stat": float(stat_perm[high_idx]),
-        "highest_perm_index": int(high_idx),
-        "true_rerun_index": int(true_rerun_index_k_plus_1),
-        "true_train_loss": float(true_train_loss_k_plus_1),
-        "true_rerun_index_k": int(true_rerun_index_k),
-        "true_train_loss_k": float(true_train_loss_k),
-        "true_rerun_index_k_plus_1": int(true_rerun_index_k_plus_1),
-        "true_train_loss_k_plus_1": float(true_train_loss_k_plus_1),
-        "lowest_rerun_index": int(lowest_rerun_index),
-        "lowest_train_loss": float(lowest_train_loss),
-        "highest_rerun_index": int(highest_rerun_index),
-        "highest_train_loss": float(highest_train_loss),
-        "rerun_summary": _rerun_summary(model_k_plus_1),
-        "null_summary": {
-            "mean": float(np.mean(stat_perm)),
-            "std": float(np.std(stat_perm)),
-            "min": float(np.min(stat_perm)),
-            "max": float(np.max(stat_perm)),
-        },
-        "n_cells": int(dataset.n_cells),
-    }
-
-
-def _summarize_exact_existence_first_step(
-    existence_result: TestResult,
-    *,
-    alpha: float,
-) -> dict[str, object]:
-    return {
-        "tested_dim": 1,
-        "previous_dim": 0,
-        "test_type": "existence",
-        "stat_true": float(existence_result.stat_true),
-        "p_value": float(existence_result.p_value),
-        "significant": bool(float(existence_result.p_value) < alpha),
-        "true_isodepth": np.asarray(existence_result.artifacts["true_isodepth"], dtype=np.float32),
-        "lowest_isodepth": np.asarray(existence_result.artifacts["lowest_isodepth"], dtype=np.float32),
-        "lowest_S": np.asarray(existence_result.artifacts["lowest_S"], dtype=np.float32),
-        "lowest_stat": float(existence_result.artifacts["lowest_stat"]),
-        "lowest_perm_index": int(existence_result.artifacts["lowest_perm_index"]),
-        "highest_isodepth": np.asarray(existence_result.artifacts["highest_isodepth"], dtype=np.float32),
-        "highest_S": np.asarray(existence_result.artifacts["highest_S"], dtype=np.float32),
-        "highest_stat": float(existence_result.artifacts["highest_stat"]),
-        "highest_perm_index": int(existence_result.artifacts["highest_perm_index"]),
-        "rerun_summary": dict(existence_result.artifacts["rerun_summary"]),
-        "true_rerun_index": int(existence_result.artifacts["true_rerun_index"]),
-        "true_train_loss": float(existence_result.artifacts["true_train_loss"]),
-        "lowest_rerun_index": int(existence_result.artifacts["lowest_rerun_index"]),
-        "lowest_train_loss": float(existence_result.artifacts["lowest_train_loss"]),
-        "highest_rerun_index": int(existence_result.artifacts["highest_rerun_index"]),
-        "highest_train_loss": float(existence_result.artifacts["highest_train_loss"]),
-        "null_summary": {
-            "mean": float(np.mean(existence_result.stat_perm)),
-            "std": float(np.std(existence_result.stat_perm)),
-            "min": float(np.min(existence_result.stat_perm)),
-            "max": float(np.max(existence_result.stat_perm)),
-        },
-        "n_cells": int(existence_result.n_cells),
-        "alpha": float(alpha),
-        "null_distribution": np.asarray(existence_result.stat_perm, dtype=np.float64),
-        "observed_stat": float(existence_result.stat_true),
-        "dimension_labels": ["d1"],
-        "pred_true_k_plus_1": np.asarray(existence_result.artifacts["pred_true"], dtype=np.float32),
-    }
 
 
 def _compute_spearman_matrix(
@@ -310,6 +269,7 @@ def _process_single_celltype_separate(
     type_name: str,
     cell_type_labels: np.ndarray,
     metric: str,
+    covariate_values: np.ndarray | None = None,
 ) -> tuple[dict, tuple[np.ndarray, np.ndarray]]:
     """Train/evaluate one cell type; returns (per-type result dict, coord standardization)."""
     mask = cell_type_labels == type_index
@@ -323,16 +283,34 @@ def _process_single_celltype_separate(
     S_c = np.asarray((S_original_c - mean_c) / safe_std_c, dtype=np.float32)
 
     type_config = replace(config, seed=config.seed + type_index)
+    parallel_config = replace(type_config, covariate=None) if _has_covariate(config) else type_config
     model_c, training_outputs_c, s_batched_np_c = train_parallel_isodepth_model(
         S_c,
         A_c,
-        type_config,
+        parallel_config,
         device=device,
         model_label=f"separate {type_name} ({n_c} cells)",
     )
     stat_true_c = float(training_outputs_c.stat_true)
     stat_perm_c = training_outputs_c.stat_perm
     p_value_c = permutation_p_value(metric, stat_true_c, stat_perm_c)
+
+    covariate_artifacts: dict[str, object] = {}
+    if _has_covariate(config):
+        cov_values_c = None
+        if covariate_values is not None:
+            cov_values_c = np.asarray(covariate_values[mask], dtype=np.float32)
+        cov_label = config.covariate.type if config.covariate is not None else "covariate"
+        covariate_artifacts = _train_covariate_artifacts(
+            S_c,
+            A_c,
+            type_config,
+            device,
+            metric,
+            stat_perm_c,
+            covariate_values=cov_values_c,
+            model_label=f"{cov_label} covariate decoder ({type_name})",
+        )
 
     low_idx = int(training_outputs_c.best_null_index)
     high_idx = int(training_outputs_c.worst_null_index)
@@ -369,6 +347,7 @@ def _process_single_celltype_separate(
         "S": S_c,
         "S_original": S_original_c,
         "A": A_c,
+        **covariate_artifacts,
     }
     del s_batched_np_c
     type_result["model"] = offload_module_to_cpu(model_c)
@@ -384,6 +363,16 @@ def _run_celltype_separate_parallel_permutation(
     cell_type_names: list[str] = list(dataset.meta["cell_type_names"])
     n_cell_types = int(dataset.meta["n_cell_types"])
     type_order = _celltype_indices_by_descending_cell_count(cell_type_labels, n_cell_types)
+    covariate_values = dataset.meta.get("covariate_values")
+    if _covariate_type_obs_key(config) and covariate_values is None:
+        obs_key = config.covariate.type
+        raise ValueError(
+            f"test.covariate obs key '{obs_key}' was specified but "
+            "dataset.meta['covariate_values'] is missing.  "
+            "Ensure load_dataset is called with covariate=config.covariate."
+        )
+    if covariate_values is not None:
+        covariate_values = np.asarray(covariate_values, dtype=np.float32)
 
     start = time.time()
     per_type_results: dict[str, dict] = {}
@@ -411,6 +400,7 @@ def _run_celltype_separate_parallel_permutation(
                 type_name=type_name,
                 cell_type_labels=cell_type_labels,
                 metric=metric,
+                covariate_values=covariate_values,
             )
             per_type_standardization[type_name] = standardization
             return type_result
@@ -422,46 +412,8 @@ def _run_celltype_separate_parallel_permutation(
         )
         current_device = used_device
 
-    # --- "Together" run: train on ALL cells, no permutations ---
-    print(
-        f"All cell types complete; training combined model on all {dataset.n_cells} cells",
-        flush=True,
-    )
-    # Single true layout only (no nulls). train_isodepth passes one s_batched row, so n_perms=0.
-    together_config = replace(config, n_perms=0, seed=config.seed + n_cell_types)
-    together_used_device = current_device
-
-    def _train_together_model(train_device: torch.device) -> tuple[object, np.ndarray, np.ndarray]:
-        nonlocal together_used_device
-        together_used_device = train_device
-        together_model, together_preds = train_isodepth_model(
-            dataset.S,
-            dataset.A,
-            together_config,
-            device=train_device,
-            model_label="all cells together (no permutations)",
-        )
-        together_isodepth = _extract_isodepth_from_model(together_model, dataset.S, train_device)
-        return together_model, together_preds, together_isodepth
-
-    together_model, together_preds, together_isodepth = run_with_cuda_oom_retry(
-        _train_together_model,
-        current_device,
-        label="all cells together",
-    )
-    current_device = together_used_device
-    together_model = offload_module_to_cpu(together_model)
-
-    together_data: dict[str, object] = {
-        "model": together_model,
-        "pred_true": np.asarray(together_preds, dtype=np.float32),
-        "true_isodepth": together_isodepth,
-        "S": dataset.S,
-        "n_cells": dataset.n_cells,
-    }
-
-    # --- Spearman correlation matrix across cell types + together ---
-    # Evaluate every model on the full dataset to get comparable isodepth vectors.
+    # --- Spearman correlation matrix across cell types ---
+    # Evaluate each per-type model on the full dataset for comparable isodepth vectors.
     full_isodepths: list[np.ndarray] = []
     spearman_labels: list[str] = []
 
@@ -474,9 +426,6 @@ def _run_celltype_separate_parallel_permutation(
         iso_full = _extract_isodepth_from_model(model_c, S_full_standardized, device)
         full_isodepths.append(iso_full.reshape(-1))
         spearman_labels.append(type_name)
-
-    full_isodepths.append(together_isodepth.reshape(-1))
-    spearman_labels.append("All Together")
 
     spearman_matrix, spearman_labels = _compute_spearman_matrix(
         full_isodepths, spearman_labels,
@@ -505,7 +454,6 @@ def _run_celltype_separate_parallel_permutation(
             "cell_type_labels": cell_type_labels,
             "n_cell_types": n_cell_types,
             "cell_type_mode": "separate",
-            "together_data": together_data,
             "spearman_matrix": spearman_matrix,
             "spearman_labels": spearman_labels,
         },
@@ -522,7 +470,8 @@ def _run_celltype_parallel_permutation(
 
     start = time.time()
     has_midline_covariate = _covariate_type_midline(config)
-    parallel_config = replace(config, covariate=None) if has_midline_covariate else config
+    has_obs_key_covariate = _covariate_type_obs_key(config)
+    parallel_config = replace(config, covariate=None) if (has_midline_covariate or has_obs_key_covariate) else config
     model, training_outputs, s_batched_np = train_celltype_parallel_isodepth_model(
         dataset.S,
         dataset.A,
@@ -534,24 +483,20 @@ def _run_celltype_parallel_permutation(
     stat_true = float(training_outputs.stat_true)
     stat_perm = training_outputs.stat_perm
     p_value = permutation_p_value(metric, stat_true, stat_perm)
-    if has_midline_covariate:
-        covariate_model, pred_covariate = train_isodepth_model(
+    if _has_covariate(config):
+        cov_values = (
+            _obs_covariate_values(dataset, config) if has_obs_key_covariate else None
+        )
+        covariate_artifacts = _train_covariate_artifacts(
             dataset.S,
             dataset.A,
             config,
-            device=device,
+            device,
+            metric,
+            stat_perm,
+            covariate_values=cov_values,
             model_label="true layout covariate decoder (cell-type parallel)",
         )
-        stat_covariate = float(compute_metric(metric, dataset.A, pred_covariate))
-        p_value_covariate = float(permutation_p_value(metric, stat_covariate, stat_perm))
-        covariate_artifacts: dict[str, object] = {
-            "stat_covariate": stat_covariate,
-            "p_value_covariate": p_value_covariate,
-            "pred_true_covariate": np.asarray(pred_covariate, dtype=np.float32),
-            "true_isodepth_covariate": np.asarray(
-                _extract_isodepth_from_model(covariate_model, dataset.S, device), dtype=np.float32
-            ),
-        }
     else:
         covariate_artifacts = {}
 
@@ -639,31 +584,32 @@ def run_parallel_permutation_method(
 
     start = time.time()
     has_midline_covariate = _covariate_type_midline(config)
-    parallel_config = replace(config, covariate=None) if has_midline_covariate else config
+    has_obs_key_covariate = _covariate_type_obs_key(config)
+    parallel_config = replace(config, covariate=None) if (has_midline_covariate or has_obs_key_covariate) else config
     model, training_outputs, s_batched_np = train_parallel_isodepth_model(
         dataset.S, dataset.A, parallel_config, device=device,
     )
     stat_true = float(training_outputs.stat_true)
     stat_perm = training_outputs.stat_perm
     p_value = permutation_p_value(metric, stat_true, stat_perm)
-    if has_midline_covariate:
-        covariate_model, pred_covariate = train_isodepth_model(
+    if _has_covariate(config):
+        cov_values = (
+            _obs_covariate_values(dataset, config) if has_obs_key_covariate else None
+        )
+        covariate_artifacts = _train_covariate_artifacts(
             dataset.S,
             dataset.A,
             config,
-            device=device,
-            model_label="true layout covariate decoder",
-        )
-        stat_covariate = float(compute_metric(metric, dataset.A, pred_covariate))
-        p_value_covariate = float(permutation_p_value(metric, stat_covariate, stat_perm))
-        covariate_artifacts: dict[str, object] = {
-            "stat_covariate": stat_covariate,
-            "p_value_covariate": p_value_covariate,
-            "pred_true_covariate": np.asarray(pred_covariate, dtype=np.float32),
-            "true_isodepth_covariate": np.asarray(
-                _extract_isodepth_from_model(covariate_model, dataset.S, device), dtype=np.float32
+            device,
+            metric,
+            stat_perm,
+            covariate_values=cov_values,
+            model_label=(
+                f"obs-key covariate decoder ({config.covariate.type})"
+                if has_obs_key_covariate
+                else "true layout covariate decoder"
             ),
-        }
+        )
     else:
         covariate_artifacts = {}
     low_idx = int(training_outputs.best_null_index)
@@ -803,205 +749,6 @@ def run_cross_validation_method(
     ).validate()
 
 
-def run_exact_existence_method(
-    dataset: DatasetBundle, config: TestConfig, device: torch.device | None = None
-) -> TestResult:
-    dataset.validate()
-    config.validate()
-    metric = canonicalize_metric_name(config.metric)
-    device = device or resolve_device(config.device)
-
-    start = time.time()
-    step_summaries: dict[str, dict[str, object]] = {}
-    dimension_plot_rows: list[dict[str, object]] = []
-    selected_spatial_dims = 0
-    final_step_summary: dict[str, object] | None = None
-
-    existence_result = run_parallel_permutation_method(dataset, config, device=device)
-    first_step_summary = _summarize_exact_existence_first_step(existence_result, alpha=config.alpha)
-    step_summaries["1"] = first_step_summary
-    dimension_plot_rows.append(
-        {
-            "tested_dim": 1,
-            "true_isodepth": first_step_summary["true_isodepth"],
-            "lowest_isodepth": first_step_summary["lowest_isodepth"],
-            "lowest_S": first_step_summary["lowest_S"],
-            "lowest_stat": float(first_step_summary["lowest_stat"]),
-            "highest_isodepth": first_step_summary["highest_isodepth"],
-            "highest_S": first_step_summary["highest_S"],
-            "highest_stat": float(first_step_summary["highest_stat"]),
-            "dimension_labels": ["d1"],
-            "p_value": float(first_step_summary["p_value"]),
-            "significant": bool(first_step_summary["significant"]),
-            "test_type": "existence",
-        }
-    )
-    final_step_summary = first_step_summary
-    if bool(first_step_summary["significant"]):
-        selected_spatial_dims = 1
-    else:
-        runtime_sec = time.time() - start
-        return TestResult(
-            method_name="exact_existence",
-            metric=metric,
-            p_value=float(first_step_summary["p_value"]),
-            stat_true=float(first_step_summary["observed_stat"]),
-            stat_perm=np.asarray(first_step_summary["null_distribution"], dtype=np.float64),
-            runtime_sec=runtime_sec,
-            n_cells=dataset.n_cells,
-            n_genes=dataset.n_genes,
-            config={"test": config.__dict__.copy()},
-            artifacts={
-                "selected_spatial_dims": 0,
-                "tested_spatial_dims": [1],
-                "step_summaries": step_summaries,
-                "dimension_plot_rows": dimension_plot_rows,
-                "true_isodepth": np.asarray(first_step_summary["true_isodepth"], dtype=np.float32),
-                "rerun_summary": dict(first_step_summary["rerun_summary"]),
-                "true_rerun_index": int(first_step_summary["true_rerun_index"]),
-                "true_train_loss": float(first_step_summary["true_train_loss"]),
-                "lowest_isodepth": np.asarray(first_step_summary["lowest_isodepth"], dtype=np.float32),
-                "lowest_S": np.asarray(first_step_summary["lowest_S"], dtype=np.float32),
-                "lowest_stat": float(first_step_summary["lowest_stat"]),
-                "lowest_perm_index": int(first_step_summary["lowest_perm_index"]),
-                "lowest_rerun_index": int(first_step_summary["lowest_rerun_index"]),
-                "lowest_train_loss": float(first_step_summary["lowest_train_loss"]),
-                "highest_isodepth": np.asarray(first_step_summary["highest_isodepth"], dtype=np.float32),
-                "highest_S": np.asarray(first_step_summary["highest_S"], dtype=np.float32),
-                "highest_stat": float(first_step_summary["highest_stat"]),
-                "highest_perm_index": int(first_step_summary["highest_perm_index"]),
-                "highest_rerun_index": int(first_step_summary["highest_rerun_index"]),
-                "highest_train_loss": float(first_step_summary["highest_train_loss"]),
-                "null_summary": dict(first_step_summary["null_summary"]),
-                "alpha": float(config.alpha),
-                "max_spatial_dims": int(config.max_spatial_dims),
-            },
-        ).validate()
-
-    for tested_dim in range(2, config.max_spatial_dims + 1):
-        s_batched_pre, _ = _build_permuted_coordinate_batch(
-            dataset.S,
-            n_perms=config.n_perms,
-            seed=config.seed + tested_dim - 1,
-            device=device,
-        )
-        s_batched_dim_np = np.asarray(s_batched_pre.detach().cpu().numpy(), dtype=np.float32)
-        del s_batched_pre
-
-        model_k, training_outputs_k, _ = train_parallel_isodepth_model(
-            dataset.S,
-            dataset.A,
-            config,
-            device=device,
-            s_batched=s_batched_dim_np,
-            latent_dim=tested_dim - 1,
-            model_label=f"exact existence k={tested_dim - 1}",
-        )
-        model_k_plus_1, training_outputs_k_plus_1, _ = train_parallel_isodepth_model(
-            dataset.S,
-            dataset.A,
-            config,
-            device=device,
-            s_batched=s_batched_dim_np,
-            latent_dim=tested_dim,
-            model_label=f"exact existence k={tested_dim}",
-        )
-        losses_k = training_outputs_k.model_metrics
-        losses_k_plus_1 = training_outputs_k_plus_1.model_metrics
-
-        step_summary = _summarize_exact_existence_step(
-            dataset,
-            s_batched_dim_np,
-            losses_k,
-            losses_k_plus_1,
-            tested_dim,
-            model_k=model_k,
-            model_k_plus_1=model_k_plus_1,
-            device=device,
-        )
-        step_summary["p_value"] = float(step_summary["p_value"])
-        step_summary["significant"] = bool(float(step_summary["p_value"]) < config.alpha)
-        step_summary["alpha"] = float(config.alpha)
-        step_summary["test_type"] = "dimension_increase"
-        step_summary["null_distribution"] = np.asarray(step_summary.pop("stat_perm"), dtype=np.float64)
-        step_summary["observed_delta"] = float(step_summary["stat_true"])
-        step_summary["dimension_labels"] = [f"d{i + 1}" for i in range(tested_dim)]
-        step_summary["pred_true_k"] = np.asarray(training_outputs_k.pred_true, dtype=np.float32)
-        step_summary["pred_true_k_plus_1"] = np.asarray(training_outputs_k_plus_1.pred_true, dtype=np.float32)
-        step_summaries[str(tested_dim)] = step_summary
-
-        dimension_plot_rows.append(
-            {
-                "tested_dim": int(tested_dim),
-                "true_isodepth": step_summary["true_isodepth"],
-                "lowest_isodepth": step_summary["lowest_isodepth"],
-                "lowest_S": step_summary["lowest_S"],
-                "lowest_stat": float(step_summary["lowest_stat"]),
-                "highest_isodepth": step_summary["highest_isodepth"],
-                "highest_S": step_summary["highest_S"],
-                "highest_stat": float(step_summary["highest_stat"]),
-                "dimension_labels": list(step_summary["dimension_labels"]),
-                "p_value": float(step_summary["p_value"]),
-                "significant": bool(step_summary["significant"]),
-                "test_type": "dimension_increase",
-            }
-        )
-        final_step_summary = step_summary
-        if bool(step_summary["significant"]):
-            selected_spatial_dims = tested_dim
-            continue
-        break
-
-    if final_step_summary is None:
-        raise RuntimeError("exact_existence did not evaluate any dimensions")
-
-    runtime_sec = time.time() - start
-    stat_true = float(
-        final_step_summary["observed_delta"]
-        if "observed_delta" in final_step_summary
-        else final_step_summary["observed_stat"]
-    )
-    stat_perm = np.asarray(final_step_summary["null_distribution"], dtype=np.float64)
-    lowest_isodepth = final_step_summary["lowest_isodepth"]
-    highest_isodepth = final_step_summary["highest_isodepth"]
-    true_isodepth = final_step_summary["true_isodepth"]
-
-    return TestResult(
-        method_name="exact_existence",
-        metric=metric,
-        p_value=float(final_step_summary["p_value"]),
-        stat_true=stat_true,
-        stat_perm=stat_perm,
-        runtime_sec=runtime_sec,
-        n_cells=dataset.n_cells,
-        n_genes=dataset.n_genes,
-        config={"test": config.__dict__.copy()},
-        artifacts={
-            "selected_spatial_dims": int(selected_spatial_dims),
-            "tested_spatial_dims": [int(value) for value in range(1, len(step_summaries) + 1)],
-            "step_summaries": step_summaries,
-            "dimension_plot_rows": dimension_plot_rows,
-            "true_isodepth": np.asarray(true_isodepth, dtype=np.float32),
-            "rerun_summary": dict(final_step_summary["rerun_summary"]),
-            "true_rerun_index": int(final_step_summary["true_rerun_index"]),
-            "true_train_loss": float(final_step_summary["true_train_loss"]),
-            "lowest_isodepth": np.asarray(lowest_isodepth, dtype=np.float32),
-            "lowest_S": np.asarray(final_step_summary["lowest_S"], dtype=np.float32),
-            "lowest_stat": float(final_step_summary["lowest_stat"]),
-            "lowest_perm_index": int(final_step_summary["lowest_perm_index"]),
-            "lowest_rerun_index": int(final_step_summary["lowest_rerun_index"]),
-            "lowest_train_loss": float(final_step_summary["lowest_train_loss"]),
-            "highest_isodepth": np.asarray(highest_isodepth, dtype=np.float32),
-            "highest_S": np.asarray(final_step_summary["highest_S"], dtype=np.float32),
-            "highest_stat": float(final_step_summary["highest_stat"]),
-            "highest_perm_index": int(final_step_summary["highest_perm_index"]),
-            "highest_rerun_index": int(final_step_summary["highest_rerun_index"]),
-            "highest_train_loss": float(final_step_summary["highest_train_loss"]),
-            "null_summary": dict(final_step_summary["null_summary"]),
-            "alpha": float(config.alpha),
-            "max_spatial_dims": int(config.max_spatial_dims),
-        },
-    ).validate()
 def run_full_retraining_method(
     dataset: DatasetBundle, config: TestConfig, device: torch.device | None = None
 ) -> TestResult:
@@ -1010,7 +757,9 @@ def run_full_retraining_method(
     metric = canonicalize_metric_name(config.metric)
     device = device or resolve_device(config.device)
 
-    config_full = replace(config, covariate=None) if _covariate_type_midline(config) else config
+    _has_midline = _covariate_type_midline(config)
+    _has_obs_key = _covariate_type_obs_key(config)
+    config_full = replace(config, covariate=None) if (_has_midline or _has_obs_key) else config
 
     start = time.time()
     true_model, pred_true = train_isodepth_model(
@@ -1024,23 +773,6 @@ def run_full_retraining_method(
     stat_true = compute_metric(metric, dataset.A, pred_true)
     true_isodepth = _extract_isodepth_from_model(true_model, dataset.S, device)
     true_rerun_index, true_train_loss = _rerun_index_and_loss(true_model, 0)
-
-    covariate_artifacts: dict[str, object] = {}
-    if _covariate_type_midline(config):
-        cov_model, pred_cov = train_isodepth_model(
-            dataset.S,
-            dataset.A,
-            config,
-            device=device,
-            seed_offset=0,
-            model_label="true model midline covariate",
-        )
-        stat_covariate = float(compute_metric(metric, dataset.A, pred_cov))
-        covariate_artifacts["stat_covariate"] = stat_covariate
-        covariate_artifacts["pred_true_covariate"] = np.asarray(pred_cov, dtype=np.float32)
-        covariate_artifacts["true_isodepth_covariate"] = np.asarray(
-            _extract_isodepth_from_model(cov_model, dataset.S, device), dtype=np.float32
-        )
 
     rng = np.random.default_rng(config.seed)
     stat_perm = np.zeros(config.n_perms, dtype=np.float64)
@@ -1083,10 +815,24 @@ def run_full_retraining_method(
 
     runtime_sec = time.time() - start
     p_value = permutation_p_value(metric, stat_true, stat_perm)
-    if covariate_artifacts:
-        covariate_artifacts["p_value_covariate"] = float(
-            permutation_p_value(metric, float(covariate_artifacts["stat_covariate"]), stat_perm)
+    if _has_midline or _has_obs_key:
+        cov_values = _obs_covariate_values(dataset, config) if _has_obs_key else None
+        covariate_artifacts = _train_covariate_artifacts(
+            dataset.S,
+            dataset.A,
+            config,
+            device,
+            metric,
+            stat_perm,
+            covariate_values=cov_values,
+            model_label=(
+                f"obs-key covariate decoder ({config.covariate.type})"
+                if _has_obs_key
+                else "true model midline covariate"
+            ),
         )
+    else:
+        covariate_artifacts = {}
 
     return TestResult(
         method_name="full_retraining",
@@ -1135,8 +881,6 @@ def _run_permutation_method_on_device(
         return run_parallel_permutation_method(dataset, config, device=device)
     if config.method == "cross_validation":
         return run_cross_validation_method(dataset, config, device=device)
-    if config.method == "exact_existence":
-        return run_exact_existence_method(dataset, config, device=device)
     if config.method == "full_retraining":
         return run_full_retraining_method(dataset, config, device=device)
     raise ValueError(f"Unsupported test.method '{config.method}'")

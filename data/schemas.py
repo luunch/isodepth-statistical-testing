@@ -125,7 +125,6 @@ def _sampling_bias_from_raw(raw: Any) -> Optional[SamplingBiasConfig]:
 SUPPORTED_PERMUTATION_METHODS = {
     "parallel_permutation",
     "cross_validation",
-    "exact_existence",
     "full_retraining",
     "comparison_perturbation_test",
     "perturbation_test",
@@ -183,6 +182,7 @@ class DataConfig:
     layer: Optional[str] = None
     use_raw: bool = False
     min_cells_per_gene: int = 0
+    top_var_genes: int = 0
     log1p: bool = False
     standardize_expression: bool = True
     q: Optional[int] = None
@@ -232,6 +232,10 @@ class DataConfig:
             raise ValueError("data.h5ad is required when data.source='h5ad'")
         if self.min_cells_per_gene < 0:
             raise ValueError("data.min_cells_per_gene must be >= 0")
+        if self.top_var_genes < 0:
+            raise ValueError("data.top_var_genes must be >= 0 (0 means use all genes)")
+        if self.top_var_genes > 0 and self.source != "h5ad":
+            raise ValueError("data.top_var_genes is only supported when data.source='h5ad'")
         if self.log1p and self.q is not None:
             raise ValueError("data.log1p cannot be combined with data.q")
         if self.q is not None and self.q <= 0:
@@ -325,18 +329,32 @@ class DataConfig:
 
 SUPPORTED_COVARIATE_TYPES = frozenset({"midline"})
 
+MIDLINE_COVARIATE = "midline"
+
 
 @dataclass
 class CovariateConfig:
-    """Optional fixed bottleneck / isodepth specification (decoder-only training for supported types)."""
+    """Optional fixed bottleneck / isodepth specification (decoder-only training).
+
+    Two modes:
+    - ``type='midline'``: fixed depth ``d(x, y) = |x - median(x)|`` computed from spatial
+      coordinates; no data key required.
+    - ``type=<obs_key>`` (any other non-empty string): reads per-cell latent values from
+      ``adata.obs[obs_key]`` in the h5ad file; the key must exist in ``obs`` or a
+      ``ValueError`` is raised at load time.
+    """
 
     type: Optional[str] = None
 
+    @property
+    def is_obs_key(self) -> bool:
+        """True when the covariate is a labeled obs column (not midline and not None)."""
+        return self.type is not None and self.type != MIDLINE_COVARIATE
+
     def validate(self) -> "CovariateConfig":
-        if self.type is not None and self.type not in SUPPORTED_COVARIATE_TYPES:
+        if self.type is not None and not self.type.strip():
             raise ValueError(
-                f"Unsupported test.covariate.type '{self.type}'. "
-                f"Expected one of {sorted(SUPPORTED_COVARIATE_TYPES)} or null."
+                "test.covariate.type must be a non-empty string or null; got an empty string."
             )
         return self
 
@@ -348,7 +366,6 @@ class TestConfig:
     n_perms: int = 100
     train_fraction: float = 0.8
     n_reruns: int = 30
-    max_spatial_dims: int = 3
     alpha: float = 0.05
     n_nulls: int = 50
     epochs: int = 5000
@@ -362,6 +379,8 @@ class TestConfig:
     sgd_cosine_lr_decay: bool = False
     sgd_cosine_eta_min: float = 0.0
     sgd_cosine_t_max_steps: Optional[int] = None
+    max_wall_time_sec: Optional[float] = None
+    record_loss_history: bool = False
     delta: list[float] = field(default_factory=lambda: [0.05])
     perturb_target: str = "coordinates"
     subset_fractions: list[float] = field(default_factory=lambda: [0.5, 0.7, 0.9])
@@ -383,8 +402,6 @@ class TestConfig:
             raise ValueError("test.train_fraction must lie strictly between 0 and 1")
         if self.n_reruns <= 0:
             raise ValueError("test.n_reruns must be > 0")
-        if self.max_spatial_dims <= 0:
-            raise ValueError("test.max_spatial_dims must be > 0")
         if self.alpha <= 0.0 or self.alpha >= 1.0:
             raise ValueError("test.alpha must lie strictly between 0 and 1")
         if self.epochs <= 0:
@@ -413,6 +430,8 @@ class TestConfig:
                 )
             if self.sgd_cosine_t_max_steps is not None and int(self.sgd_cosine_t_max_steps) <= 0:
                 raise ValueError("test.sgd_cosine_t_max_steps must be > 0 when provided")
+        if self.max_wall_time_sec is not None and float(self.max_wall_time_sec) <= 0:
+            raise ValueError("test.max_wall_time_sec must be > 0 when provided")
         self.delta = [float(value) for value in self.delta]
         if not self.delta:
             raise ValueError("test.delta must contain at least one value")
@@ -430,7 +449,6 @@ class TestConfig:
         if self.method in {
             "parallel_permutation",
             "cross_validation",
-            "exact_existence",
             "full_retraining",
             "comparison_perturbation_test",
             "perturbation_test",
@@ -467,22 +485,9 @@ class TestConfig:
             raise ValueError(
                 "test.metric for subsampling_test must be one of ['mse', 'nll_gaussian_mse']"
             )
-        if self.method == "exact_existence" and self.metric not in {
-            "nll_gaussian_mse",
-            "mse",
-        }:
-            raise ValueError(
-                "test.metric for exact_existence must be one of ['mse', 'nll_gaussian_mse']"
-            )
 
         if self.covariate is not None:
             self.covariate.validate()
-            if self.covariate.type == "midline":
-                if self.method == "exact_existence":
-                    raise ValueError(
-                        "test.covariate.type 'midline' is incompatible with test.method 'exact_existence' "
-                        "(midline fixes a 1D depth; use parallel_permutation, cross_validation, or full_retraining)."
-                    )
         return self
 
 
@@ -568,7 +573,14 @@ class TestResult:
 
 
 def _covariate_config_from_raw(raw: Any) -> CovariateConfig:
-    """Build ``CovariateConfig`` from JSON/YAML: nested dict, or shorthand string ``\"midline\"``."""
+    """Build ``CovariateConfig`` from JSON/YAML.
+
+    Accepts:
+    - ``"midline"`` (string shorthand)
+    - ``{"type": "midline"}`` (mapping)
+    - any non-empty string to use as an ``adata.obs`` key
+    - ``{"type": "<obs_key>"}`` mapping for the same
+    """
     if isinstance(raw, CovariateConfig):
         return raw
     if isinstance(raw, str):
@@ -576,8 +588,9 @@ def _covariate_config_from_raw(raw: Any) -> CovariateConfig:
     if isinstance(raw, Mapping):
         return CovariateConfig(**dict(raw))
     raise TypeError(
-        "test.covariate must be a mapping like {\"type\": \"midline\"}, "
-        f"a string such as \"midline\", or omitted; got {type(raw).__name__}"
+        "test.covariate must be a mapping like {\"type\": \"midline\"} or "
+        "{\"type\": \"<obs_key>\"}, a string such as \"midline\" or an obs key, "
+        f"or omitted; got {type(raw).__name__}"
     )
 
 
@@ -600,6 +613,7 @@ __all__ = [
     "CovariateConfig",
     "DataConfig",
     "DatasetBundle",
+    "MIDLINE_COVARIATE",
     "OutputConfig",
     "RunConfig",
     "SUPPORTED_COVARIATE_TYPES",

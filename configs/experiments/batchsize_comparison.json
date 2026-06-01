@@ -1,8 +1,9 @@
 {
   "experiment_name": "batchsize_comparison",
   "base_config": "configs/fourier_existence.json",
-  "output_root": "results/experiments/batchsize_comparison",
+  "output_root": "results/experiments/batchsize_comparison_100cells",
   "base_epochs": 5000,
+  "time_budget_sec":600,
   "batch_sizes": [512, 256, 128, 64, 32, 8],
   "n_perms": 100,
   "n_reruns": 10,
