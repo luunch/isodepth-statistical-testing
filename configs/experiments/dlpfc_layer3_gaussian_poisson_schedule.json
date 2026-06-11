@@ -1,0 +1,40 @@
+{
+  "experiment_name": "dlpfc_layer3_gaussian_poisson_schedule",
+  "description": "Sweep Gaussian-then-Poisson schedules on DLPFC Layer 3. At each m, fork into free (encoder+decoder) vs frozen-encoder (decoder-only) Poisson branches after a shared Gaussian phase.",
+  "data": {
+    "parent_h5ad": "data/h5ad/dlpfc_new/spatialDLPFC_Visium.h5ad",
+    "prepared_h5ad": "data/h5ad/dlpfc_new/layer3_br6522_ant_1000hvg_gaussian_isodepth.h5ad",
+    "obs_filters": {"sample_id": "Br6522_ant"},
+    "obs_drop_na": ["manual_layer_label"],
+    "layer_label": "Layer 3",
+    "layer_obs_key": "manual_layer_label",
+    "top_var_genes": 1000,
+    "covariate_obs_key": "gaussian_isodepth"
+  },
+  "artifacts": {
+    "gaussian_isodepth_npz": "results/dlpfc_new/gaussian_BR6522_ant_1000_genes/Layer_3/Layer_3_isodepths.npz",
+    "poisson_isodepth_npz": "results/dlpfc_new/poisson_1000_genes/Layer_3/Layer_3_isodepths.npz"
+  },
+  "preprocessing": {
+    "min_cells_per_gene": 3,
+    "normalize_total": false,
+    "log1p": false,
+    "standardize_expression": false,
+    "standardize_coordinates": true
+  },
+  "schedule": {
+    "total_epochs": 1000,
+    "gaussian_epochs_list": [0, 20, 200, 500],
+    "covariate_epochs": 500,
+    "n_reruns": 100,
+    "sgd_batch_size": 128,
+    "lr": 0.001,
+    "decoder": "nn",
+    "seed": 42,
+    "device": "cuda"
+  },
+  "output": {
+    "out_dir": "results/dlpfc_new",
+    "run_name": "layer3_gaussian_poisson_schedule"
+  }
+}

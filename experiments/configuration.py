@@ -1,27 +1,39 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Mapping
 
 import numpy as np
 
+from analysis.cosmx_region_context import (
+    save_cosmx_region_context_plot,
+    _is_cosmx_subset_config,
+    _LEGACY_RUN_RE,
+)
 from analysis.plots import (
+    save_block_permutation_overlay,
     save_celltype_dataset_plot,
-    save_celltype_expression_plot,
+    save_combined_celltype_residual_ratio_outputs,
     save_combined_celltype_isodepth_grid,
     save_combined_celltype_metric_distribution,
+    save_cross_validation_fold_isodepth_grid,
+    save_cross_validation_per_fold_metric_distributions,
     save_dataset_triptych,
     save_gene_expression_vs_coordinates_comparison,
     save_gene_expression_vs_isodepth_plot,
     save_isodepth_triptych,
     save_metric_distribution_plot,
     save_perturbation_delta_pvalue_plot,
+    save_synthetic_kernel_plot,
     save_synthetic_true_curve_plot,
     save_subset_fraction_pvalue_plot,
     save_true_rerun_isodepth_grid,
 )
 from data.schemas import DatasetBundle, RunConfig, TestResult, run_config_from_mapping
+from data import raw_coordinates_from_standardized
+from data.transforms import celltype_expression_residuals
 from methods.metrics import summarize_metric_distribution
 
 
@@ -32,26 +44,56 @@ def load_json_config(path: str | None) -> dict[str, Any]:
         return json.load(f)
 
 
+def _repo_root_from_config_path(config_path: str) -> Path:
+    """Return the repo root for a config file under ``configs/`` (any nesting depth)."""
+    config_dir = Path(config_path).resolve().parent
+    for ancestor in [config_dir, *config_dir.parents]:
+        if ancestor.name == "configs":
+            return ancestor.parent
+    return config_dir.parent
+
+
+def _resolve_relative_path(config_path: str, rel_path: str) -> str:
+    """Resolve a config-relative path to an absolute path.
+
+    - ``../`` or ``./`` paths are resolved from the config file's directory
+      (supports arbitrary nesting depth under ``configs/``).
+    - Bare paths (e.g. ``data/h5ad/...``) are resolved from the repo root.
+    """
+    if not rel_path or Path(rel_path).is_absolute():
+        return rel_path
+    config_dir = Path(config_path).resolve().parent
+    if rel_path.startswith("../") or rel_path.startswith("./"):
+        return str((config_dir / rel_path).resolve())
+    repo_root = _repo_root_from_config_path(config_path)
+    return str((repo_root / rel_path).resolve())
+
+
 def _resolve_config_relative_paths(config: dict[str, Any], config_path: str | None) -> dict[str, Any]:
     if not config_path:
         return config
 
-    base_dir = Path(config_path).resolve().parent.parent
     data_cfg = config.get("data")
     if isinstance(data_cfg, Mapping):
         h5ad_path = data_cfg.get("h5ad")
-        if isinstance(h5ad_path, str) and h5ad_path and not Path(h5ad_path).is_absolute():
+        if isinstance(h5ad_path, str) and h5ad_path:
             data_cfg = dict(data_cfg)
-            data_cfg["h5ad"] = str((base_dir / h5ad_path).resolve())
+            data_cfg["h5ad"] = _resolve_relative_path(config_path, h5ad_path)
+            config = dict(config)
+            config["data"] = data_cfg
+        obs_indices = data_cfg.get("obs_indices") if isinstance(data_cfg, Mapping) else None
+        if isinstance(obs_indices, str) and obs_indices:
+            data_cfg = dict(config.get("data", data_cfg))
+            data_cfg["obs_indices"] = _resolve_relative_path(config_path, obs_indices)
             config = dict(config)
             config["data"] = data_cfg
 
     output_cfg = config.get("output")
     if isinstance(output_cfg, Mapping):
         out_dir = output_cfg.get("out_dir")
-        if isinstance(out_dir, str) and out_dir and not Path(out_dir).is_absolute():
+        if isinstance(out_dir, str) and out_dir:
             output_cfg = dict(output_cfg)
-            output_cfg["out_dir"] = str((base_dir / out_dir).resolve())
+            output_cfg["out_dir"] = _resolve_relative_path(config_path, out_dir)
             config = dict(config)
             config["output"] = output_cfg
 
@@ -163,6 +205,9 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
             "cell_type",
             "cell_type_key",
             "min_cells_per_celltype",
+            "obs_filters",
+            "obs_indices",
+            "obs_drop_na",
         }
     if data.get("mode") == "fourier":
         data_keys |= {"k_min", "k_max"}
@@ -170,6 +215,9 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
         data_keys.add("dependent_xy")
         data_keys.add("shape")
         data_keys.add("sampling_bias")
+        data_keys.add("expression_distribution")
+        if data.get("expression_distribution") == "poisson":
+            data_keys.add("mean_count")
     if data.get("mode") == "noise":
         data_keys.add("side_length")
 
@@ -189,9 +237,13 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
         "sgd_cosine_lr_decay",
         "sgd_cosine_eta_min",
         "sgd_cosine_t_max_steps",
+        "alpha",
+        "recursive",
+        "max_gradients",
     }
     if method in {
         "parallel_permutation",
+        "block_permutation",
         "cross_validation",
         "full_retraining",
         "comparison_perturbation_test",
@@ -200,8 +252,14 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
         "subsampling_test",
     }:
         test_keys.add("n_perms")
+    if method == "block_permutation":
+        test_keys |= {
+            "block_radius",
+            "coordinate_um_per_unit",
+            "block_jitter",
+        }
     if method == "cross_validation":
-        test_keys.add("train_fraction")
+        test_keys.add("n_folds")
     if method in {"comparison_perturbation_test", "perturbation_test"}:
         test_keys |= {"n_nulls", "batch_size", "delta", "perturb_target"}
     elif method in {"comparison_subsampling_test", "subsampling_test"}:
@@ -233,6 +291,7 @@ def _method_artifact_keys(method_name: str) -> set[str]:
     }
     if method_name in {
         "parallel_permutation",
+        "block_permutation",
         "cross_validation",
         "full_retraining",
         "subsampling_test",
@@ -252,12 +311,19 @@ def _method_artifact_keys(method_name: str) -> set[str]:
             extra |= {
                 "train_mask",
                 "test_mask",
-                "train_fraction",
-                "test_fraction",
+                "n_folds",
+                "fold_test_sizes",
+                "fold_weights",
+                "per_fold_true_loss",
+                "per_fold_perm_loss",
+                "per_fold_p_values",
+                "per_fold_true_isodepth",
                 "train_size",
                 "test_size",
                 "observed_test_loss",
             }
+        if method_name == "block_permutation":
+            extra.add("block_stats")
         return shared | extra
     if method_name == "perturbation_test":
         return shared | {
@@ -331,6 +397,9 @@ def _save_single_type_outputs(
             "model": type_data.get("model"),
             "pred_true": type_data.get("pred_true"),
             "true_isodepth": type_data.get("true_isodepth"),
+            "true_isodepth_covariate": type_data.get("true_isodepth_covariate"),
+            "stat_covariate": type_data.get("stat_covariate"),
+            "p_value_covariate": type_data.get("p_value_covariate"),
             "rerun_summary": type_data.get("rerun_summary", {}),
             "true_rerun_index": type_data.get("true_rerun_index", 0),
             "true_train_loss": type_data.get("true_train_loss", 0.0),
@@ -352,10 +421,6 @@ def _save_single_type_outputs(
     type_dir.mkdir(parents=True, exist_ok=True)
     paths: dict[str, str] = {}
 
-    p = save_dataset_triptych(subset_dataset, subset_result, type_dir / f"{type_name}_dataset.png")
-    if p is not None:
-        paths["dataset_triptych_plot"] = str(p)
-
     p = save_isodepth_triptych(subset_dataset, subset_result, type_dir / f"{type_name}_isodepth.png")
     if p is not None:
         paths["isodepth_triptych_plot"] = str(p)
@@ -363,19 +428,42 @@ def _save_single_type_outputs(
     p_dist = save_metric_distribution_plot(subset_result, type_dir / f"{type_name}_metric_distribution.png")
     paths["metric_distribution_plot"] = str(p_dist)
 
-    # Save per-type isodepth arrays to NPZ for offline regeneration.
+    if type_data.get("per_fold_true_isodepth") is not None:
+        fold_isodepths = np.asarray(type_data["per_fold_true_isodepth"], dtype=np.float32)
+        p_fold_iso = save_cross_validation_fold_isodepth_grid(
+            subset_dataset,
+            [np.asarray(row, dtype=np.float32) for row in fold_isodepths],
+            type_dir / f"{type_name}_cv_fold_isodepths.png",
+            fold_test_sizes=np.asarray(type_data.get("fold_test_sizes", []), dtype=np.int64),
+        )
+        if p_fold_iso is not None:
+            paths["cross_validation_fold_isodepth_grid_plot"] = str(p_fold_iso)
+
+        cv_subset_result = TestResult(
+            method_name="cross_validation",
+            metric=metric,
+            p_value=float(type_data["p_value"]),
+            stat_true=float(type_data["stat_true"]),
+            stat_perm=np.asarray(type_data["stat_perm"], dtype=np.float64),
+            runtime_sec=0.0,
+            n_cells=int(S_c.shape[0]),
+            n_genes=int(A_c.shape[1]),
+            config={},
+            artifacts={
+                "per_fold_true_loss": type_data.get("per_fold_true_loss"),
+                "per_fold_perm_loss": type_data.get("per_fold_perm_loss"),
+                "per_fold_p_values": type_data.get("per_fold_p_values"),
+            },
+        ).validate()
+        p_fold_dist = save_cross_validation_per_fold_metric_distributions(
+            cv_subset_result,
+            type_dir / f"{type_name}_cv_per_fold_metric_distributions.png",
+        )
+        if p_fold_dist is not None:
+            paths["cross_validation_per_fold_metric_distribution_plot"] = str(p_fold_dist)
+
     iso_raw = type_data.get("true_isodepth")
     cov_raw = type_data.get("true_isodepth_covariate")
-    if iso_raw is not None:
-        save_dict: dict[str, Any] = {
-            "true_isodepth": np.asarray(iso_raw, dtype=np.float32),
-            "A": np.asarray(type_data["A"], dtype=np.float32),
-        }
-        if cov_raw is not None:
-            save_dict["true_isodepth_covariate"] = np.asarray(cov_raw, dtype=np.float32)
-        npz_path = type_dir / f"{type_name}_isodepths.npz"
-        np.savez_compressed(npz_path, **save_dict)
-        paths["isodepths_npz"] = str(npz_path)
 
     # Gene expression vs isodepth/covariate summary plot (quantile bins).
     if iso_raw is not None:
@@ -404,6 +492,28 @@ def _save_single_type_outputs(
             decoder_df=decoder_df,
         )
 
+    iso_raw = type_data.get("true_isodepth")
+    if iso_raw is not None:
+        npz_path = type_dir / f"{type_name}_isodepths.npz"
+        npz_payload: dict[str, np.ndarray] = {
+            "true_isodepth": np.asarray(iso_raw, dtype=np.float32).reshape(-1),
+            "A": A_c,
+            "S": S_c,
+        }
+        pred_true = type_data.get("pred_true")
+        if pred_true is not None:
+            npz_payload["pred_true"] = np.asarray(pred_true, dtype=np.float32)
+        cov_raw = type_data.get("true_isodepth_covariate")
+        if cov_raw is not None:
+            npz_payload["true_isodepth_covariate"] = np.asarray(
+                cov_raw, dtype=np.float32
+            ).reshape(-1)
+        pred_cov = type_data.get("pred_true_covariate")
+        if pred_cov is not None:
+            npz_payload["pred_true_covariate"] = np.asarray(pred_cov, dtype=np.float32)
+        np.savez(npz_path, **npz_payload)
+        paths["isodepths_npz"] = str(npz_path)
+
     model_c = type_data.get("model")
     training_metadata = getattr(model_c, "training_metadata", None)
     if isinstance(training_metadata, Mapping):
@@ -429,6 +539,21 @@ def _save_single_type_outputs(
                 paths["true_rerun_isodepth_grid_plot"] = str(p_rerun)
 
     return paths
+
+
+def _dataset_for_gene_expression_plots(dataset: DatasetBundle) -> DatasetBundle:
+    """Use cell-type residuals for together-mode gene-expression summary plots."""
+    if dataset.meta.get("cell_type_mode") != "together":
+        return dataset
+    cell_type_labels = dataset.meta.get("cell_type_labels")
+    if cell_type_labels is None:
+        return dataset
+    residuals = celltype_expression_residuals(
+        dataset.A,
+        np.asarray(cell_type_labels, dtype=np.int64),
+        n_cell_types=int(dataset.meta.get("n_cell_types", 0)),
+    )
+    return replace(dataset, A=residuals)
 
 
 def _save_gene_expression_summary_plots(
@@ -458,6 +583,7 @@ def _save_gene_expression_summary_plots(
     iso_raw = result.artifacts.get("true_isodepth")
     if iso_raw is None:
         return
+    plot_dataset = _dataset_for_gene_expression_plots(dataset)
     iso = np.asarray(iso_raw, dtype=np.float64).reshape(-1)
 
     pred_iso_raw = result.artifacts.get("pred_true")
@@ -471,7 +597,7 @@ def _save_gene_expression_summary_plots(
         cov = np.asarray(cov_raw, dtype=np.float64).reshape(-1)
         try:
             p = save_gene_expression_vs_coordinates_comparison(
-                dataset, iso, cov,
+                plot_dataset, iso, cov,
                 out_dir / f"{run_name}_gene_expression_vs_coordinates.png",
                 isodepth_label=isodepth_label,
                 covariate_label=cov_lbl,
@@ -480,18 +606,30 @@ def _save_gene_expression_summary_plots(
                 decoder_df=decoder_df,
             )
             artifact_paths["gene_expression_plot"] = str(p)
+            stem = p.parent / p.stem
+            companion_artifacts = {
+                "gene_expression_correlation_distribution_plot": Path(f"{stem}_correlation_distribution.png"),
+                "gene_expression_residual_ratio_distribution_plot": Path(f"{stem}_residual_ratio_distribution.png"),
+                "gene_expression_residual_ratio_rankings_csv": Path(f"{stem}_residual_ratio_rankings.csv"),
+            }
+            for key, path in companion_artifacts.items():
+                if path.exists():
+                    artifact_paths[key] = str(path)
         except Exception:
             pass
     else:
         try:
             p = save_gene_expression_vs_isodepth_plot(
-                dataset, iso,
+                plot_dataset, iso,
                 out_dir / f"{run_name}_gene_expression_vs_isodepth.png",
                 coord_label=isodepth_label,
                 decoder_preds=pred_iso,
                 decoder_df=decoder_df,
             )
             artifact_paths["gene_expression_plot"] = str(p)
+            corr_path = p.parent / f"{p.stem}_correlation_distribution.png"
+            if corr_path.exists():
+                artifact_paths["gene_expression_correlation_distribution_plot"] = str(corr_path)
         except Exception:
             pass
 
@@ -546,12 +684,31 @@ def save_standardized_outputs(
     if dataset_triptych_path is not None:
         artifact_paths["dataset_triptych_plot"] = str(dataset_triptych_path)
 
+    if _is_cosmx_subset_config(run_config.data) or _LEGACY_RUN_RE.match(run_config.output.run_name):
+        try:
+            region_context_path = save_cosmx_region_context_plot(
+                run_config.data,
+                out_dir / f"{run_config.output.run_name}_region_context.png",
+                run_name=run_config.output.run_name,
+            )
+            artifact_paths["region_context_plot"] = str(region_context_path)
+        except Exception as exc:
+            import warnings
+            warnings.warn(f"Could not save CosMx region context plot: {exc}")
+
     synthetic_true_curve_path = save_synthetic_true_curve_plot(
         dataset,
         out_dir / f"{run_config.output.run_name}_true_curve.png",
     )
     if synthetic_true_curve_path is not None:
         artifact_paths["synthetic_true_curve_plot"] = str(synthetic_true_curve_path)
+
+    synthetic_kernel_path = save_synthetic_kernel_plot(
+        dataset,
+        out_dir / f"{run_config.output.run_name}_kernel_diagnostics.png",
+    )
+    if synthetic_kernel_path is not None:
+        artifact_paths["synthetic_kernel_plot"] = str(synthetic_kernel_path)
 
     isodepth_plot_path = save_isodepth_triptych(
         dataset,
@@ -566,6 +723,43 @@ def save_standardized_outputs(
         out_dir / f"{run_config.output.run_name}_metric_distribution.png",
     )
     artifact_paths["metric_distribution_plot"] = str(distribution_plot_path)
+
+    if result.method_name == "block_permutation":
+        S_true_raw = raw_coordinates_from_standardized(dataset.S, dataset.meta)
+        block_overlay_path = save_block_permutation_overlay(
+            S_true_raw,
+            result.artifacts.get("s_permuted_slot1_raw"),
+            result.artifacts.get("block_ids_true"),
+            out_dir / f"{run_config.output.run_name}_block_permutation_overlay.png",
+            run_name=run_config.output.run_name,
+            radius_units=result.artifacts.get("block_radius_units"),
+        )
+        if block_overlay_path is not None:
+            artifact_paths["block_permutation_overlay_plot"] = str(block_overlay_path)
+
+    if result.method_name == "cross_validation":
+        fold_isodepths = result.artifacts.get("per_fold_true_isodepth")
+        if fold_isodepths is not None:
+            fold_grid_path = save_cross_validation_fold_isodepth_grid(
+                dataset,
+                [np.asarray(row, dtype=np.float32) for row in np.asarray(fold_isodepths)],
+                out_dir / f"{run_config.output.run_name}_cv_fold_isodepths.png",
+                fold_test_sizes=np.asarray(
+                    result.artifacts.get("fold_test_sizes", []),
+                    dtype=np.int64,
+                ),
+            )
+            if fold_grid_path is not None:
+                artifact_paths["cross_validation_fold_isodepth_grid_plot"] = str(fold_grid_path)
+
+        per_fold_dist_path = save_cross_validation_per_fold_metric_distributions(
+            result,
+            out_dir / f"{run_config.output.run_name}_cv_per_fold_metric_distributions.png",
+        )
+        if per_fold_dist_path is not None:
+            artifact_paths["cross_validation_per_fold_metric_distribution_plot"] = str(
+                per_fold_dist_path
+            )
 
     _save_gene_expression_summary_plots(
         dataset, result, run_config.output.run_name, out_dir, artifact_paths,
@@ -593,14 +787,6 @@ def save_standardized_outputs(
     )
     if celltype_plot_path is not None:
         artifact_paths["celltype_dataset_plot"] = str(celltype_plot_path)
-
-    celltype_expr_plot_path = save_celltype_expression_plot(
-        dataset,
-        result,
-        out_dir / f"{run_config.output.run_name}_celltype_expression.png",
-    )
-    if celltype_expr_plot_path is not None:
-        artifact_paths["celltype_expression_plot"] = str(celltype_expr_plot_path)
 
     model = result.artifacts.get("model")
     training_metadata = getattr(model, "training_metadata", None)
@@ -667,11 +853,7 @@ def _save_separate_celltype_outputs(
     per_type_summaries: dict[str, dict[str, Any]] = {}
     per_type_artifact_paths: dict[str, dict[str, str]] = {}
 
-    # For cell-type separate mode the latent is always 1D, so an F-test with
-    # df_model=1 is always well-defined regardless of decoder architecture.
-    # This produces per-cell-type sig-gene CSVs for both isodepth and covariate
-    # decoders whenever their predictions are available in type_data.
-    _ct_decoder_df = 1
+    _ct_decoder_df = _decoder_df_from_config(getattr(run_config.test, "decoder", None))
 
     for type_name in cell_type_names:
         type_data = per_type_results[type_name]
@@ -684,7 +866,7 @@ def _save_separate_celltype_outputs(
             decoder_df=_ct_decoder_df,
         )
         per_type_artifact_paths[type_name] = type_artifact_paths
-        per_type_summaries[type_name] = {
+        type_summary: dict[str, Any] = {
             "p_value": float(type_data["p_value"]),
             "stat_true": float(type_data["stat_true"]),
             "stat_perm": [float(x) for x in np.asarray(type_data["stat_perm"]).tolist()],
@@ -692,6 +874,11 @@ def _save_separate_celltype_outputs(
             "perm_summary": summarize_metric_distribution(type_data["stat_perm"]),
             "artifact_paths": type_artifact_paths,
         }
+        if type_data.get("stat_covariate") is not None:
+            type_summary["stat_covariate"] = float(type_data["stat_covariate"])
+        if type_data.get("p_value_covariate") is not None:
+            type_summary["p_value_covariate"] = float(type_data["p_value_covariate"])
+        per_type_summaries[type_name] = type_summary
 
     combined_dist_path = save_combined_celltype_metric_distribution(
         per_type_results,
@@ -707,6 +894,21 @@ def _save_separate_celltype_outputs(
         full_spatial=dataset.S,
     )
 
+    var_names = dataset.meta.get("var_names")
+    gene_names = (
+        [str(var_names[i]) for i in range(dataset.n_genes)]
+        if var_names is not None else [f"gene_{i}" for i in range(dataset.n_genes)]
+    )
+    combined_residual_csv_path, combined_residual_plot_path = save_combined_celltype_residual_ratio_outputs(
+        per_type_results,
+        cell_type_names,
+        gene_names,
+        out_dir / f"{run_config.output.run_name}_piecewise_residual_ratio_rankings.csv",
+        out_dir / f"{run_config.output.run_name}_piecewise_residual_ratio_distribution.png",
+        coord_label="Isodepth",
+        covariate_label=_resolve_covariate_label(run_config),
+    )
+
     top_level_artifacts: dict[str, Any] = {
         "cell_type_mode": "separate",
         "cell_type_names": cell_type_names,
@@ -718,6 +920,10 @@ def _save_separate_celltype_outputs(
     }
     if celltype_overview_path is not None:
         top_level_artifacts["celltype_dataset_plot"] = str(celltype_overview_path)
+    if combined_residual_csv_path is not None:
+        top_level_artifacts["piecewise_residual_ratio_rankings_csv"] = str(combined_residual_csv_path)
+    if combined_residual_plot_path is not None:
+        top_level_artifacts["piecewise_residual_ratio_distribution_plot"] = str(combined_residual_plot_path)
 
     payload = result.to_json_dict(
         config=_compact_run_config(run_config),

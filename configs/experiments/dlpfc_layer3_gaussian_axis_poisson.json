@@ -1,0 +1,50 @@
+{
+  "experiment_name": "dlpfc_layer3_gaussian_axis_poisson",
+  "description": "Phase-1 check: Poisson existence test on DLPFC Layer 3 with frozen Gaussian isodepth as covariate.",
+  "data": {
+    "parent_h5ad": "data/h5ad/dlpfc_new/spatialDLPFC_Visium.h5ad",
+    "prepared_h5ad": "data/h5ad/dlpfc_new/layer3_br6522_ant_1000hvg_gaussian_isodepth.h5ad",
+    "obs_filters": {"sample_id": "Br6522_ant"},
+    "obs_drop_na": ["manual_layer_label"],
+    "layer_label": "Layer 3",
+    "layer_obs_key": "manual_layer_label",
+    "top_var_genes": 1000,
+    "covariate_obs_key": "gaussian_isodepth"
+  },
+  "artifacts": {
+    "gaussian_isodepth_npz": "results/dlpfc_new/gaussian_BR6522_ant_1000_genes/Layer_3/Layer_3_isodepths.npz",
+    "poisson_isodepth_npz": "results/dlpfc_new/poisson_1000_genes/Layer_3/Layer_3_isodepths.npz"
+  },
+  "baselines": {
+    "gaussian_layer3_result": "results/dlpfc_new/gaussian_BR6522_ant_1000_genes/gaussian_BR6522_ant_1000_genes_result.json",
+    "poisson_layer3_result": "results/dlpfc_new/poisson_1000_genes/poisson_1000_genes_result.json",
+    "layer_key": "Layer 3"
+  },
+  "preprocessing": {
+    "min_cells_per_gene": 3,
+    "normalize_total": false,
+    "log1p": false,
+    "standardize_expression": false,
+    "standardize_coordinates": true
+  },
+  "test": {
+    "method": "parallel_permutation",
+    "metric": "nll_poisson_mse",
+    "covariate": "gaussian_isodepth",
+    "n_perms": 999,
+    "epochs": 500,
+    "n_reruns": 10,
+    "sgd_batch_size": 128,
+    "lr": 0.001,
+    "seed": 42,
+    "device": "cuda",
+    "decoder": "nn",
+    "verbose": true
+  },
+  "output": {
+    "out_dir": "results/dlpfc_new",
+    "run_name": "layer3_poisson_gaussian_covariate",
+    "run_config": "configs/dlpfc_new/dlpfc_layer3_poisson_gaussian_covariate.json",
+    "save_per_unit_outputs": true
+  }
+}

@@ -23,8 +23,18 @@ class TestDataSchema(unittest.TestCase):
         config = DataConfig(source="h5ad", h5ad="data/example.h5ad", q=2)
         self.assertIs(config.validate(), config)
 
-    def test_log1p_is_valid_for_h5ad(self) -> None:
-        config = DataConfig(source="h5ad", h5ad="data/example.h5ad", log1p=True)
+    def test_obs_drop_na_must_be_non_empty_list(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(source="h5ad", h5ad="data/example.h5ad", obs_drop_na=[]).validate()
+        with self.assertRaises(ValueError):
+            DataConfig(source="h5ad", h5ad="data/example.h5ad", obs_drop_na=[""]).validate()
+
+    def test_obs_drop_na_accepts_column_names(self) -> None:
+        config = DataConfig(
+            source="h5ad",
+            h5ad="data/example.h5ad",
+            obs_drop_na=["manual_layer_label"],
+        )
         self.assertIs(config.validate(), config)
 
     def test_log1p_cannot_be_combined_with_q(self) -> None:
@@ -38,6 +48,35 @@ class TestDataSchema(unittest.TestCase):
     def test_q_is_rejected_for_synthetic(self) -> None:
         with self.assertRaises(ValueError):
             DataConfig(source="synthetic", n_cells=8, n_genes=3, q=2).validate()
+
+    def test_expression_distribution_is_rejected_for_h5ad(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="h5ad",
+                h5ad="data/example.h5ad",
+                expression_distribution="poisson",
+            ).validate()
+
+    def test_poisson_expression_distribution_is_valid_for_synthetic(self) -> None:
+        config = DataConfig(
+            source="synthetic",
+            mode="radial",
+            n_cells=16,
+            n_genes=3,
+            expression_distribution="poisson",
+            mean_count=10.0,
+        )
+        self.assertIs(config.validate(), config)
+
+    def test_non_positive_mean_count_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="synthetic",
+                n_cells=16,
+                n_genes=3,
+                expression_distribution="poisson",
+                mean_count=0.0,
+            ).validate()
 
     def test_fourier_mode_accepts_frequency_bounds(self) -> None:
         config = DataConfig(source="synthetic", mode="fourier", n_cells=16, n_genes=3, k_min=2, k_max=4)

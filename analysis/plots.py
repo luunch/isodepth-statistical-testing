@@ -8,7 +8,9 @@ from typing import Any
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 from matplotlib import colors as mcolors
+from matplotlib.collections import PolyCollection
 import numpy as np
+from scipy.ndimage import uniform_filter1d
 from scipy.stats import f as _f_dist
 from scipy.stats import gaussian_kde, linregress, spearmanr
 
@@ -688,74 +690,6 @@ def save_celltype_dataset_plot(
     return out_path
 
 
-def save_celltype_expression_plot(
-    dataset: DatasetBundle,
-    result: TestResult,
-    out_path: str | Path,
-) -> Path | None:
-    """Scatter plot of cells colored by mean predicted expression, labeled by cell type."""
-    cell_type_labels = dataset.meta.get("cell_type_labels")
-    cell_type_names = dataset.meta.get("cell_type_names")
-    pred_true = result.artifacts.get("pred_true")
-    if cell_type_labels is None or cell_type_names is None or pred_true is None:
-        return None
-
-    labels = np.asarray(cell_type_labels, dtype=np.int64)
-    S = np.asarray(dataset.S, dtype=np.float32)
-    preds = np.asarray(pred_true, dtype=np.float32)
-    signal = np.mean(np.abs(preds), axis=1)
-
-    n_types = len(cell_type_names)
-    cmap_cat = plt.cm.get_cmap("tab20" if n_types > 10 else "tab10")
-
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-
-    scatter = axes[0].scatter(
-        S[:, 0], S[:, 1],
-        c=signal,
-        cmap="Reds",
-        s=_point_size(S),
-        linewidths=0,
-        alpha=0.8,
-    )
-    axes[0].set_title("Predicted Expression (mean |pred|)")
-    axes[0].set_xlabel("x")
-    axes[0].set_ylabel("y")
-    axes[0].set_aspect("equal")
-    plt.colorbar(scatter, ax=axes[0], fraction=0.046, pad=0.04)
-
-    for c in range(n_types):
-        mask = labels == c
-        if not np.any(mask):
-            continue
-        axes[1].scatter(
-            S[mask, 0],
-            S[mask, 1],
-            c=[cmap_cat(c / max(n_types - 1, 1))],
-            s=_point_size(S),
-            label=cell_type_names[c],
-            alpha=0.7,
-            linewidths=0,
-        )
-    axes[1].set_title("Cell Types")
-    axes[1].set_xlabel("x")
-    axes[1].set_ylabel("y")
-    axes[1].set_aspect("equal")
-    axes[1].legend(
-        loc="center left",
-        bbox_to_anchor=(1.0, 0.5),
-        fontsize="x-small",
-        markerscale=2.0,
-        frameon=False,
-    )
-
-    fig.tight_layout()
-    out_path = Path(out_path)
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return out_path
-
-
 def save_synthetic_true_curve_plot(
     dataset: DatasetBundle,
     out_path: str | Path,
@@ -798,6 +732,109 @@ def save_synthetic_true_curve_plot(
     fig.tight_layout()
     out_path = Path(out_path)
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_synthetic_kernel_plot(
+    dataset: DatasetBundle,
+    out_path: "str | Path",
+) -> "Path | None":
+    """Two-panel diagnostic for the spatial autocorrelation kernel.
+
+    Panel 1 — Correlation curve: ``corr(r) = δ·exp(-r/p) / (1+δ)`` vs. r (µm).
+    Panel 2 — Spatial noise draw: one gene's draw from N(0, σ²·C) on the tissue grid.
+
+    Returns the saved path or None if the dataset has no kernel metadata.
+    """
+    if dataset.meta.get("source") != "synthetic":
+        return None
+    kernel_meta = dataset.meta.get("kernel")
+    if kernel_meta is None:
+        return None
+    delta = float(dataset.meta.get("delta", 0.0))
+    scale_um = float(dataset.meta.get("scale_um", 1.0))
+    p = float(kernel_meta["distance"])
+    r_max_explicit = kernel_meta.get("max_interaction_distance")
+    r_max = float(r_max_explicit) if r_max_explicit is not None else 4.0 * p
+    local_fraction = delta / (1.0 + delta)
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+
+    # ── Panel 1: correlation curve ────────────────────────────────────────
+    ax = axes[0]
+    r = np.linspace(0.0, r_max * 1.05, 400)
+    corr = delta * np.exp(-r / p) / (1.0 + delta)
+    ax.plot(r, corr, color="steelblue", lw=2, label=r"$\delta \cdot e^{-r/p}\,/\,(1+\delta)$")
+    ax.axvline(p, color="gray", lw=1.2, ls="--", label=f"$p$ = {p:g} µm")
+    if r_max_explicit is not None:
+        ax.axvline(r_max, color="tomato", lw=1.2, ls="--", label=f"cutoff = {r_max:g} µm")
+    ax.axhline(local_fraction, color="steelblue", lw=0.8, ls=":", alpha=0.6)
+    ax.annotate(
+        f"local fraction\n$\\delta/(1+\\delta)$ = {local_fraction:.2f}",
+        xy=(0, local_fraction),
+        xytext=(r_max * 0.3, local_fraction + 0.04),
+        fontsize=8,
+        color="steelblue",
+    )
+    ax.set_xlabel("Distance (µm)")
+    ax.set_ylabel("Spatial correlation")
+    ax.set_title(f"Kernel: exp, p={p:g} µm, δ={delta:g}")
+    ax.set_ylim(bottom=0)
+    ax.legend(fontsize=8)
+
+    # ── Panel 2: single noise draw on tissue grid ─────────────────────────
+    ax2 = axes[1]
+    noise_sample = dataset.meta.get("kernel_noise_sample")
+    S = np.asarray(dataset.S, dtype=np.float32)
+    if noise_sample is not None:
+        noise = np.asarray(noise_sample, dtype=np.float32)
+        gh = int(dataset.meta.get("grid_height", 0) or 0)
+        gw = int(dataset.meta.get("grid_width", 0) or 0)
+        if gh > 0 and gw > 0 and gh * gw == len(noise):
+            grid = noise.reshape(gh, gw)
+            vmax = float(np.abs(grid).max()) or 1.0
+            im = ax2.imshow(
+                grid,
+                cmap="RdBu_r",
+                vmin=-vmax,
+                vmax=vmax,
+                origin="lower",
+                extent=[0, scale_um, 0, scale_um * gh / gw],
+            )
+            plt.colorbar(im, ax=ax2, shrink=0.8)
+            # circle of radius p at tissue centre
+            cx = scale_um * 0.5
+            cy = scale_um * gh / gw * 0.5
+            circle = plt.Circle((cx, cy), p, fill=False, color="white", lw=1.5, ls="--")
+            ax2.add_patch(circle)
+            ax2.set_xlabel("x (µm)")
+            ax2.set_ylabel("y (µm)")
+        else:
+            sc = ax2.scatter(
+                S[:, 0] * scale_um,
+                S[:, 1] * scale_um,
+                c=noise,
+                cmap="RdBu_r",
+                s=6,
+                vmin=-float(np.abs(noise).max()),
+                vmax=float(np.abs(noise).max()),
+            )
+            plt.colorbar(sc, ax=ax2, shrink=0.8)
+            ax2.set_xlabel("x (µm)")
+            ax2.set_ylabel("y (µm)")
+    else:
+        ax2.text(0.5, 0.5, "noise sample not available", ha="center", va="center",
+                 transform=ax2.transAxes, color="gray")
+    ax2.set_title(f"Sample correlated noise (1 gene, σ={dataset.meta.get('sigma', '?'):g})")
+
+    fig.suptitle(
+        f"Spatial kernel diagnostics — δ={delta:g}, local fraction={local_fraction:.2f}",
+        fontsize=11,
+    )
+    fig.tight_layout()
+    out_path = Path(out_path)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return out_path
 
@@ -1219,6 +1256,118 @@ def save_metric_distribution_plot(result: TestResult, out_path: str | Path) -> P
     return out_path
 
 
+def save_cross_validation_fold_isodepth_grid(
+    dataset: DatasetBundle,
+    fold_isodepths: list[np.ndarray],
+    out_path: str | Path,
+    *,
+    fold_test_sizes: np.ndarray | None = None,
+) -> Path | None:
+    """Spatial grid of true-model isodepths, one panel per CV fold."""
+    if not fold_isodepths:
+        return None
+
+    panels = [np.asarray(depth, dtype=np.float32).reshape(-1) for depth in fold_isodepths]
+    n_folds = len(panels)
+    if panels[0].shape[0] != dataset.n_cells:
+        raise ValueError(
+            f"fold isodepth length must match dataset.n_cells={dataset.n_cells}, "
+            f"got {panels[0].shape[0]}"
+        )
+
+    n_cols = min(n_folds, 3)
+    n_rows = int(np.ceil(n_folds / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.5 * n_cols, 4.8 * n_rows), squeeze=False)
+    spatial = np.asarray(dataset.S, dtype=np.float32)
+
+    stacked = np.concatenate(panels, axis=0)
+    vmin = float(np.min(stacked))
+    vmax = float(np.max(stacked))
+    normalize_bounds = (vmin, vmax) if vmax > vmin else None
+
+    for fold_index, depth in enumerate(panels):
+        title = f"Fold {fold_index + 1}"
+        if fold_test_sizes is not None and fold_index < fold_test_sizes.size:
+            title += f" (held-out n={int(fold_test_sizes[fold_index])})"
+        _plot_spatial_isodepth(
+            axes.flat[fold_index],
+            spatial,
+            depth,
+            title,
+            normalize_bounds=normalize_bounds,
+        )
+
+    for axis in axes.flat[n_folds:]:
+        axis.axis("off")
+
+    fig.suptitle("True-model isodepth by cross-validation fold", fontsize=12)
+    fig.tight_layout()
+    out_path = Path(out_path)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_cross_validation_per_fold_metric_distributions(
+    result: TestResult,
+    out_path: str | Path,
+) -> Path | None:
+    """Per-fold null histograms using fold-local permutation p-values."""
+    if result.method_name != "cross_validation":
+        return None
+
+    per_fold_true = result.artifacts.get("per_fold_true_loss")
+    per_fold_perm = result.artifacts.get("per_fold_perm_loss")
+    per_fold_p = result.artifacts.get("per_fold_p_values")
+    if per_fold_true is None or per_fold_perm is None:
+        return None
+
+    true_losses = np.asarray(per_fold_true, dtype=np.float64).reshape(-1)
+    perm_losses = np.asarray(per_fold_perm, dtype=np.float64)
+    if perm_losses.ndim != 2 or perm_losses.shape[0] != true_losses.size:
+        raise ValueError(
+            "per_fold_perm_loss must have shape (n_folds, n_perms) matching per_fold_true_loss"
+        )
+
+    p_values = (
+        np.asarray(per_fold_p, dtype=np.float64).reshape(-1)
+        if per_fold_p is not None
+        else np.full(true_losses.size, np.nan, dtype=np.float64)
+    )
+
+    n_folds = true_losses.size
+    fig, axes = plt.subplots(n_folds, 1, figsize=(6.4, 3.8 * n_folds), squeeze=False)
+    for fold_index, ax in enumerate(axes[:, 0]):
+        stat_perm = perm_losses[fold_index]
+        stat_true = float(true_losses[fold_index])
+        p_value = float(p_values[fold_index]) if np.isfinite(p_values[fold_index]) else float("nan")
+        ax.hist(
+            stat_perm,
+            bins=30,
+            color="lightsteelblue",
+            edgecolor="black",
+            label="Null (permutations)",
+        )
+        ax.axvline(
+            stat_true,
+            color="crimson",
+            linestyle="--",
+            linewidth=1.5,
+            label=f"Observed: {stat_true:.4g}",
+        )
+        ax.set_title(f"Fold {fold_index + 1}  |  p-value = {p_value:.4g}")
+        ax.set_xlabel(result.metric)
+        ax.set_ylabel("Count")
+        ax.legend(loc="upper right", framealpha=0.95, fontsize=8)
+
+    fig.suptitle("Per-fold null distributions (unweighted permutation tests)", fontsize=12)
+    fig.tight_layout()
+    out_path = Path(out_path)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
 def save_combined_celltype_metric_distribution(
     per_type_results: dict[str, dict],
     cell_type_names: list[str],
@@ -1243,12 +1392,26 @@ def save_combined_celltype_metric_distribution(
         stat_true = float(data["stat_true"])
         p_value = float(data["p_value"])
         n_cells = int(data["n_cells"])
+        stat_cov = data.get("stat_covariate")
+        p_cov = data.get("p_value_covariate")
+        has_cov_dual = stat_cov is not None and p_cov is not None
 
         ax.hist(stat_perm, bins=30, color="lightsteelblue", edgecolor="black",
                 label="Null (permutations)")
-        ax.axvline(stat_true, color="crimson", linestyle="--", linewidth=1.5,
-                   label=f"Observed: {stat_true:.4g}")
-        ax.set_title(f"{type_name} (n={n_cells})\np = {p_value:.4g}", fontsize=10)
+        if has_cov_dual:
+            ax.axvline(stat_true, color="crimson", linestyle="--", linewidth=1.5,
+                       label=f"Isodepth: {stat_true:.4g}")
+            ax.axvline(float(stat_cov), color="teal", linestyle="--", linewidth=1.5,
+                       label=f"Covariate: {float(stat_cov):.4g}")
+            ax.set_title(
+                f"{type_name} (n={n_cells})\n"
+                f"p = {p_value:.4g}  |  p (cov) = {float(p_cov):.4g}",
+                fontsize=10,
+            )
+        else:
+            ax.axvline(stat_true, color="crimson", linestyle="--", linewidth=1.5,
+                       label=f"Observed: {stat_true:.4g}")
+            ax.set_title(f"{type_name} (n={n_cells})\np = {p_value:.4g}", fontsize=10)
         ax.set_xlabel(metric, fontsize=9)
         ax.set_ylabel("Count", fontsize=9)
         ax.legend(fontsize=7, loc="upper right", framealpha=0.9)
@@ -1319,6 +1482,214 @@ def save_combined_celltype_isodepth_grid(
         axes[row][col].set_visible(False)
 
     fig.suptitle("Per-Cell-Type Learned Isodepths (True Data)", fontsize=13, y=1.01)
+    fig.tight_layout()
+    out_path = Path(out_path)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_region_isodepth_timeline(
+    stage_panels: list[dict[str, object]],
+    out_path: str | Path,
+    *,
+    region_name: str,
+    model_label: str | None = None,
+) -> Path | None:
+    """Spatial true-isodepth panels for one region across embryonic stages.
+
+    Each entry in ``stage_panels`` must provide ``S``, ``true_isodepth``,
+    ``stage_label``, ``n_cells``, and ``p_value``.
+    """
+    if not stage_panels:
+        return None
+
+    out_path = Path(out_path)
+    n_panels = len(stage_panels)
+    n_cols = min(n_panels, 4)
+    n_rows = int(np.ceil(n_panels / n_cols))
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(5.5 * n_cols, 4.8 * n_rows),
+        squeeze=False,
+    )
+
+    for idx, panel in enumerate(stage_panels):
+        row, col = divmod(idx, n_cols)
+        ax = axes[row][col]
+        S = np.asarray(panel["S"], dtype=np.float32)
+        true_isodepth = np.asarray(panel["true_isodepth"], dtype=np.float32)
+        stage_label = str(panel["stage_label"])
+        n_cells = int(panel["n_cells"])
+        p_value = float(panel["p_value"])
+        title = f"{stage_label}\nn = {n_cells:,}\np = {p_value:.4g}"
+        _plot_spatial_isodepth(
+            ax,
+            S,
+            true_isodepth,
+            title,
+            spatial_limits=_spatial_axis_limits(S),
+        )
+
+    for idx in range(n_panels, n_rows * n_cols):
+        row, col = divmod(idx, n_cols)
+        axes[row][col].set_visible(False)
+
+    title_parts = [f"{region_name}: isodepth over time"]
+    if model_label:
+        title_parts.append(f"({model_label})")
+    fig.suptitle(" ".join(title_parts), fontsize=13, y=1.01)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def _recursive_celltype_grid_shape(
+    per_type_recursive_results: dict[str, dict],
+    cell_type_names: list[str],
+) -> tuple[int, int]:
+    ncols = max(1, len(cell_type_names))
+    nrows = 1
+    for type_name in cell_type_names:
+        tested = per_type_recursive_results.get(type_name, {}).get("tested_gradients", [])
+        nrows = max(nrows, len(tested))
+    return nrows, ncols
+
+
+def _recursive_celltype_panel_title(type_name: str, entry: dict) -> str:
+    gradient_index = int(entry.get("gradient_index", 0))
+    p_value = float(entry.get("p_value", np.nan))
+    n_svgs = int(entry.get("n_svgs", 0))
+    if bool(entry.get("passed_permutation", False)):
+        status = f"{n_svgs} SVGs" if n_svgs > 0 else "no SVGs"
+    else:
+        status = "not significant"
+    return f"{type_name}\nGradient {gradient_index} | p = {p_value:.4g} | {status}"
+
+
+def save_recursive_celltype_isodepth_grid(
+    per_type_recursive_results: dict[str, dict],
+    cell_type_names: list[str],
+    out_path: str | Path,
+    *,
+    full_spatial: np.ndarray | None = None,
+) -> Path | None:
+    """Grid of recursive cell-type isodepths.
+
+    Columns are cell types/regions. Rows are tested recursive gradients,
+    including the terminal non-significant gradient when present.
+    """
+    if not cell_type_names:
+        return None
+
+    if full_spatial is not None:
+        tissue_limits = _spatial_axis_limits(full_spatial)
+    else:
+        all_coords: list[np.ndarray] = []
+        for type_name in cell_type_names:
+            for entry in per_type_recursive_results.get(type_name, {}).get("tested_gradients", []):
+                S_plot = entry.get("S_plot")
+                if S_plot is not None:
+                    all_coords.append(np.asarray(S_plot, dtype=np.float32))
+                    break
+        tissue_limits = _spatial_axis_limits(np.vstack(all_coords)) if all_coords else None
+
+    nrows, ncols = _recursive_celltype_grid_shape(per_type_recursive_results, cell_type_names)
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(5.2 * ncols, 4.4 * nrows),
+        squeeze=False,
+    )
+
+    for col, type_name in enumerate(cell_type_names):
+        tested = per_type_recursive_results.get(type_name, {}).get("tested_gradients", [])
+        for row in range(nrows):
+            ax = axes[row][col]
+            if row >= len(tested):
+                ax.set_visible(False)
+                continue
+            entry = tested[row]
+            S_plot = entry.get("S_plot")
+            iso = entry.get("true_isodepth")
+            if S_plot is None or iso is None:
+                ax.set_visible(False)
+                continue
+            _plot_spatial_isodepth(
+                ax,
+                np.asarray(S_plot, dtype=np.float32),
+                np.asarray(iso, dtype=np.float32),
+                _recursive_celltype_panel_title(type_name, entry),
+                spatial_limits=tissue_limits,
+            )
+            if col == 0:
+                ax.set_ylabel(f"Test {row + 1}", fontsize=10)
+
+    fig.suptitle("Recursive Cell-Type Isodepths", fontsize=13, y=1.01)
+    fig.tight_layout()
+    out_path = Path(out_path)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_recursive_celltype_metric_distribution_grid(
+    per_type_recursive_results: dict[str, dict],
+    cell_type_names: list[str],
+    out_path: str | Path,
+    *,
+    metric: str = "nll_gaussian_mse",
+) -> Path | None:
+    """Grid of recursive cell-type permutation null distributions."""
+    if not cell_type_names:
+        return None
+
+    nrows, ncols = _recursive_celltype_grid_shape(per_type_recursive_results, cell_type_names)
+    fig, axes = plt.subplots(
+        nrows,
+        ncols,
+        figsize=(5.2 * ncols, 4.0 * nrows),
+        squeeze=False,
+    )
+
+    for col, type_name in enumerate(cell_type_names):
+        tested = per_type_recursive_results.get(type_name, {}).get("tested_gradients", [])
+        for row in range(nrows):
+            ax = axes[row][col]
+            if row >= len(tested):
+                ax.set_visible(False)
+                continue
+            entry = tested[row]
+            stat_perm = np.asarray(entry.get("stat_perm", []), dtype=np.float64)
+            stat_true = float(entry.get("stat_true", np.nan))
+            if stat_perm.size == 0:
+                ax.set_visible(False)
+                continue
+            ax.hist(
+                stat_perm,
+                bins=30,
+                color="lightsteelblue",
+                edgecolor="black",
+                label="Null (permutations)",
+            )
+            ax.axvline(
+                stat_true,
+                color="crimson",
+                linestyle="--",
+                linewidth=1.5,
+                label=f"Observed: {stat_true:.4g}",
+            )
+            ax.set_title(_recursive_celltype_panel_title(type_name, entry), fontsize=9)
+            ax.set_xlabel(metric, fontsize=8)
+            ax.set_ylabel("Count", fontsize=8)
+            ax.legend(fontsize=7, loc="upper right", framealpha=0.9)
+            ax.tick_params(labelsize=8)
+            if col == 0:
+                ax.set_ylabel(f"Test {row + 1}\nCount", fontsize=9)
+
+    fig.suptitle("Recursive Cell-Type Null Distributions", fontsize=13, y=1.01)
     fig.tight_layout()
     out_path = Path(out_path)
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
@@ -1906,7 +2277,8 @@ def _ftest_decoder_pvalues(
 
     # Guard against degenerate genes (zero variance)
     safe_sse = np.where(sse > 0, sse, np.finfo(float).tiny)
-    f_stat = (ssr / df_model) / (safe_sse / df_error)
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        f_stat = (ssr / df_model) / (safe_sse / df_error)
     pvalues = 1.0 - _f_dist.cdf(f_stat, df_model, df_error)
     # Genes with zero total variance → p = 1
     pvalues = np.where(sst > 0, pvalues, 1.0)
@@ -1935,15 +2307,14 @@ def _save_sig_genes_csv(
     pvalues: np.ndarray,
     qvalues: np.ndarray,
     q_threshold: float = 0.05,
-) -> Path | None:
+) -> Path:
     """Write significant genes (q < q_threshold) to a CSV file.
 
     Columns: gene, p_value, q_value — sorted by p_value ascending.
-    Returns the path written, or None if no genes pass the threshold.
+    Always writes the file; if no genes pass the threshold the file contains
+    only the header row.  Returns the path written.
     """
     sig_mask = qvalues < q_threshold
-    if not sig_mask.any():
-        return None
     rows = sorted(
         [
             (gene_names[g], float(pvalues[g]), float(qvalues[g]))
@@ -1960,21 +2331,414 @@ def _save_sig_genes_csv(
     return out_path
 
 
+def compute_isodepth_sig_genes(
+    A: np.ndarray,
+    gene_names: list[str],
+    pred_isodepth: np.ndarray | None,
+    decoder_df: int,
+    coord: np.ndarray | None = None,
+    alpha: float = 0.05,
+) -> dict:
+    """Compute significant SVGs for an isodepth gradient via F-test + BH correction.
+
+    Parameters
+    ----------
+    A : (n_cells, G) observed expression matrix.
+    gene_names : length-G list of gene name strings.
+    pred_isodepth : (n_cells, G) decoder predictions, or None. When None,
+        ``coord`` must be provided and a polynomial of degree ``decoder_df``
+        is fit per gene to approximate the decoder.
+    decoder_df : degrees of freedom for the decoder (1=linear, 2=quadratic).
+    coord : (n_cells,) isodepth values; required only when pred_isodepth is None.
+    alpha : BH q-value threshold; genes with q < alpha are significant.
+
+    Returns
+    -------
+    dict with keys:
+        ``sig_indices``   : np.ndarray of significant gene indices into A columns
+        ``sig_names``     : list[str] of significant gene names
+        ``pvalues``       : (G,) raw F-test p-values for all genes
+        ``qvalues``       : (G,) BH q-values for all genes
+    """
+    A = np.asarray(A, dtype=np.float64)
+    G = A.shape[1]
+
+    if pred_isodepth is not None:
+        fitted = np.asarray(pred_isodepth, dtype=np.float64)
+    else:
+        if coord is None:
+            raise ValueError("coord must be provided when pred_isodepth is None")
+        c = np.asarray(coord, dtype=np.float64).reshape(-1)
+        fitted = np.stack(
+            [np.poly1d(np.polyfit(c, A[:, g], decoder_df))(c) for g in range(G)],
+            axis=1,
+        )
+
+    pvals = _ftest_decoder_pvalues(A, fitted, df_model=decoder_df)
+    qvals = _bh_qvalues(pvals)
+    sig_mask = qvals < alpha
+    sig_indices = np.flatnonzero(sig_mask)
+    sig_names = [gene_names[i] for i in sig_indices]
+    return {
+        "sig_indices": sig_indices,
+        "sig_names": sig_names,
+        "pvalues": pvals,
+        "qvalues": qvals,
+    }
+
+
 def _gene_spearman_rhos(A: np.ndarray, coord: np.ndarray) -> np.ndarray:
-    """Spearman ρ between every gene column of A and coord. Shape (G,)."""
+    """|Spearman ρ| between every gene column of A and coord. Shape (G,)."""
     A = np.asarray(A, dtype=np.float64)
     coord = np.asarray(coord, dtype=np.float64).reshape(-1)
     G = A.shape[1]
     rhos = np.zeros(G, dtype=np.float64)
     for g in range(G):
         r, _ = spearmanr(A[:, g], coord)
-        rhos[g] = float(r) if np.isfinite(r) else 0.0
+        rhos[g] = abs(float(r)) if np.isfinite(r) else 0.0
     return rhos
 
 
 def _top_genes_by_abs_rho(rhos: np.ndarray, n_top: int) -> np.ndarray:
     """Indices of top n_top genes by |ρ|, descending."""
-    return np.argsort(-np.abs(rhos))[: min(int(n_top), int(rhos.size))]
+    return np.argsort(-np.asarray(rhos, dtype=np.float64))[: min(int(n_top), int(rhos.size))]
+
+
+def _decoder_fitted_values(
+    A: np.ndarray,
+    coord: np.ndarray,
+    decoder_preds: np.ndarray | None,
+    decoder_df: int | None,
+) -> np.ndarray | None:
+    """Return fitted expression values for residual summaries, if available."""
+    if decoder_preds is not None:
+        fitted = np.asarray(decoder_preds, dtype=np.float64)
+        if fitted.shape == np.asarray(A).shape:
+            return fitted
+        return None
+    if decoder_df is None:
+        return None
+    A = np.asarray(A, dtype=np.float64)
+    c = np.asarray(coord, dtype=np.float64).reshape(-1)
+    return np.stack(
+        [np.poly1d(np.polyfit(c, A[:, g], int(decoder_df)))(c) for g in range(A.shape[1])],
+        axis=1,
+    )
+
+
+def _rss_per_gene(A: np.ndarray, fitted: np.ndarray) -> np.ndarray:
+    A = np.asarray(A, dtype=np.float64)
+    fitted = np.asarray(fitted, dtype=np.float64)
+    return np.sum((A - fitted) ** 2, axis=0)
+
+
+def _residual_ratio_hist_bins(values: np.ndarray, n_bins: int = 40) -> np.ndarray:
+    """Equal-width histogram bins symmetric about 1.0."""
+    vals = np.asarray(values, dtype=np.float64).reshape(-1)
+    vals = vals[np.isfinite(vals) & (vals > 0)]
+    n_bins = max(2, int(n_bins))
+    if vals.size == 0:
+        return np.linspace(0.5, 1.5, n_bins + 1)
+
+    vmin = float(vals.min())
+    vmax = float(vals.max())
+    if np.isclose(vmin, vmax):
+        delta = max(abs(vmin - 1.0), 0.05)
+        return np.linspace(1.0 - delta, 1.0 + delta, n_bins + 1)
+
+    half_extent = max(1.0 - vmin, vmax - 1.0, 1e-6)
+    return np.linspace(1.0 - half_extent, 1.0 + half_extent, n_bins + 1)
+
+
+def _save_correlation_distribution_plot(
+    out_path: Path,
+    series: list[tuple[str, np.ndarray, Any]],
+) -> Path | None:
+    """Save overlaid histograms of per-gene |Spearman ρ| values."""
+    valid_series: list[tuple[str, np.ndarray, Any]] = []
+    for label, values, color in series:
+        vals = np.abs(np.asarray(values, dtype=np.float64).reshape(-1))
+        vals = vals[np.isfinite(vals)]
+        if vals.size:
+            valid_series.append((label, vals, color))
+    if not valid_series:
+        return None
+
+    fig, ax = plt.subplots(1, 1, figsize=(7.0, 4.5))
+    bins = np.linspace(0.0, 1.0, 41)
+    for label, vals, color in valid_series:
+        ax.hist(
+            vals,
+            bins=bins,
+            alpha=0.45,
+            label=f"{label} (n={vals.size})",
+            color=color,
+            edgecolor="white",
+            linewidth=0.4,
+        )
+        ax.axvline(float(np.median(vals)), color=color, linestyle="--", linewidth=1.2)
+    ax.set_xlabel("Per-gene |Spearman correlation|")
+    ax.set_ylabel("Count")
+    ax.set_title("Distribution of gene-coordinate correlations")
+    ax.legend(frameon=False)
+    ax.grid(alpha=0.18, linewidth=0.5)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def _save_residual_ratio_outputs(
+    *,
+    csv_path: Path,
+    plot_path: Path,
+    gene_names: list[str],
+    A: np.ndarray,
+    fitted_coord: np.ndarray | None,
+    fitted_covariate: np.ndarray | None,
+    rhos_coord: np.ndarray,
+    rhos_covariate: np.ndarray,
+    coord_label: str,
+    covariate_label: str,
+) -> tuple[Path | None, Path | None]:
+    """Save RSS_covariate/RSS_fitted-coordinate rankings and a ratio histogram."""
+    if fitted_coord is None or fitted_covariate is None:
+        return None, None
+
+    rss_coord = _rss_per_gene(A, fitted_coord)
+    rss_cov = _rss_per_gene(A, fitted_covariate)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = rss_cov / rss_coord
+    ratio = np.asarray(ratio, dtype=np.float64)
+    order = np.argsort(-np.nan_to_num(ratio, nan=-np.inf, posinf=np.inf, neginf=-np.inf))
+
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow([
+            "rank",
+            "gene",
+            "residual_covariate",
+            "residual_fitted_coordinate",
+            "residual_cov_over_fitted",
+            "spearman_covariate",
+            "spearman_fitted_coordinate",
+            "abs_spearman_covariate",
+            "abs_spearman_fitted_coordinate",
+            "covariate_label",
+            "fitted_coordinate_label",
+        ])
+        for rank, g in enumerate(order, start=1):
+            writer.writerow([
+                rank,
+                gene_names[int(g)],
+                float(rss_cov[int(g)]),
+                float(rss_coord[int(g)]),
+                float(ratio[int(g)]),
+                float(rhos_covariate[int(g)]),
+                float(rhos_coord[int(g)]),
+                float(abs(rhos_covariate[int(g)])),
+                float(abs(rhos_coord[int(g)])),
+                covariate_label,
+                coord_label,
+            ])
+
+    finite_ratio = ratio[np.isfinite(ratio) & (ratio > 0)]
+    plot_out: Path | None = None
+    if finite_ratio.size:
+        fig, ax = plt.subplots(1, 1, figsize=(7.0, 4.5))
+        ax.hist(
+            finite_ratio,
+            bins=_residual_ratio_hist_bins(finite_ratio),
+            color="mediumpurple",
+            alpha=0.75,
+            edgecolor="white",
+            linewidth=0.4,
+        )
+        ax.axvline(1.0, color="0.15", linestyle="--", linewidth=1.2)
+        ax.set_xlabel(f"RSS {covariate_label} / RSS {coord_label}")
+        ax.set_ylabel("Genes")
+        ax.set_title("Residual ratio distribution")
+        ax.grid(alpha=0.18, linewidth=0.5)
+        fig.tight_layout()
+        fig.savefig(plot_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        plot_out = plot_path
+
+    return csv_path, plot_out
+
+
+def save_combined_celltype_residual_ratio_outputs(
+    per_type_results: dict[str, dict],
+    cell_type_names: list[str],
+    gene_names: list[str],
+    csv_path: str | Path,
+    plot_path: str | Path,
+    *,
+    coord_label: str = "Isodepth",
+    covariate_label: str = "Covariate",
+) -> tuple[Path | None, Path | None]:
+    """Combine per-cell-type residuals into one gene-level piecewise RSS ratio.
+
+    Separate cell-type mode fits one coordinate/decoder per cell type.  For a
+    global gene-level residual comparison, treat those fits as one piecewise
+    function: for each gene, sum RSS across all cell-type subsets before taking
+    ``RSS_covariate / RSS_fitted_coordinate``.
+    """
+    rss_coord: np.ndarray | None = None
+    rss_cov: np.ndarray | None = None
+    used_cell_types: list[str] = []
+    n_cells_total = 0
+
+    for type_name in cell_type_names:
+        type_data = per_type_results.get(type_name, {})
+        A = type_data.get("A")
+        fitted_coord = type_data.get("pred_true")
+        fitted_cov = type_data.get("pred_true_covariate")
+        if A is None or fitted_coord is None or fitted_cov is None:
+            continue
+
+        A_arr = np.asarray(A, dtype=np.float64)
+        coord_arr = np.asarray(fitted_coord, dtype=np.float64)
+        cov_arr = np.asarray(fitted_cov, dtype=np.float64)
+        if A_arr.shape != coord_arr.shape or A_arr.shape != cov_arr.shape:
+            continue
+
+        type_rss_coord = _rss_per_gene(A_arr, coord_arr)
+        type_rss_cov = _rss_per_gene(A_arr, cov_arr)
+        rss_coord = type_rss_coord if rss_coord is None else rss_coord + type_rss_coord
+        rss_cov = type_rss_cov if rss_cov is None else rss_cov + type_rss_cov
+        used_cell_types.append(str(type_name))
+        n_cells_total += int(A_arr.shape[0])
+
+    if rss_coord is None or rss_cov is None or not used_cell_types:
+        return None, None
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratio = np.asarray(rss_cov / rss_coord, dtype=np.float64)
+    order = np.argsort(-np.nan_to_num(ratio, nan=-np.inf, posinf=np.inf, neginf=-np.inf))
+
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(csv_path, "w", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow([
+            "rank",
+            "gene",
+            "residual_covariate_sum_across_cell_types",
+            "residual_fitted_coordinate_sum_across_cell_types",
+            "residual_cov_over_fitted",
+            "n_cells_total",
+            "n_cell_types",
+            "cell_types",
+            "covariate_label",
+            "fitted_coordinate_label",
+        ])
+        cell_types_joined = ";".join(used_cell_types)
+        for rank, g in enumerate(order, start=1):
+            writer.writerow([
+                rank,
+                gene_names[int(g)] if int(g) < len(gene_names) else f"gene_{int(g)}",
+                float(rss_cov[int(g)]),
+                float(rss_coord[int(g)]),
+                float(ratio[int(g)]),
+                n_cells_total,
+                len(used_cell_types),
+                cell_types_joined,
+                covariate_label,
+                coord_label,
+            ])
+
+    finite_ratio = ratio[np.isfinite(ratio) & (ratio > 0)]
+    plot_out: Path | None = None
+    if finite_ratio.size:
+        plot_path = Path(plot_path)
+        fig, ax = plt.subplots(1, 1, figsize=(7.0, 4.5))
+        ax.hist(
+            finite_ratio,
+            bins=_residual_ratio_hist_bins(finite_ratio),
+            color="mediumpurple",
+            alpha=0.75,
+            edgecolor="white",
+            linewidth=0.4,
+        )
+        ax.axvline(1.0, color="0.15", linestyle="--", linewidth=1.2)
+        ax.set_xlabel(f"RSS {covariate_label} / RSS piecewise {coord_label}")
+        ax.set_ylabel("Genes")
+        ax.set_title("Piecewise cell-type residual ratio distribution")
+        ax.grid(alpha=0.18, linewidth=0.5)
+        fig.tight_layout()
+        fig.savefig(plot_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        plot_out = plot_path
+
+    return csv_path, plot_out
+
+
+def _quantile_bin_assignments(
+    coord: np.ndarray,
+    n_bins: int,
+) -> tuple[np.ndarray, int]:
+    """Assign each coordinate to a quantile bin; return bin index and bin count."""
+    coord = np.asarray(coord, dtype=np.float64).reshape(-1)
+    bin_edges = np.unique(np.quantile(coord, np.linspace(0.0, 1.0, n_bins + 1)))
+    actual_n = max(len(bin_edges) - 1, 1)
+    if len(bin_edges) < 2:
+        bin_edges = np.array([float(coord.min()), float(coord.max())])
+    bin_idx = np.clip(np.digitize(coord, bin_edges) - 1, 0, actual_n - 1)
+    return bin_idx, actual_n
+
+
+def _bin_mean_series(
+    coord: np.ndarray,
+    values: np.ndarray,
+    bin_idx: np.ndarray,
+    actual_n: int,
+    *,
+    min_bin_cells: int,
+) -> tuple[list[float], list[float]]:
+    """Per-bin mean coordinate and mean value for bins with enough cells."""
+    coord = np.asarray(coord, dtype=np.float64).reshape(-1)
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    centers: list[float] = []
+    means: list[float] = []
+    for b in range(actual_n):
+        mask = bin_idx == b
+        if int(mask.sum()) < min_bin_cells:
+            continue
+        centers.append(float(np.mean(coord[mask])))
+        means.append(float(np.mean(values[mask])))
+    return centers, means
+
+
+def _plot_trend_curve_from_bin_means(
+    ax,
+    centers: list[float],
+    means: list[float],
+    coord: np.ndarray,
+    *,
+    fallback_x: np.ndarray | None = None,
+    fallback_y: np.ndarray | None = None,
+) -> None:
+    """Draw a smooth trend line through quantile bin means on ``coord``'s range."""
+    coord = np.asarray(coord, dtype=np.float64).reshape(-1)
+    if len(centers) >= 4:
+        deg = min(3, len(centers) - 1)
+        poly = np.poly1d(np.polyfit(centers, means, deg))
+        fit_x = np.linspace(float(coord.min()), float(coord.max()), 300)
+        ax.plot(fit_x, poly(fit_x), color="0.20", linewidth=1.8, alpha=0.9, zorder=4)
+    elif len(centers) >= 2:
+        order = np.argsort(centers)
+        ax.plot(
+            np.asarray(centers, dtype=np.float64)[order],
+            np.asarray(means, dtype=np.float64)[order],
+            color="0.20", linewidth=1.8, alpha=0.9, zorder=4,
+        )
+    elif fallback_x is not None and fallback_y is not None:
+        slope, intercept, *_ = linregress(fallback_x, fallback_y)
+        fit_x = np.array([float(coord.min()), float(coord.max())])
+        ax.plot(fit_x, slope * fit_x + intercept, color="0.20", linewidth=1.8, alpha=0.9, zorder=4)
 
 
 def _plot_gene_binned_vs_coord(
@@ -1991,15 +2755,17 @@ def _plot_gene_binned_vs_coord(
     max_cells_scatter: int = 2000,
     decoder_preds: np.ndarray | None = None,
     show_background_cells: bool = False,
+    expression_y_label: str = "Expression",
 ) -> None:
-    """Per-bin mean dots + decoder fit curve, with optional per-cell background scatter.
+    """Per-bin mean dots + trend curve, with optional per-cell background scatter.
 
     When ``decoder_preds`` is provided (model decoder predictions for this gene,
-    shape ``(n_cells,)``), the fit curve is drawn by sorting cells by coordinate
-    and plotting the decoder output — capturing the true (possibly non-linear)
-    learned relationship.  When ``decoder_preds`` is None, a degree-3 polynomial
-    is fit to the per-bin means as a non-linear trend approximation, falling
-    back to linear regression when fewer than 4 bins are available.
+    shape ``(n_cells,)``), the fit curve is the actual decoder output: cells are
+    sorted by coordinate and the predictions are smoothed with a uniform running
+    mean (~10% window).  This shows NN non-linearities faithfully rather than
+    collapsing them to a polynomial.
+    When ``decoder_preds`` is None, a degree-3 polynomial is fit through the
+    per-bin expression means as a non-linear trend approximation.
 
     Set ``show_background_cells=True`` to overlay a subsampled per-cell scatter
     (useful for visualising per-cell noise alongside the bin means).
@@ -2021,21 +2787,10 @@ def _plot_gene_binned_vs_coord(
             rasterized=True,
         )
 
-    # --- quantile-based bin means (equal cell count per bin) ---
-    bin_edges = np.unique(np.quantile(coord, np.linspace(0.0, 1.0, n_bins + 1)))
-    actual_n = max(len(bin_edges) - 1, 1)
-    if len(bin_edges) < 2:
-        bin_edges = np.array([float(coord.min()), float(coord.max())])
-    bin_idx = np.clip(np.digitize(coord, bin_edges) - 1, 0, actual_n - 1)
-
-    centers: list[float] = []
-    means: list[float] = []
-    for b in range(actual_n):
-        mask = bin_idx == b
-        if int(mask.sum()) < min_bin_cells:
-            continue
-        centers.append(float(np.mean(coord[mask])))
-        means.append(float(np.mean(expr_col[mask])))
+    bin_idx, actual_n = _quantile_bin_assignments(coord, n_bins)
+    centers, means = _bin_mean_series(
+        coord, expr_col, bin_idx, actual_n, min_bin_cells=min_bin_cells
+    )
 
     if centers:
         ax.scatter(
@@ -2044,32 +2799,32 @@ def _plot_gene_binned_vs_coord(
             edgecolors="white", zorder=3,
         )
 
-    # --- fit curve: model decoder predictions or polynomial through bin means ---
+    # --- fit curve: actual NN predictions (smoothed) or poly through expression bin means ---
     if decoder_preds is not None:
+        # Show the actual decoder curve: sort cells by coordinate, then apply a
+        # uniform running mean whose window is ~10% of cells (min 5, max 200).
+        # This preserves NN non-linearities that a degree-3 polynomial would destroy.
         dp = np.asarray(decoder_preds, dtype=np.float64).reshape(-1)
-        sort_idx = np.argsort(coord)
+        sort_order = np.argsort(coord)
+        dp_sorted = dp[sort_order]
+        coord_sorted = coord[sort_order]
+        window = max(5, min(200, int(round(len(dp_sorted) * 0.10))))
+        dp_smooth = uniform_filter1d(dp_sorted, size=window, mode="nearest")
         ax.plot(
-            coord[sort_idx], dp[sort_idx],
+            coord_sorted, dp_smooth,
             color="0.20", linewidth=1.8, alpha=0.9, zorder=4,
         )
-    elif len(centers) >= 4:
-        # Degree-3 polynomial through bin means — captures non-linear trend
-        # without requiring model weights at regen time.
-        deg = min(3, len(centers) - 1)
-        poly = np.poly1d(np.polyfit(centers, means, deg))
-        fit_x = np.linspace(float(coord.min()), float(coord.max()), 300)
-        ax.plot(fit_x, poly(fit_x), color="0.20", linewidth=1.8, alpha=0.9, zorder=4)
     else:
-        slope, intercept, *_ = linregress(coord, expr_col)
-        fit_x = np.array([float(coord.min()), float(coord.max())])
-        ax.plot(fit_x, slope * fit_x + intercept, color="0.20", linewidth=1.8, alpha=0.9, zorder=4)
+        _plot_trend_curve_from_bin_means(
+            ax, centers, means, coord, fallback_x=coord, fallback_y=expr_col
+        )
 
     title = gene_name
     if rho is not None:
-        title += f"\nρ={rho:.3f} (per cell)"
+        title += f"\n|Spearman r| = {abs(float(rho)):.3f}"
     ax.set_title(title, fontsize=9)
     ax.set_xlabel(xlabel, fontsize=8)
-    ax.set_ylabel("Expression (z-scored)", fontsize=8)
+    ax.set_ylabel(expression_y_label, fontsize=8)
     ax.tick_params(labelsize=7)
     ax.grid(alpha=0.15, linewidth=0.4)
 
@@ -2085,14 +2840,25 @@ def save_gene_expression_vs_isodepth_plot(
     coord_label: str = "Isodepth",
     decoder_preds: np.ndarray | None = None,
     decoder_df: int | None = None,
+    q_threshold: float = 0.05,
+    gene_indices: np.ndarray | list[int] | None = None,
+    figure_title: str | None = None,
+    pvalues: np.ndarray | None = None,
+    qvalues: np.ndarray | None = None,
+    spatial_S: np.ndarray | None = None,
 ) -> Path:
     """Top n_top_genes genes (by |Spearman ρ| with isodepth) as binned mean
     expression vs isodepth.
 
-    ``decoder_preds`` (n_cells, G): when provided the fit curve uses the decoder
-    output sorted by isodepth.  ``decoder_df`` triggers an F-test across all G
-    genes; significant genes (BH q < 0.05) are saved to
-    ``<stem>_isodepth_sig_genes.csv`` beside the PNG.
+    ``decoder_preds`` (n_cells, G): when provided the fit curve uses the binned
+    mean decoder output smoothed over isodepth.  ``decoder_df`` triggers an
+    F-test across all G genes (parametric decoders only); significant genes
+    (BH q < q_threshold) are saved to
+    ``<stem>_isodepth_sig_genes.csv`` beside the PNG, and a companion spatial
+    expression scatter is saved to ``<stem>_svg_spatial_expression.png``.
+
+    ``spatial_S``: optional (N, 2) spatial coordinates used for the companion
+    scatter.  Defaults to ``dataset.S`` when not provided.
     """
     out_path = Path(out_path)
     A = np.asarray(dataset.A, dtype=np.float64)
@@ -2105,46 +2871,100 @@ def save_gene_expression_vs_isodepth_plot(
     )
 
     rhos = _gene_spearman_rhos(A, coord)
-    top_idx = _top_genes_by_abs_rho(rhos, n_top_genes)
+    if gene_indices is None:
+        top_idx = _top_genes_by_abs_rho(rhos, n_top_genes)
+        title = f"Top {{n_top}} genes by |Spearman r| with {coord_label}"
+    else:
+        top_idx = np.asarray(gene_indices, dtype=np.intp)[: int(n_top_genes)]
+        title = figure_title or f"Selected genes vs {coord_label}"
     n_top = len(top_idx)
 
     colors = plt.cm.tab10(np.linspace(0.0, 0.9, max(n_top, 1)))
     fig, axes = plt.subplots(1, n_top, figsize=(4.0 * n_top, 3.6), squeeze=False)
+    pv_arr = np.asarray(pvalues, dtype=np.float64) if pvalues is not None else None
+    qv_arr = np.asarray(qvalues, dtype=np.float64) if qvalues is not None else None
+    expression_y_label = _expression_y_axis_label(dataset.meta)
 
     for col, gene_idx in enumerate(top_idx):
         dp = (
             np.asarray(decoder_preds, dtype=np.float64)[:, gene_idx]
             if decoder_preds is not None else None
         )
+        show_rho = None if (pv_arr is not None and qv_arr is not None) else float(rhos[gene_idx])
         _plot_gene_binned_vs_coord(
             axes[0, col], A[:, gene_idx], coord,
             gene_names[gene_idx], coord_label,
             n_bins=n_bins, min_bin_cells=min_bin_cells,
-            rho=float(rhos[gene_idx]), color=colors[col],
+            rho=show_rho, color=colors[col],
             decoder_preds=dp,
+            expression_y_label=expression_y_label,
         )
+        if pv_arr is not None and qv_arr is not None:
+            axes[0, col].set_title(
+                f"{gene_names[gene_idx]}\np={pv_arr[gene_idx]:.2e}  q={qv_arr[gene_idx]:.2e}",
+                fontsize=9,
+            )
 
-    fig.suptitle(f"Top {n_top} genes by |Spearman ρ| with {coord_label}", fontsize=11)
+    fig.suptitle(title.format(n_top=n_top), fontsize=11)
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
-    # --- F-test significance CSV ---
+    stem = out_path.parent / out_path.stem
+    _save_correlation_distribution_plot(
+        Path(f"{stem}_correlation_distribution.png"),
+        [(coord_label, rhos, "steelblue")],
+    )
+
+    S_plot = (
+        np.asarray(spatial_S, dtype=np.float32)
+        if spatial_S is not None
+        else np.asarray(dataset.S, dtype=np.float32)
+    )
+    spatial_out = out_path.parent / (out_path.stem + "_svg_spatial_expression.png")
+
+    # --- F-test significance CSV + companion spatial expression scatter ---
     if decoder_df is not None:
-        if decoder_preds is not None:
-            fitted = np.asarray(decoder_preds, dtype=np.float64)
-        else:
-            fitted = np.stack(
-                [
-                    np.poly1d(np.polyfit(coord, A[:, g], decoder_df))(coord)
-                    for g in range(G)
-                ],
-                axis=1,
-            )
-        pvals = _ftest_decoder_pvalues(A, fitted, df_model=decoder_df)
-        qvals = _bh_qvalues(pvals)
+        svg_result = compute_isodepth_sig_genes(
+            A, gene_names, decoder_preds, decoder_df,
+            coord=coord, alpha=q_threshold,
+        )
         csv_path = out_path.parent / (out_path.stem + "_isodepth_sig_genes.csv")
-        _save_sig_genes_csv(csv_path, gene_names, pvals, qvals)
+        _save_sig_genes_csv(
+            csv_path, gene_names,
+            svg_result["pvalues"], svg_result["qvalues"],
+            q_threshold=q_threshold,
+        )
+        if svg_result["sig_indices"].size > 0:
+            try:
+                save_svg_spatial_expression_plots(
+                    S_plot, A, gene_names,
+                    svg_result["sig_indices"],
+                    spatial_out,
+                    pvalues=svg_result["pvalues"],
+                    qvalues=svg_result["qvalues"],
+                    expression_meta=dataset.meta,
+                    suptitle=f"Top SVG Spatial Expression — {coord_label}",
+                )
+            except Exception:
+                pass
+    else:
+        stale_csv = out_path.parent / (out_path.stem + "_isodepth_sig_genes.csv")
+        if stale_csv.exists():
+            stale_csv.unlink()
+        # nn decoder: no F-test, use the same top-|rho| genes shown in the binned plot
+        if top_idx.size > 0:
+            try:
+                save_svg_spatial_expression_plots(
+                    S_plot, A, gene_names,
+                    top_idx,
+                    spatial_out,
+                    rhos=rhos,
+                    expression_meta=dataset.meta,
+                    suptitle=f"Top Gene Spatial Expression — {coord_label}",
+                )
+            except Exception:
+                pass
 
     return out_path
 
@@ -2163,6 +2983,8 @@ def save_gene_expression_vs_coordinates_comparison(
     pred_isodepth: np.ndarray | None = None,
     pred_covariate: np.ndarray | None = None,
     decoder_df: int | None = None,
+    q_threshold: float = 0.05,
+    spatial_S: np.ndarray | None = None,
 ) -> Path:
     """4-row × n_top_genes comparison grid.
 
@@ -2172,11 +2994,11 @@ def save_gene_expression_vs_coordinates_comparison(
     Row 3: top covariate genes vs isodepth  (ρ shown vs isodepth)
 
     When ``pred_isodepth`` / ``pred_covariate`` are provided (model decoder
-    predictions, shape ``(n_cells, G)``), the fit curve for each panel uses the
-    corresponding decoder output sorted by the x-axis coordinate, faithfully
-    representing the learned (possibly non-linear) decoder function.  Otherwise
-    a degree-3 polynomial fit through the per-bin means is used as a non-linear
-    trend approximation.
+    predictions, shape ``(n_cells, G)``), the fit curve shows the actual decoder
+    output: cells sorted by coordinate, predictions smoothed with a uniform
+    running mean (~10% window) to remove per-cell noise while preserving NN
+    non-linearities.  Otherwise a degree-3 polynomial fit through the per-bin
+    expression means is used as a non-linear trend approximation.
 
     When ``decoder_df`` is set (e.g. 1 for a linear decoder, 2 for quadratic)
     an F-test is run across **all** genes for each decoder model and significant
@@ -2225,6 +3047,7 @@ def save_gene_expression_vs_coordinates_comparison(
     ]
 
     fig, axes = plt.subplots(4, n_top, figsize=(4.0 * n_top, 3.6 * 4), squeeze=False)
+    expression_y_label = _expression_y_axis_label(dataset.meta)
 
     for row_idx, (gene_indices, rhos_for_row, coord, xlabel, colors, preds) in enumerate(row_specs):
         for col, gene_idx in enumerate(gene_indices):
@@ -2238,6 +3061,7 @@ def save_gene_expression_vs_coordinates_comparison(
                 n_bins=n_bins, min_bin_cells=min_bin_cells,
                 rho=float(rhos_for_row[gene_idx]), color=colors[col],
                 decoder_preds=dp,
+                expression_y_label=expression_y_label,
             )
         for col in range(len(gene_indices), n_top):
             axes[row_idx, col].set_visible(False)
@@ -2253,29 +3077,431 @@ def save_gene_expression_vs_coordinates_comparison(
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
-    # --- F-test significance CSVs ---
+    stem = out_path.parent / out_path.stem
+    _save_correlation_distribution_plot(
+        Path(f"{stem}_correlation_distribution.png"),
+        [
+            (isodepth_label, rhos_iso, "steelblue"),
+            (covariate_label, rhos_cov, "seagreen"),
+        ],
+    )
+    fitted_iso = _decoder_fitted_values(A, iso, pred_isodepth, decoder_df)
+    fitted_cov = _decoder_fitted_values(A, cov, pred_covariate, decoder_df)
+    _save_residual_ratio_outputs(
+        csv_path=Path(f"{stem}_residual_ratio_rankings.csv"),
+        plot_path=Path(f"{stem}_residual_ratio_distribution.png"),
+        gene_names=gene_names,
+        A=A,
+        fitted_coord=fitted_iso,
+        fitted_covariate=fitted_cov,
+        rhos_coord=rhos_iso,
+        rhos_covariate=rhos_cov,
+        coord_label=isodepth_label,
+        covariate_label=covariate_label,
+    )
+
+    S_plot = (
+        np.asarray(spatial_S, dtype=np.float32)
+        if spatial_S is not None
+        else np.asarray(dataset.S, dtype=np.float32)
+    )
+
+    # --- F-test significance CSVs (parametric decoders only) ---
     if decoder_df is not None:
-        stem = out_path.parent / out_path.stem
-        for preds_arr, label in [
-            (pred_isodepth, "isodepth"),
-            (pred_covariate, "covariate"),
-        ]:
-            if preds_arr is not None:
-                fitted = np.asarray(preds_arr, dtype=np.float64)
+        iso_svg = compute_isodepth_sig_genes(
+            A, gene_names, pred_isodepth, decoder_df, coord=iso, alpha=q_threshold,
+        )
+        cov_svg = compute_isodepth_sig_genes(
+            A, gene_names, pred_covariate, decoder_df, coord=cov, alpha=q_threshold,
+        )
+        _save_sig_genes_csv(
+            Path(f"{stem}_isodepth_sig_genes.csv"), gene_names,
+            iso_svg["pvalues"], iso_svg["qvalues"], q_threshold=q_threshold,
+        )
+        _save_sig_genes_csv(
+            Path(f"{stem}_covariate_sig_genes.csv"), gene_names,
+            cov_svg["pvalues"], cov_svg["qvalues"], q_threshold=q_threshold,
+        )
+        # rows for the combined spatial plot: (gene_indices, pvalues, qvalues, rhos, label)
+        spatial_row_specs = [
+            (iso_svg["sig_indices"], iso_svg["pvalues"], iso_svg["qvalues"], None,
+             f"Top {isodepth_label} SVGs  (q\u2009<\u2009{q_threshold})"),
+            (cov_svg["sig_indices"], cov_svg["pvalues"], cov_svg["qvalues"], None,
+             f"Top {covariate_label} SVGs  (q\u2009<\u2009{q_threshold})"),
+        ]
+    else:
+        # nn decoder: top-|rho| genes already computed for the binned plot
+        spatial_row_specs = [
+            (top_iso, None, None, rhos_iso, f"Top {isodepth_label} genes  (by |Spearman r|)"),
+            (top_cov, None, None, rhos_cov, f"Top {covariate_label} genes  (by |Spearman r|)"),
+        ]
+
+    # --- Combined 2 × n_top spatial expression grid ---
+    # Mirrors the layout of the 4-row comparison binned-plot: rows = gene sets,
+    # columns = individual genes.  Each panel shows cells at (x, y) coloured by
+    # gene expression, so the spatial pattern is immediately comparable across
+    # the two coordinate systems.
+    try:
+        n_cols = int(n_top_genes)
+        n_rows = len(spatial_row_specs)
+        ps = _point_size(S_plot)
+        expr_label = _expression_label(dataset.meta)
+
+        fig, axes = plt.subplots(
+            n_rows, n_cols,
+            figsize=(4.5 * n_cols, 4.5 * n_rows),
+            squeeze=False,
+        )
+
+        for row_idx, (g_indices, pvals, qvals, rho_arr, row_label) in enumerate(spatial_row_specs):
+            g_indices = np.asarray(g_indices, dtype=np.intp)
+            pv_arr = np.asarray(pvals, dtype=np.float64) if pvals is not None else None
+            qv_arr = np.asarray(qvals, dtype=np.float64) if qvals is not None else None
+            rh_arr = np.asarray(rho_arr, dtype=np.float64) if rho_arr is not None else None
+
+            if pv_arr is not None and g_indices.size > 0:
+                order = np.argsort(pv_arr[g_indices])
+                top = g_indices[order[:n_cols]]
             else:
-                # Fit a fresh polynomial of degree decoder_df to ALL genes on
-                # the relevant coordinate so the F-test covers every gene.
-                coord_for_fit = iso if label == "isodepth" else cov
-                fitted = np.stack(
-                    [
-                        np.poly1d(np.polyfit(coord_for_fit, A[:, g], decoder_df))(coord_for_fit)
-                        for g in range(G)
-                    ],
-                    axis=1,
+                top = g_indices[:n_cols]
+
+            for col, gene_idx in enumerate(top):
+                ax = axes[row_idx, col]
+                expr = A[:, int(gene_idx)]
+                scatter = ax.scatter(
+                    S_plot[:, 0], S_plot[:, 1],
+                    c=expr, cmap="Reds", s=ps,
+                    linewidths=0, alpha=0.9, rasterized=True,
                 )
-            pvals = _ftest_decoder_pvalues(A, fitted, df_model=decoder_df)
-            qvals = _bh_qvalues(pvals)
-            csv_path = Path(f"{stem}_{label}_sig_genes.csv")
-            _save_sig_genes_csv(csv_path, gene_names, pvals, qvals)
+                ax.set_aspect("equal")
+                ax.set_xlabel("x", fontsize=7)
+                ax.set_ylabel("y", fontsize=7)
+                gname = gene_names[int(gene_idx)] if int(gene_idx) < len(gene_names) else f"gene_{gene_idx}"
+                if pv_arr is not None and qv_arr is not None:
+                    ann = f"p={pv_arr[int(gene_idx)]:.2e}  q={qv_arr[int(gene_idx)]:.2e}"
+                elif rh_arr is not None:
+                    ann = f"|Spearman r| = {abs(float(rh_arr[int(gene_idx)])):.3f}"
+                else:
+                    ann = ""
+                ax.set_title(f"{gname}\n{ann}" if ann else gname, fontsize=7)
+                plt.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04, label=expr_label)
+
+            for col in range(len(top), n_cols):
+                axes[row_idx, col].set_visible(False)
+
+            axes[row_idx, 0].set_ylabel(
+                f"{row_label}\n\ny", fontsize=7,
+            )
+
+        fig.suptitle(
+            f"Spatial expression — {isodepth_label} | {covariate_label}",
+            fontsize=10, y=1.01,
+        )
+        fig.tight_layout()
+        fig.savefig(
+            Path(f"{stem}_svg_spatial_expression.png"),
+            dpi=200, bbox_inches="tight",
+        )
+        plt.close(fig)
+    except Exception:
+        pass
 
     return out_path
+
+
+def _expression_label(meta: dict | None) -> str:
+    """Human-readable colorbar label describing the expression normalisation."""
+    if meta is None:
+        return "Expression"
+    log1p = bool(meta.get("log1p", False))
+    standardized = bool(meta.get("standardize_expression", False))
+    if log1p and standardized:
+        return "Log-norm. standardized expression"
+    if log1p:
+        return "Log-norm. expression"
+    if standardized:
+        return "Standardized expression"
+    return "Expression (raw counts)"
+
+
+def save_svg_spatial_expression_plots(
+    S: np.ndarray,
+    A: np.ndarray,
+    gene_names: list[str],
+    gene_indices: np.ndarray,
+    out_path: str | Path,
+    *,
+    pvalues: np.ndarray | None = None,
+    qvalues: np.ndarray | None = None,
+    rhos: np.ndarray | None = None,
+    expression_meta: dict | None = None,
+    n_top: int = 5,
+    suptitle: str = "",
+) -> Path:
+    """Spatial scatter plots for the top ``n_top`` genes colored by expression.
+
+    Each panel shows cells at their (x, y) spatial coordinates colored by the
+    expression level of one gene — the same style as the dataset-triptych total
+    expression heatmap but resolved to individual gene expression values.
+
+    Gene selection and panel annotation depend on which statistics are supplied:
+
+    * **Parametric decoders** (``pvalues`` and ``qvalues`` provided): genes are
+      ranked by raw F-test p-value (ascending); each panel shows ``p=...  q=...``.
+      ``gene_indices`` should be the significant-gene subset (q < alpha).
+    * **nn decoder** (``pvalues``/``qvalues`` absent, ``rhos`` provided): genes
+      are displayed in the order supplied in ``gene_indices`` (caller ranks by
+      |rho|); each panel shows |Spearman rho|.
+
+    Parameters
+    ----------
+    S            : (N, 2) spatial coordinates.
+    A            : (N, G) expression matrix.
+    gene_names   : length-G list of gene name strings.
+    gene_indices : gene indices (into G columns of A) to consider.
+    out_path     : destination PNG path.
+    pvalues      : (G,) raw F-test p-values — used for ranking and annotation.
+    qvalues      : (G,) BH q-values — used for annotation only.
+    rhos         : (G,) |Spearman rho| values — used when pvalues are absent.
+    n_top        : maximum panels to display (default 5).
+    suptitle     : optional figure super-title.
+    """
+    out_path = Path(out_path)
+    S = np.asarray(S, dtype=np.float32)
+    A = np.asarray(A, dtype=np.float32)
+    gene_indices = np.asarray(gene_indices, dtype=np.intp)
+
+    if gene_indices.size == 0:
+        return out_path
+
+
+    pv_arr = np.asarray(pvalues, dtype=np.float64) if pvalues is not None else None
+    qv_arr = np.asarray(qvalues, dtype=np.float64) if qvalues is not None else None
+    rho_arr = np.asarray(rhos, dtype=np.float64) if rhos is not None else None
+
+    # Ranking: p-value order for parametric, caller-supplied order for nn
+    if pv_arr is not None:
+        order = np.argsort(pv_arr[gene_indices])
+        top_indices = gene_indices[order[: int(n_top)]]
+    else:
+        top_indices = gene_indices[: int(n_top)]
+
+    n_panels = int(len(top_indices))
+    ps = _point_size(S)
+    expr_label = _expression_label(expression_meta)
+    fig, axes = plt.subplots(1, n_panels, figsize=(4.5 * n_panels, 4.5), squeeze=False)
+    axes_flat = axes[0]
+
+    for col, gene_idx in enumerate(top_indices):
+        ax = axes_flat[col]
+        expr = A[:, int(gene_idx)]
+        scatter = ax.scatter(
+            S[:, 0], S[:, 1],
+            c=expr,
+            cmap="Reds",
+            s=ps,
+            linewidths=0,
+            alpha=0.9,
+            rasterized=True,
+        )
+        ax.set_aspect("equal")
+        ax.set_xlabel("x", fontsize=8)
+        ax.set_ylabel("y", fontsize=8)
+        gname = gene_names[int(gene_idx)] if int(gene_idx) < len(gene_names) else f"gene_{gene_idx}"
+        if pv_arr is not None and qv_arr is not None:
+            annotation = f"p={pv_arr[int(gene_idx)]:.2e}  q={qv_arr[int(gene_idx)]:.2e}"
+        elif rho_arr is not None:
+            annotation = f"|Spearman r| = {abs(float(rho_arr[int(gene_idx)])):.3f}"
+        else:
+            annotation = ""
+        ax.set_title(f"{gname}\n{annotation}" if annotation else gname, fontsize=8)
+        plt.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04, label=expr_label)
+
+    if suptitle:
+        fig.suptitle(suptitle, fontsize=10, y=1.02)
+
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_recursive_svg_count_plot(
+    svg_counts_by_label: dict[str, list[dict]],
+    out_path: str | Path,
+    *,
+    title: str = "Recursive SVG counts by gradient",
+) -> Path | None:
+    """Line plot of the number of SVGs detected at each recursive gradient."""
+    out_path = Path(out_path)
+
+    series: list[tuple[str, np.ndarray, np.ndarray]] = []
+    for label, entries in svg_counts_by_label.items():
+        points: list[tuple[int, int]] = []
+        for entry in entries:
+            if "gradient_index" not in entry or "n_svgs" not in entry:
+                continue
+            points.append((int(entry["gradient_index"]), int(entry["n_svgs"])))
+        if not points:
+            continue
+        points.sort(key=lambda x: x[0])
+        xs = np.asarray([p[0] for p in points], dtype=np.int64)
+        ys = np.asarray([p[1] for p in points], dtype=np.int64)
+        series.append((str(label), xs, ys))
+
+    if not series:
+        return None
+
+    fig, ax = plt.subplots(figsize=(7.0, 4.5))
+    colors = plt.cm.tab10(np.linspace(0.0, 0.9, max(len(series), 1)))
+    max_y = 0
+    all_x: list[int] = []
+    for color, (label, xs, ys) in zip(colors, series):
+        max_y = max(max_y, int(ys.max()))
+        all_x.extend(int(x) for x in xs)
+        ax.plot(xs, ys, marker="o", linewidth=2.0, markersize=5, label=label, color=color)
+        for x, y in zip(xs, ys):
+            ax.annotate(
+                str(int(y)),
+                (int(x), int(y)),
+                textcoords="offset points",
+                xytext=(0, 7),
+                ha="center",
+                fontsize=8,
+                color=color,
+            )
+
+    ax.set_title(title, fontsize=12)
+    ax.set_xlabel("Gradient")
+    ax.set_ylabel("SVGs detected")
+    ax.set_xticks(sorted(set(all_x)))
+    ax.set_ylim(bottom=0, top=max(1, max_y) * 1.15)
+    ax.grid(alpha=0.25, linewidth=0.6)
+    if len(series) > 1:
+        ax.legend(title="Cell type", fontsize=8)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_block_permutation_overlay(
+    S_true: np.ndarray,
+    S_permuted: np.ndarray | None,
+    block_ids: np.ndarray | None,
+    out_path: str | Path,
+    *,
+    run_name: str = "",
+    radius_units: float | None = None,
+) -> Path | None:
+    """Two-panel diagnostic: true layout with hex mesh, then a sample centroid permutation.
+
+    Left panel shows cells on the tissue with the hex block mesh drawn on top.
+    Right panel (when provided) colours cells by their *original* block ID at permuted
+    coordinates so it is clear how blocks were scrambled.
+    """
+    from methods.block_permutation import hex_polygons_for_block_ids
+
+    out_path = Path(out_path)
+    S_true = np.asarray(S_true, dtype=np.float32)
+    if S_true.ndim != 2 or S_true.shape[1] != 2 or S_true.shape[0] == 0:
+        return None
+
+    n_panels = 2 if S_permuted is not None else 1
+    spatial_limits = _spatial_axis_limits(S_true)
+    ps = _point_size(S_true)
+
+    block_ids_arr: np.ndarray | None = None
+    block_colors: np.ndarray | None = None
+    n_blocks = 0
+    if block_ids is not None:
+        block_ids_arr = np.asarray(block_ids, dtype=np.int64)
+        unique_ids = np.unique(block_ids_arr)
+        id_to_idx = {int(bid): i for i, bid in enumerate(unique_ids)}
+        block_colors = np.array([id_to_idx[int(b)] for b in block_ids_arr], dtype=float)
+        n_blocks = len(unique_ids)
+
+    fig, axes = plt.subplots(1, n_panels, figsize=(6.5 * n_panels, 5.5))
+    if n_panels == 1:
+        axes = [axes]
+
+    xlim, ylim = spatial_limits
+
+    ax_true = axes[0]
+    ax_true.scatter(
+        S_true[:, 0],
+        S_true[:, 1],
+        c="#bdbdbd",
+        s=ps,
+        linewidths=0,
+        alpha=0.55,
+        rasterized=True,
+        zorder=1,
+    )
+    if block_ids_arr is not None and radius_units is not None and float(radius_units) > 0:
+        hex_polys = hex_polygons_for_block_ids(block_ids_arr, float(radius_units))
+        if hex_polys:
+            mesh = PolyCollection(
+                hex_polys,
+                facecolors="none",
+                edgecolors="#404040",
+                linewidths=0.45,
+                alpha=0.85,
+                zorder=2,
+            )
+            ax_true.add_collection(mesh)
+    ax_true.set_aspect("equal")
+    ax_true.set_xlabel("x")
+    ax_true.set_ylabel("y")
+    ax_true.set_title(f"True layout — {n_blocks} hex blocks")
+    ax_true.set_xlim(float(xlim[0]), float(xlim[1]))
+    ax_true.set_ylim(float(ylim[0]), float(ylim[1]))
+
+    if S_permuted is not None:
+        S_perm = np.asarray(S_permuted, dtype=np.float32)
+        ax_perm = axes[1]
+        cmap = "tab20" if n_blocks <= 20 else "nipy_spectral"
+        ax_perm.scatter(
+            S_perm[:, 0],
+            S_perm[:, 1],
+            c=block_colors if block_colors is not None else "#bdbdbd",
+            cmap=cmap if block_colors is not None else None,
+            s=ps,
+            linewidths=0,
+            alpha=0.85,
+            rasterized=True,
+        )
+        ax_perm.set_aspect("equal")
+        ax_perm.set_xlabel("x")
+        ax_perm.set_ylabel("y")
+        ax_perm.set_title("Centroid permutation — colour = original block")
+        ax_perm.set_xlim(float(xlim[0]), float(xlim[1]))
+        ax_perm.set_ylim(float(ylim[0]), float(ylim[1]))
+
+        if block_ids_arr is not None and n_blocks <= 50:
+            for bid in np.unique(block_ids_arr):
+                mask = block_ids_arr == bid
+                if int(mask.sum()) == 0:
+                    continue
+                old_c = S_true[mask].mean(axis=0)
+                new_c = S_perm[mask].mean(axis=0)
+                ax_perm.annotate(
+                    "",
+                    xy=(new_c[0], new_c[1]),
+                    xytext=(old_c[0], old_c[1]),
+                    arrowprops=dict(arrowstyle="->", color="black", lw=0.6, alpha=0.45),
+                )
+
+    title_parts = ["Block permutation overlay"]
+    if run_name:
+        title_parts = [f"Block permutation overlay — {run_name}"]
+    if radius_units is not None:
+        title_parts.append(f"radius = {radius_units:.1f} coord units")
+    fig.suptitle("  ".join(title_parts), fontsize=11)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+

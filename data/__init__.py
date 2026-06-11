@@ -55,6 +55,33 @@ def _standardize_coordinates_inplace(dataset: DatasetBundle) -> DatasetBundle:
     return dataset
 
 
+def raw_coordinates_from_standardized(
+    S: np.ndarray,
+    meta: dict,
+) -> np.ndarray:
+    """Invert per-axis z-score using ``coord_mean`` / ``coord_std`` from ``meta``."""
+    if meta.get("coordinate_standardization") != "zscore":
+        return np.asarray(S, dtype=np.float32)
+    mean = np.asarray(meta["coord_mean"], dtype=np.float32)
+    std = np.asarray(meta["coord_std"], dtype=np.float32)
+    safe_std = np.where(std > 1e-8, std, 1.0)
+    return (np.asarray(S, dtype=np.float32) * safe_std + mean).astype(np.float32)
+
+
+def standardize_coordinate_batch(
+    s_batched: np.ndarray,
+    meta: dict,
+) -> np.ndarray:
+    """Apply the fixed true-layout z-score to every coordinate batch slot."""
+    if meta.get("coordinate_standardization") != "zscore":
+        return np.asarray(s_batched, dtype=np.float32)
+    mean = np.asarray(meta["coord_mean"], dtype=np.float32)
+    std = np.asarray(meta["coord_std"], dtype=np.float32)
+    safe_std = np.where(std > 1e-8, std, 1.0)
+    s = np.asarray(s_batched, dtype=np.float32)
+    return ((s - mean[None, None, :]) / safe_std[None, None, :]).astype(np.float32)
+
+
 def load_dataset(config: DataConfig, *, covariate=None) -> DatasetBundle:
     """Load a dataset from ``config``.
 
@@ -105,4 +132,6 @@ __all__ = [
     "load_h5ad_dataset_from_config",
     "load_h5ad_dataset",
     "load_h5ad_as_permutation_dataset",
+    "raw_coordinates_from_standardized",
+    "standardize_coordinate_batch",
 ]

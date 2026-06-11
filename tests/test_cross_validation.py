@@ -17,7 +17,11 @@ if str(REPO_ROOT) not in sys.path:
 from data.schemas import DataConfig, DatasetBundle, OutputConfig, RunConfig, TestConfig
 from data.synthetic import generate_synthetic_dataset
 from experiments.configuration import save_standardized_outputs
-from methods.permutation import run_cross_validation_method
+from methods.permutation import (
+    _aggregate_weighted_fold_losses,
+    _build_kfold_assignments,
+    run_cross_validation_method,
+)
 from methods.trainers import resolve_device
 
 
@@ -27,19 +31,45 @@ class TestCrossValidationSchema(unittest.TestCase):
             method="cross_validation",
             metric="mse",
             n_perms=3,
-            train_fraction=0.75,
+            n_folds=3,
         )
         self.assertIs(config.validate(), config)
 
-    def test_cross_validation_rejects_invalid_train_fraction(self) -> None:
+    def test_cross_validation_accepts_poisson_metric(self) -> None:
+        config = TestConfig(
+            method="cross_validation",
+            metric="nll_poisson_mse",
+            n_folds=3,
+        )
+        self.assertIs(config.validate(), config)
+
+    def test_cross_validation_rejects_invalid_n_folds(self) -> None:
         with self.assertRaises(ValueError):
-            TestConfig(method="cross_validation", train_fraction=0.0).validate()
-        with self.assertRaises(ValueError):
-            TestConfig(method="cross_validation", train_fraction=1.0).validate()
+            TestConfig(method="cross_validation", n_folds=1).validate()
 
     def test_cross_validation_rejects_correlation_metric(self) -> None:
         with self.assertRaises(ValueError):
             TestConfig(method="cross_validation", metric="spearman_corr_mean").validate()
+
+
+class TestKFoldHelpers(unittest.TestCase):
+    def test_build_kfold_assignments_is_deterministic(self) -> None:
+        fold_a, sizes_a = _build_kfold_assignments(10, 3, seed=7)
+        fold_b, sizes_b = _build_kfold_assignments(10, 3, seed=7)
+        np.testing.assert_array_equal(fold_a, fold_b)
+        np.testing.assert_array_equal(sizes_a, sizes_b)
+        self.assertEqual(int(sizes_a.sum()), 10)
+
+    def test_weighted_aggregation(self) -> None:
+        fold_true = [0.0, 4.0]
+        fold_perm = [
+            np.asarray([1.0, 2.0], dtype=np.float64),
+            np.asarray([3.0, 8.0], dtype=np.float64),
+        ]
+        weights = np.asarray([0.3, 0.7], dtype=np.float64)
+        stat_true, stat_perm = _aggregate_weighted_fold_losses(fold_true, fold_perm, weights)
+        self.assertAlmostEqual(stat_true, 2.8)
+        np.testing.assert_allclose(stat_perm, np.asarray([2.4, 6.2]))
 
 
 class TestCrossValidationMethod(unittest.TestCase):
@@ -60,7 +90,7 @@ class TestCrossValidationMethod(unittest.TestCase):
             method="cross_validation",
             metric="mse",
             n_perms=2,
-            train_fraction=0.6,
+            n_folds=2,
             n_reruns=1,
             epochs=2,
             patience=2,
@@ -69,8 +99,9 @@ class TestCrossValidationMethod(unittest.TestCase):
             seed=11,
         )
 
-    def test_cross_validation_uses_shared_deterministic_holdout_loss(self) -> None:
+    def test_cross_validation_runs_k_folds_and_aggregates(self) -> None:
         recorded_masks: list[np.ndarray] = []
+        fold_calls = {"count": 0}
 
         def _mock_train_parallel_isodepth_model(
             S,
@@ -84,6 +115,7 @@ class TestCrossValidationMethod(unittest.TestCase):
             a_batched=None,
             loss_mask_batched=None,
             metric_loss_mask_batched=None,
+            **kwargs,
         ):
             assert s_batched is not None
             assert loss_mask_batched is not None
@@ -95,9 +127,11 @@ class TestCrossValidationMethod(unittest.TestCase):
             n_models, n_cells, _ = s_batched_np.shape
             predictions = np.repeat(np.asarray(A, dtype=np.float32)[None, :, :], n_models, axis=0)
 
-            predictions[0, train_mask[0, :, 0] > 0, 0] += 100.0
-            predictions[1, test_mask[1, :, 0] > 0, 0] += 1.0
-            predictions[2, test_mask[2, :, 0] > 0, 0] += 2.0
+            fold_idx = fold_calls["count"]
+            fold_calls["count"] += 1
+            predictions[0, test_mask[0, :, 0] > 0, 0] += float(fold_idx)
+            predictions[1, test_mask[1, :, 0] > 0, 0] += float(fold_idx) + 1.0
+            predictions[2, test_mask[2, :, 0] > 0, 0] += float(fold_idx) + 2.0
 
             from methods.subsampling import compute_masked_losses
             from methods.trainers import BatchedTrainingOutputs
@@ -144,23 +178,24 @@ class TestCrossValidationMethod(unittest.TestCase):
             side_effect=_mock_train_parallel_isodepth_model,
         ):
             result_a = run_cross_validation_method(self.dataset, self.config, device=resolve_device("cpu"))
+            self.assertEqual(fold_calls["count"], self.config.n_folds)
+            fold_calls["count"] = 0
             result_b = run_cross_validation_method(self.dataset, self.config, device=resolve_device("cpu"))
+            self.assertEqual(fold_calls["count"], self.config.n_folds)
 
         self.assertEqual(result_a.method_name, "cross_validation")
-        self.assertAlmostEqual(result_a.stat_true, 0.0)
-        np.testing.assert_allclose(result_a.stat_perm, np.asarray([1.0, 4.0], dtype=np.float64))
-        self.assertAlmostEqual(result_a.p_value, 1.0 / 3.0)
-        np.testing.assert_array_equal(result_a.artifacts["train_mask"] + result_a.artifacts["test_mask"], 1.0)
+        self.assertEqual(result_a.artifacts["n_folds"], self.config.n_folds)
+        np.testing.assert_array_equal(
+            result_a.artifacts["train_mask"] + result_a.artifacts["test_mask"],
+            1.0,
+        )
         np.testing.assert_array_equal(result_a.artifacts["train_mask"], result_b.artifacts["train_mask"])
         np.testing.assert_array_equal(result_a.artifacts["test_mask"], result_b.artifacts["test_mask"])
-        self.assertEqual(result_a.artifacts["train_size"], 3)
-        self.assertEqual(result_a.artifacts["test_size"], 2)
-        self.assertEqual(len(recorded_masks), 2)
-        self.assertEqual(recorded_masks[0].shape, (self.config.n_perms + 1, self.dataset.n_cells, 1))
+        self.assertEqual(len(recorded_masks), self.config.n_folds * 2)  # two deterministic runs
         np.testing.assert_array_equal(recorded_masks[0][0], recorded_masks[0][1])
         np.testing.assert_array_equal(recorded_masks[0][0], recorded_masks[0][2])
 
-    def test_cross_validation_rejects_empty_holdout_after_rounding(self) -> None:
+    def test_cross_validation_rejects_too_many_folds(self) -> None:
         tiny_dataset = DatasetBundle(
             S=np.asarray([[0.0, 0.0], [1.0, 1.0]], dtype=np.float32),
             A=np.asarray([[0.0], [1.0]], dtype=np.float32),
@@ -168,7 +203,7 @@ class TestCrossValidationMethod(unittest.TestCase):
         config = TestConfig(
             method="cross_validation",
             metric="mse",
-            train_fraction=0.99,
+            n_folds=3,
             n_perms=1,
             epochs=1,
             patience=1,
@@ -190,7 +225,7 @@ class TestCrossValidationOutputs(unittest.TestCase):
                 method="cross_validation",
                 metric="mse",
                 n_perms=2,
-                train_fraction=0.75,
+                n_folds=2,
                 n_reruns=1,
                 epochs=5,
                 patience=2,
@@ -207,7 +242,7 @@ class TestCrossValidationOutputs(unittest.TestCase):
                     method="cross_validation",
                     metric="mse",
                     n_perms=2,
-                    train_fraction=0.75,
+                    n_folds=2,
                     n_reruns=1,
                     epochs=5,
                     patience=2,
@@ -219,12 +254,18 @@ class TestCrossValidationOutputs(unittest.TestCase):
             payload, result_path = save_standardized_outputs(dataset, result, run_config)
 
             self.assertEqual(payload["method_name"], "cross_validation")
-            self.assertEqual(payload["config"]["test"]["train_fraction"], 0.75)
+            self.assertEqual(payload["config"]["test"]["n_folds"], 2)
             self.assertIn("train_mask", payload["artifacts"])
             self.assertIn("test_mask", payload["artifacts"])
-            self.assertIn("null_summary", payload["artifacts"])
+            self.assertIn("per_fold_true_loss", payload["artifacts"])
+            self.assertIn("per_fold_p_values", payload["artifacts"])
+            self.assertIn("per_fold_true_isodepth", payload["artifacts"])
             self.assertTrue((result_path.parent / "cross_validation_test_metric_distribution.png").exists())
             self.assertTrue((result_path.parent / "cross_validation_test_isodepth.png").exists())
+            self.assertTrue((result_path.parent / "cross_validation_test_cv_fold_isodepths.png").exists())
+            self.assertTrue(
+                (result_path.parent / "cross_validation_test_cv_per_fold_metric_distributions.png").exists()
+            )
 
 
 if __name__ == "__main__":

@@ -1,0 +1,51 @@
+{
+  "experiment_name": "mouse_organogenesis_E10.5_heart_gaussian_cpm_poisson_schedule",
+  "description": "Sweep Gaussian-then-Poisson schedules on MOSTA E10.5 Heart. Gaussian (MSE) phase trains on normalized log-CPM + standardized expression; Poisson phase switches to raw counts.",
+  "plot_title": "MOSTA E10.5 Heart — Gaussian(log-CPM) MSE then Poisson(raw), free vs frozen encoder",
+  "data": {
+    "parent_h5ad": "data/h5ad/mouse-organogenesis/E10.5_E1S1.MOSTA.h5ad",
+    "parent_layer": "count",
+    "prepared_h5ad": "data/h5ad/mouse-organogenesis/E10.5_heart_1000hvg_gaussian_isodepth.h5ad",
+    "obs_filters": {},
+    "obs_drop_na": ["annotation"],
+    "layer_label": "Heart",
+    "layer_obs_key": "annotation",
+    "top_var_genes": 1000,
+    "covariate_obs_key": "gaussian_isodepth",
+    "spatial_key": "spatial",
+    "layer": null,
+    "seed": 42
+  },
+  "artifacts": {
+    "gaussian_isodepth_npz": "results/mouse-organogenesis/gaussian_E10.5_E1S1_1000_genes/Heart/Heart_isodepths.npz",
+    "poisson_isodepth_npz": "results/mouse-organogenesis/poisson_E10.5_E1S1_1000_genes/Heart/Heart_isodepths.npz"
+  },
+  "preprocessing": {
+    "min_cells_per_gene": 3,
+    "normalize_total": false,
+    "log1p": false,
+    "standardize_expression": false,
+    "standardize_coordinates": true
+  },
+  "gaussian_preprocessing": {
+    "normalize_total": true,
+    "log1p": true,
+    "standardize_expression": true
+  },
+  "schedule": {
+    "total_epochs": 500,
+    "gaussian_epochs_list": [0, 10, 100, 250, 400, 450],
+    "covariate_epochs": 500,
+    "n_reruns": 100,
+    "n_reruns_permutation": 10,
+    "sgd_batch_size": 128,
+    "lr": 0.001,
+    "decoder": "nn",
+    "seed": 42,
+    "device": "cuda"
+  },
+  "output": {
+    "out_dir": "results/mouse-organogenesis",
+    "run_name": "E10.5_heart_gaussian_cpm_poisson_schedule"
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "data": {
+    "source": "synthetic",
+    "mode": "noise",
+    "n_cells": 5000,
+    "n_genes": 20,
+    "shape": "square",
+    "sampling_bias": {"type": "uniform"},
+    "sigma": 0.5,
+    "poly_degree": 1,
+    "expression_distribution": "poisson",
+    "mean_count": 1.0,
+    "seed": 42
+  },
+  "test": {
+    "method": "parallel_permutation",
+    "metric": "nll_poisson_mse",
+    "n_perms": 99,
+    "epochs": 500,
+    "n_reruns": 1,
+    "lr": 0.001,
+    "seed": 42,
+    "device": "cuda",
+    "decoder": "nn",
+    "batch_size": null,
+    "verbose": true
+  },
+  "output": {
+    "out_dir": "results",
+    "run_name": "noise_poisson_slideseq",
+    "save_preds": false,
+    "save_perm_stats": true
+  }
+}

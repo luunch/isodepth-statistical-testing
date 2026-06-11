@@ -20,6 +20,50 @@ from experiments.configuration import save_standardized_outputs
 
 
 class TestSyntheticGeneration(unittest.TestCase):
+    def test_poisson_expression_distribution_generates_non_negative_counts(self) -> None:
+        dataset = generate_synthetic_dataset(
+            DataConfig(
+                source="synthetic",
+                mode="radial",
+                n_cells=64,
+                n_genes=5,
+                sigma=0.2,
+                expression_distribution="poisson",
+                mean_count=8.0,
+                seed=3,
+            )
+        )
+
+        self.assertEqual(dataset.meta["expression_distribution"], "poisson")
+        self.assertEqual(dataset.meta["mean_count"], 8.0)
+        A = np.asarray(dataset.A)
+        self.assertTrue(np.all(A >= 0.0))
+        self.assertTrue(np.all(np.isfinite(A)))
+        self.assertGreater(float(A.mean()), 0.0)
+
+    def test_poisson_expression_distribution_is_reproducible_for_fixed_seed(self) -> None:
+        config = DataConfig(
+            source="synthetic",
+            mode="radial",
+            n_cells=25,
+            n_genes=4,
+            sigma=0.1,
+            expression_distribution="poisson",
+            mean_count=6.0,
+            seed=11,
+        )
+        dataset_a = generate_synthetic_dataset(config)
+        dataset_b = generate_synthetic_dataset(config)
+        np.testing.assert_allclose(dataset_a.A, dataset_b.A)
+
+    def test_expression_distribution_is_rejected_for_h5ad(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="h5ad",
+                h5ad="data/example.h5ad",
+                expression_distribution="poisson",
+            ).validate()
+
     def test_fourier_bounds_set_the_frequency_band(self) -> None:
         simulator = SpatialDataSimulator(N=16, G=2, sigma=0.0)
         x = simulator.S[:, 0]

@@ -224,7 +224,7 @@ class TestRealDataExistenceConsistencySpec(unittest.TestCase):
                             "method": "cross_validation",
                             "metric": "mse",
                             "n_perms": 10,
-                            "train_fraction": 0.7,
+                            "n_folds": 3,
                             "epochs": 2,
                             "lr": 0.01,
                             "patience": 2,
@@ -260,7 +260,7 @@ class TestRealDataExistenceConsistencySpec(unittest.TestCase):
             run_config = build_repeat_run_config(build_run_config(str(spec.base_config), {}), spec, condition)
 
         self.assertEqual(run_config.test.method, "cross_validation")
-        self.assertEqual(run_config.test.train_fraction, 0.7)
+        self.assertEqual(run_config.test.n_folds, 3)
 
 
 class TestRealDataExistenceConsistencyHelpers(unittest.TestCase):
@@ -312,7 +312,7 @@ class TestRealDataExistenceConsistencyHelpers(unittest.TestCase):
                         "runtime_sec": 0.5,
                         "config": {
                             "data": {"source": "h5ad", "h5ad": "data/example.h5ad"},
-                            "test": {"seed": 13, "n_perms": 3, "train_fraction": 0.75},
+                            "test": {"seed": 13, "n_perms": 3, "n_folds": 5},
                             "output": {"run_name": "study__repeat-000__seed-013"},
                         },
                         "artifacts": {"true_isodepth": [0.0, 1.0, 2.0]},

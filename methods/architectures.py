@@ -6,6 +6,7 @@ import torch.nn as nn
 
 
 SUPPORTED_DECODER_TYPES = {"linear", "nn", "quadratic"}
+SUPPORTED_ENCODER_TYPES = {"mlp", "midline"}
 
 
 class QuadraticDecoder(nn.Module):
@@ -259,20 +260,27 @@ class ParallelCellTypeIsoDepthNet(nn.Module):
     so subsequent calls use contiguous slicing instead of per-type boolean masks.
     """
 
-    def __init__(self, M: int, n_cell_types: int, G: int, latent_dim: int = 1, decoder_type: str = "nn"):
+    def __init__(self, M: int, n_cell_types: int, G: int, latent_dim: int = 1, decoder_type: str = "nn", encoder_type: str = "mlp"):
         super().__init__()
         self.M = int(M)
         self.n_cell_types = int(n_cell_types)
         self.latent_dim = int(latent_dim)
         self.decoder_type = str(decoder_type)
+        self.encoder_type = str(encoder_type)
         self.G = int(G)
-        self.encoder = nn.Sequential(
-            ParallelLinear(M, 2, 20),
-            nn.ReLU(),
-            ParallelLinear(M, 20, 20),
-            nn.ReLU(),
-            ParallelLinear(M, 20, self.latent_dim),
-        )
+        if encoder_type == "midline":
+            if int(latent_dim) != 1:
+                raise ValueError("encoder_type='midline' requires latent_dim=1")
+            self.latent_dim = 1
+            self.encoder = ParallelParameterizedMidlineEncoder(self.M)
+        else:
+            self.encoder = nn.Sequential(
+                ParallelLinear(M, 2, 20),
+                nn.ReLU(),
+                ParallelLinear(M, 20, 20),
+                nn.ReLU(),
+                ParallelLinear(M, 20, self.latent_dim),
+            )
         self.decoders = nn.ModuleList([
             _build_parallel_decoder(M, self.latent_dim, G, decoder_type=self.decoder_type)
             for _ in range(self.n_cell_types)
@@ -280,6 +288,7 @@ class ParallelCellTypeIsoDepthNet(nn.Module):
         self._sort_idx: torch.Tensor | None = None
         self._unsort_idx: torch.Tensor | None = None
         self._type_offsets: list[tuple[int, int]] | None = None
+        self._cached_cell_type_indices: torch.Tensor | None = None
 
     def _build_routing_cache(self, cell_type_indices: torch.Tensor) -> None:
         """Pre-compute sorted order and per-type slice boundaries."""
@@ -300,10 +309,27 @@ class ParallelCellTypeIsoDepthNet(nn.Module):
         self._sort_idx = torch.from_numpy(sort_idx).long().to(device)
         self._unsort_idx = torch.from_numpy(unsort_idx).long().to(device)
         self._type_offsets = offsets
+        self._cached_cell_type_indices = cell_type_indices.detach().clone()
+
+    def _routing_cache_matches(self, cell_type_indices: torch.Tensor, device: torch.device) -> bool:
+        if (
+            self._sort_idx is None
+            or self._unsort_idx is None
+            or self._type_offsets is None
+            or self._cached_cell_type_indices is None
+            or self._sort_idx.device != device
+            or self._cached_cell_type_indices.device != device
+            or self._cached_cell_type_indices.shape != cell_type_indices.shape
+        ):
+            return False
+        return bool(torch.equal(self._cached_cell_type_indices, cell_type_indices))
+
+    def _ensure_routing_cache(self, cell_type_indices: torch.Tensor, device: torch.device) -> None:
+        if not self._routing_cache_matches(cell_type_indices, device):
+            self._build_routing_cache(cell_type_indices)
 
     def forward(self, x: torch.Tensor, cell_type_indices: torch.Tensor) -> torch.Tensor:
-        if self._sort_idx is None or self._sort_idx.device != x.device:
-            self._build_routing_cache(cell_type_indices)
+        self._ensure_routing_cache(cell_type_indices, x.device)
 
         latent = self.encoder(x)
         M, N, _ = x.shape
@@ -318,6 +344,114 @@ class ParallelCellTypeIsoDepthNet(nn.Module):
 
         output = sorted_output[:, self._unsort_idx, :]
         return output
+
+    def forward_masked(self, x: torch.Tensor, cell_type_indices: torch.Tensor) -> torch.Tensor:
+        """Forward pass using per-cell-type boolean masks; no CPU-GPU transfers.
+
+        The routing-cache ``forward`` path pre-sorts cells into contiguous blocks for
+        efficient slicing, but building that cache requires a GPU→CPU sync + numpy ops.
+        For mini-batches where N is small and cell composition changes every step, that
+        overhead dominates.  This method does the same routing entirely on-device via
+        boolean masks, which is fast for small N and never touches the CPU.
+        """
+        latent = self.encoder(x)  # (M, N, latent_dim)
+        M, N, _ = x.shape
+        output = torch.zeros(M, N, self.G, device=x.device, dtype=x.dtype)
+        for c in range(self.n_cell_types):
+            mask = cell_type_indices == c  # (N,) bool, stays on device
+            if mask.any():
+                output[:, mask, :] = self.decoders[c](latent[:, mask, :])
+        return output
+
+
+class ParameterizedMidlineEncoder(nn.Module):
+    """Learnable straight-line midline encoder.
+
+    Computes d = |x_c·sin θ + y_c·cos θ − c| on mean-centred coordinates,
+    then z-scores across cells.  Two free parameters: θ (line orientation)
+    and c (signed perpendicular offset from the centroid).
+
+    θ = π/2, c = 0 recovers the vertical midline through the centroid.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.latent_dim = 1
+        self.theta = nn.Parameter(torch.tensor(0.0))
+        self.c = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, s: torch.Tensor) -> torch.Tensor:
+        """s: (N, 2)."""
+        s_c = s - s.mean(dim=0, keepdim=True)
+        proj = s_c[:, 0] * torch.sin(self.theta) + s_c[:, 1] * torch.cos(self.theta)
+        depth = (proj - self.c).abs()
+        mu = depth.mean()
+        sigma = depth.std(unbiased=False).clamp_min(1e-8)
+        return ((depth - mu) / sigma).unsqueeze(-1)
+
+
+class ParallelParameterizedMidlineEncoder(nn.Module):
+    """M independent learnable midline encoders for batched parallel training.
+
+    Each slot m has its own θ_m and c_m; the functional form mirrors
+    :class:`ParameterizedMidlineEncoder`.
+    """
+
+    def __init__(self, M: int, init_theta: float = 0.0) -> None:
+        super().__init__()
+        self.M = int(M)
+        self.latent_dim = 1
+        self.theta = nn.Parameter(torch.full((M,), float(init_theta)))
+        self.c = nn.Parameter(torch.zeros(M))
+
+    def forward(self, s: torch.Tensor) -> torch.Tensor:
+        """s: (M, N, 2)."""
+        s_c = s - s.mean(dim=1, keepdim=True)
+        proj = (
+            s_c[..., 0] * torch.sin(self.theta).unsqueeze(-1)
+            + s_c[..., 1] * torch.cos(self.theta).unsqueeze(-1)
+        )
+        depth = (proj - self.c.unsqueeze(-1)).abs()
+        mu = depth.mean(dim=1, keepdim=True)
+        sigma = depth.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-8)
+        return ((depth - mu) / sigma).unsqueeze(-1)
+
+
+class MidlineEncoderNet(nn.Module):
+    """Parameterized midline encoder (2 learnable params: θ, c) + configurable decoder.
+
+    Encoder is restricted to straight-line depth contours; the decoder may be an MLP,
+    quadratic, or linear layer.  Gradient descent trains both encoder and decoder jointly.
+    """
+
+    def __init__(self, G: int, latent_dim: int = 1, decoder_type: str = "nn") -> None:
+        super().__init__()
+        if int(latent_dim) != 1:
+            raise ValueError("MidlineEncoderNet requires latent_dim=1.")
+        self.latent_dim = 1
+        self.decoder_type = str(decoder_type)
+        self.encoder = ParameterizedMidlineEncoder()
+        self.decoder = _build_decoder(1, G, decoder_type=self.decoder_type)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.decoder(self.encoder(x))
+
+
+class ParallelMidlineEncoderNet(nn.Module):
+    """M parallel parameterized midline encoders + M parallel decoders."""
+
+    def __init__(self, M: int, G: int, latent_dim: int = 1, decoder_type: str = "nn", init_theta: float = 0.0) -> None:
+        super().__init__()
+        if int(latent_dim) != 1:
+            raise ValueError("ParallelMidlineEncoderNet requires latent_dim=1.")
+        self.M = int(M)
+        self.latent_dim = 1
+        self.decoder_type = str(decoder_type)
+        self.encoder = ParallelParameterizedMidlineEncoder(self.M, init_theta=init_theta)
+        self.decoder = _build_parallel_decoder(self.M, 1, G, decoder_type=self.decoder_type)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.decoder(self.encoder(x))
 
 
 class DecoderOnlyNet(nn.Module):

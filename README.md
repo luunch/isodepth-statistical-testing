@@ -14,6 +14,11 @@ The active pipeline is built around these files and folders:
 - `data/schemas.py`: shared `DatasetBundle`, `TestConfig`, `RunConfig`, and `TestResult` contracts
 - `validation/`: smoothness and related validation checks
 
+`run_permutation.py` is the only Python entry point that should live at the
+repository root. Put all other standalone utilities, diagnostics, and
+regeneration helpers under `scripts/` so the root stays reserved for the main
+pipeline entry point.
+
 Legacy scripts that are not part of this pipeline are archived under `old/`.
 
 ## Data Layout
@@ -216,7 +221,7 @@ This option is intended for `h5ad` count-valued inputs and is not supported for 
 - `--method`: test method. Supported values are `parallel_permutation`, `cross_validation`, `full_retraining`, `comparison_perturbation_test`, `perturbation_test`, `comparison_subsampling_test`, `subsampling_test`.
 - `--metric`: one of `nll_gaussian_mse`, `mse`, `pearson_corr_mean`, `spearman_corr_mean`.
 - `--n-perms`: number of perturbations for `comparison_perturbation_test` and `perturbation_test`, number of random subset draws per fraction for `subsampling_test` and `comparison_subsampling_test`, or number of permutations for existence-style methods.
-- `--train-fraction`: train-set fraction for `cross_validation`. The remaining cells define the held-out test statistic.
+- `--n-folds`: number of k-fold splits for `cross_validation`. Each fold trains on all but one partition and evaluates the held-out test loss; fold losses are combined with fold-size weighting before the permutation comparison.
 - `--n-reruns`: number of parallel reruns trained per dataset instance inside the batched GASTON model. The minimum training reconstruction loss is selected independently for the observed dataset and every transformed/null dataset. Default is `30`.
 - `--alpha`: one-sided permutation significance threshold. Default is `0.05`.
 - `--n-nulls`: number of null datasets for `comparison_perturbation_test` and `comparison_subsampling_test`. This field is ignored by the direct transformed-data methods.
@@ -473,6 +478,125 @@ results/experiments/<experiment_name>/
     null_loss_density_overlay.png
     true_isodepth_spearman_matrix.png
     isodepth_spearman_histogram.png
+```
+
+## Recursive SVG Gradient Discovery
+
+Setting `test.recursive = true` enables iterative spatial gradient peeling.
+
+**Requirements:**
+- `test.method` must be `parallel_permutation`.
+- `test.decoder` must be `linear` or `quadratic` (the F-test requires a parametric decoder df). The `nn` decoder raises an error.
+- `cell_type = "none"` (default), `"together"`, and `"separate"` are all supported.
+
+**How it works (plain / `together` mode):**
+
+1. Run the permutation test on the full gene set.
+2. If `p_value >= alpha`, stop — no spatial structure found.
+3. Identify significant SVGs: per-gene F-test on the decoder predictions + Benjamini-Hochberg correction at `q < alpha`.
+4. If none pass, stop.
+5. Record gradient `k`, remove its SVGs from the dataset, repeat on remaining genes.
+6. Stop after `max_gradients` iterations or when no genes remain.
+
+Each gene is assigned to exactly one gradient. The covariate is carried through fitting but is not peeled recursively.
+
+**How it works (`separate` mode):**
+
+1. Run the full separate-mode permutation test (one model per cell type); save all standard per-type plots and CSVs.
+2. For each cell type with `p_value < alpha`, run the gradient-peeling loop **independently** on that cell type's data and save outputs in `<TypeName>/recursive/`.
+3. Cell types with `p_value >= alpha` are skipped (no `recursive/` folder created).
+4. A top-level `<run_name>_celltype_recursive_summary.json` records which types were processed and the number of gradients found per type.
+
+**Config parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `recursive` | `false` | Enable recursive mode |
+| `alpha` | `0.05` | Dataset significance threshold AND SVG BH q-value threshold |
+| `max_gradients` | `10` | Safety cap on number of gradients |
+
+Example config for plain mode (`configs/hypothalamus_recursive.json`):
+
+```json
+{
+  "test": {
+    "method": "parallel_permutation",
+    "decoder": "quadratic",
+    "recursive": true,
+    "alpha": 0.05,
+    "max_gradients": 10
+  }
+}
+```
+
+Example config for separate cell-type mode (`configs/hypothalamus_celltype_recursive.json`):
+
+```json
+{
+  "data": { "cell_type": "separate", "cell_type_key": "dominant_cell_type" },
+  "test": {
+    "method": "parallel_permutation",
+    "decoder": "quadratic",
+    "recursive": true,
+    "alpha": 0.05,
+    "max_gradients": 10
+  }
+}
+```
+
+Run:
+
+```bash
+python run_permutation.py --config configs/hypothalamus_recursive.json
+python run_permutation.py --config configs/hypothalamus_celltype_recursive.json
+```
+
+**Output layout (plain / `together` mode):**
+
+```text
+results/<run_name>/recursive/
+  combined_sig_genes.csv          # all SVGs: gene, p_value, q_value, corresponding_gradient
+  recursive_summary.json          # per-gradient summary + paths
+  gradient_1/
+    gradient_1_dataset.png        # spatial cell scatter coloured by expression
+    gradient_1_isodepth.png       # isodepth triptych (true, best null, worst null)
+    gradient_1_isodepth.npy       # isodepth vector (float32)
+    gradient_1_metric_distribution.png
+    gradient_1_null_distribution.npy
+    gradient_1_top_genes.png      # top genes by |Spearman ρ| vs gradient
+    gradient_1_sig_genes.csv
+    gradient_1_result.json
+  gradient_2/
+    ...
+```
+
+**Output layout (`separate` mode):**
+
+```text
+results/<run_name>/
+  <run_name>_result.json                         # standard separate result
+  <run_name>_celltype_recursive_summary.json     # NEW: per-type recursive summary
+  TypeA/                                         # standard per-type outputs (unchanged)
+    TypeA_dataset.png
+    TypeA_isodepth.png
+    TypeA_metric_distribution.png
+    TypeA_gene_expression_vs_isodepth.png
+    TypeA_isodepth_sig_genes.csv
+    recursive/                                   # NEW: only for types with p < alpha
+      combined_sig_genes.csv
+      recursive_summary.json
+      gradient_1/
+        gradient_1_dataset.png
+        gradient_1_isodepth.png
+        gradient_1_isodepth.npy
+        gradient_1_metric_distribution.png
+        gradient_1_null_distribution.npy
+        gradient_1_top_genes.png
+        gradient_1_sig_genes.csv
+        gradient_1_result.json
+      gradient_2/  ...
+  TypeB/                                         # no recursive/ if p >= alpha
+    ...
 ```
 
 ## Notes

@@ -1,0 +1,35 @@
+{
+  "experiment_name": "dlpfc_study_smoke",
+  "run_full_sections": false,
+  "data": {
+    "h5ad_dir": "data/h5ad",
+    "sections": ["151673"],
+    "layer_obs": "Region",
+    "n_hvg": 2000
+  },
+  "negative": {
+    "layers": ["Layer1", "Layer2", "Layer3", "Layer4", "Layer5", "Layer6", "WM"],
+    "within_layer_min_spots": 40
+  },
+  "preprocessing": {
+    "min_cells_per_gene": 3,
+    "normalize_total": true,
+    "log1p": true,
+    "standardize_expression": true
+  },
+  "test": {
+    "method": "parallel_permutation",
+    "metric": "nll_gaussian_mse",
+    "n_perms": 99,
+    "epochs": 500,
+    "n_reruns": 5,
+    "lr": 0.001,
+    "decoder": "nn",
+    "device": "cuda",
+    "seed": 42
+  },
+  "output": {
+    "out_dir": "results/dlpfc_study_smoke",
+    "save_per_unit_outputs": false
+  }
+}

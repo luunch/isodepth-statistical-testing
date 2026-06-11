@@ -1,0 +1,39 @@
+{
+  "experiment_name": "liver_lobule_study",
+  "data": {
+    "h5ad": "data/h5ad/stmliver_CN16_D1.h5ad",
+    "mask": "data/h5ad/stmliver/Hepaquery_data/mask/CN16_D1_mask_0.1.png",
+    "ground_truth_obs": "dist_central"
+  },
+  "segmentation": {
+    "cv_min_size": 20,
+    "min_spots": 15,
+    "radius_px": 400.0
+  },
+  "preprocessing": {
+    "min_cells_per_gene": 2,
+    "normalize_total": true,
+    "log1p": true,
+    "standardize_expression": true
+  },
+  "test": {
+    "method": "parallel_permutation",
+    "metric": "nll_gaussian_mse",
+    "n_perms": 99,
+    "epochs": 300,
+    "n_reruns": 5,
+    "lr": 0.001,
+    "patience": 50,
+    "decoder": "nn",
+    "device": "cuda",
+    "seed": 42
+  },
+  "aggregate": {
+    "n_null_draws": 4000,
+    "length_scales": [0.5, 0.7, 1.0],
+    "main_length_scale": 0.7
+  },
+  "output": {
+    "out_dir": "results/liver_lobule_sweep"
+  }
+}

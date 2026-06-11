@@ -8,6 +8,8 @@ import numpy as np
 CANONICAL_METRIC_ALIASES = {
     "nll": "nll_gaussian_mse",
     "nll_gaussian_mse": "nll_gaussian_mse",
+    "nll_poisson_mse": "nll_poisson_mse",
+    "poisson": "nll_poisson_mse",
     "mse": "mse",
     "pearson": "pearson_corr_mean",
     "pearson_corr": "pearson_corr_mean",
@@ -44,7 +46,7 @@ def canonicalize_metric_name(metric: str) -> str:
 
 
 def metric_prefers_lower(metric: str) -> bool:
-    return canonicalize_metric_name(metric) in {"nll_gaussian_mse", "mse"}
+    return canonicalize_metric_name(metric) in {"nll_gaussian_mse", "nll_poisson_mse", "mse"}
 
 
 def permutation_p_value(metric: str, stat_true: float, stat_perm: np.ndarray) -> float:
@@ -70,7 +72,30 @@ def _mean_gene_spearman_corr(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return _mean_gene_pearson_corr(ranks_true, ranks_pred)
 
 
-def compute_metric(metric: str, y_true: np.ndarray, y_pred: np.ndarray) -> float:
+def compute_metric(
+    metric: str,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    *,
+    poisson_size_factors: np.ndarray | None = None,
+) -> float:
+    """Compute a scalar metric between ground-truth and predictions.
+
+    Parameters
+    ----------
+    metric:
+        Canonical metric name (or alias).
+    y_true:
+        Ground-truth expression matrix of shape ``(N, G)``.
+    y_pred:
+        Predicted values of shape ``(N, G)``.
+    poisson_size_factors:
+        Optional override for the Poisson NLL size factors, shape ``(N, 1)`` or
+        ``(N, G)``.  When *None* the default per-cell row sums of ``y_true`` are
+        used.  Pass per-gene per-cell-type mean counts here when evaluating a
+        ``cell_type="together"`` model so training and evaluation use the same
+        baseline offsets.
+    """
     metric = canonicalize_metric_name(metric)
     y_true = np.asarray(y_true, dtype=np.float64)
     y_pred = np.asarray(y_pred, dtype=np.float64)
@@ -84,6 +109,16 @@ def compute_metric(metric: str, y_true: np.ndarray, y_pred: np.ndarray) -> float
     if metric == "nll_gaussian_mse":
         n_total = y_true.shape[0] * y_true.shape[1]
         return float((n_total / 2) * np.log(2 * np.pi * mse + 1e-12) + (n_total / 2))
+    if metric == "nll_poisson_mse":
+        # Poisson NLL: mean(sf * exp(y_pred) - y_true * y_pred)
+        # Default size factors: per-cell row sum of y_true.
+        # Custom size factors (e.g. per-gene cell-type means) can be passed to
+        # remove baseline variation before measuring spatial log-fold-change.
+        if poisson_size_factors is not None:
+            sf = np.asarray(poisson_size_factors, dtype=np.float64)
+        else:
+            sf = y_true.sum(axis=1, keepdims=True)  # (N, 1)
+        return float(np.mean(sf * np.exp(y_pred) - y_true * y_pred))
     if metric == "pearson_corr_mean":
         return _mean_gene_pearson_corr(y_true, y_pred)
     if metric == "spearman_corr_mean":

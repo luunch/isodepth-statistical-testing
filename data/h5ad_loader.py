@@ -20,6 +20,94 @@ DEFAULT_OBS_COORD_CANDIDATES = [
 ]
 
 
+def _select_hvg_mask(adata: ad.AnnData, n_top: int) -> np.ndarray:
+    """Seurat HVG mask computed on a normalize+log1p copy (safe for raw counts)."""
+    import scanpy as sc
+
+    tmp = ad.AnnData(adata.X)
+    tmp.var_names = adata.var_names.copy()
+    tmp.obs_names = adata.obs_names.copy()
+    sc.pp.normalize_total(tmp, target_sum=1e4)
+    sc.pp.log1p(tmp)
+    sc.pp.highly_variable_genes(
+        tmp,
+        flavor="seurat",
+        n_top_genes=min(int(n_top), adata.n_vars - 1),
+    )
+    return tmp.var["highly_variable"].to_numpy()
+
+
+def _select_hvg_mask_from_counts(counts: np.ndarray, n_top: int) -> np.ndarray:
+    """Seurat HVG mask over a raw-count matrix ``(N, G)`` (numpy entry point)."""
+    counts = np.asarray(counts, dtype=np.float32)
+    n_genes = counts.shape[1]
+    if n_top <= 0 or int(n_top) >= n_genes:
+        return np.ones(n_genes, dtype=bool)
+    tmp = ad.AnnData(counts)
+    tmp.var_names = [f"gene_{i}" for i in range(n_genes)]
+    return _select_hvg_mask(tmp, int(n_top))
+
+
+def preprocess_celltype_subset(
+    counts: np.ndarray,
+    var_names: Optional[list[str]],
+    *,
+    min_cells_per_gene: int = 0,
+    top_var_genes: int = 0,
+    normalize_total: bool = False,
+    log1p: bool = False,
+    standardize_expression: bool = True,
+    q: Optional[int] = None,
+    seed: int = 0,
+) -> tuple[np.ndarray, list[str], str]:
+    """Apply the full expression-preprocessing pipeline to one cell-type subset.
+
+    Mirrors the global ordering used by :func:`load_h5ad_dataset` (HVG selection on
+    raw counts, then gene filtering + normalize/log1p/standardize/q), but every
+    statistic (HVG dispersion, ``min_cells_per_gene`` support, per-gene z-score
+    mean/std, Poisson low-rank factorization) is computed *within this subset only*.
+
+    Returns ``(A_c, var_names_c, feature_space)`` where ``var_names_c`` are the
+    surviving gene names (or Poisson-latent feature names when ``q`` is set).
+    """
+    counts = np.asarray(counts, dtype=np.float32)
+    n_genes_full = counts.shape[1]
+    if var_names is None:
+        var_names = [f"gene_{i}" for i in range(n_genes_full)]
+    var_names = [str(v) for v in var_names]
+    if len(var_names) != n_genes_full:
+        raise ValueError(
+            f"var_names length {len(var_names)} != counts genes {n_genes_full}"
+        )
+
+    surviving = np.arange(n_genes_full, dtype=np.int64)
+    work = counts
+    if top_var_genes and int(top_var_genes) > 0 and int(top_var_genes) < work.shape[1]:
+        hvg_mask = _select_hvg_mask_from_counts(work, int(top_var_genes))
+        work = work[:, hvg_mask]
+        surviving = surviving[hvg_mask]
+
+    transformed, transform_meta = apply_expression_transforms(
+        work,
+        min_cells_per_gene=min_cells_per_gene,
+        normalize_total=normalize_total,
+        log1p=log1p,
+        standardize_expression=standardize_expression,
+        q=q,
+        seed=seed,
+        return_metadata=True,
+    )
+    keep_mask = np.asarray(transform_meta["gene_keep_mask"], dtype=bool)
+    surviving = surviving[keep_mask]
+
+    feature_space = str(transform_meta["representation"])
+    if "feature_names" in transform_meta:
+        var_names_c = [str(name) for name in transform_meta["feature_names"]]
+    else:
+        var_names_c = [var_names[int(i)] for i in surviving]
+    return np.asarray(transformed, dtype=np.float32), var_names_c, feature_space
+
+
 def _extract_coordinates(
     adata: ad.AnnData,
     *,
@@ -76,6 +164,40 @@ def _extract_expression(
     if x.ndim != 2:
         raise ValueError(f"Expression matrix must be 2D, got shape {x.shape}")
     return x
+
+
+def _detect_coordinate_um_per_unit(adata: ad.AnnData) -> Optional[float]:
+    """Try to detect microns-per-coordinate-unit from uns['spatial'] scalefactors.
+
+    - Visium HD: reads ``scalefactors/microns_per_pixel`` directly.
+    - Classic Visium: derives from ``scalefactors/spot_diameter_fullres``
+      using the known physical spot diameter of 55 µm.
+    Returns ``None`` when no recognisable scalefactor entry is found.
+    """
+    sp = adata.uns.get("spatial") if "spatial" in adata.uns else None
+    if not isinstance(sp, dict):
+        return None
+    for lib_val in sp.values():
+        if not isinstance(lib_val, dict):
+            continue
+        sf = lib_val.get("scalefactors")
+        if not isinstance(sf, dict):
+            continue
+        if "microns_per_pixel" in sf:
+            try:
+                val = float(sf["microns_per_pixel"])
+                if val > 0:
+                    return val
+            except (TypeError, ValueError):
+                pass
+        if "spot_diameter_fullres" in sf:
+            try:
+                spot_px = float(sf["spot_diameter_fullres"])
+                if spot_px > 0:
+                    return 55.0 / spot_px
+            except (TypeError, ValueError):
+                pass
+    return None
 
 
 def _uns_keys_from_io_registry_error(error: BaseException) -> list[str]:
@@ -143,6 +265,57 @@ def _safe_read_h5ad(h5ad_path: str) -> ad.AnnData:
             return ad.read_h5ad(h5ad_path)
 
 
+def _apply_obs_subset(
+    adata: ad.AnnData,
+    *,
+    obs_filters: Optional[dict] = None,
+    obs_indices: Optional[str] = None,
+    obs_drop_na: Optional[list[str]] = None,
+) -> ad.AnnData:
+    """Subset ``adata`` by global cell indices, equality filters, and/or non-null obs columns."""
+    mask = np.ones(adata.n_obs, dtype=bool)
+
+    if obs_indices is not None:
+        idx = np.load(obs_indices)
+        idx = np.asarray(idx, dtype=np.int64)
+        if idx.size == 0:
+            raise ValueError(f"obs_indices file is empty: {obs_indices}")
+        index_mask = np.zeros(adata.n_obs, dtype=bool)
+        index_mask[idx] = True
+        mask &= index_mask
+
+    if obs_filters:
+        for col, val in obs_filters.items():
+            if col not in adata.obs.columns:
+                raise ValueError(
+                    f"obs_filters key '{col}' not in adata.obs; "
+                    f"available: {list(adata.obs.columns)}"
+                )
+            mask &= adata.obs[col].astype(str).to_numpy() == str(val)
+
+    if obs_drop_na:
+        for col in obs_drop_na:
+            if col not in adata.obs.columns:
+                raise ValueError(
+                    f"obs_drop_na key '{col}' not in adata.obs; "
+                    f"available: {list(adata.obs.columns)}"
+                )
+            mask &= adata.obs[col].notna().to_numpy()
+
+    if mask.all():
+        return adata
+    if not mask.any():
+        raise ValueError(
+            "Obs subset matched no cells "
+            f"(obs_filters={obs_filters}, obs_indices={obs_indices}, obs_drop_na={obs_drop_na})"
+        )
+
+    sub = adata[mask]
+    if getattr(sub, "isbacked", False):
+        return sub.to_memory()
+    return sub.copy()
+
+
 def load_h5ad_dataset(
     *,
     h5ad_path: str,
@@ -153,6 +326,7 @@ def load_h5ad_dataset(
     use_raw: bool = False,
     min_cells_per_gene: int = 0,
     top_var_genes: int = 0,
+    normalize_total: bool = False,
     log1p: bool = False,
     standardize_expression: bool = True,
     q: Optional[int] = None,
@@ -162,9 +336,30 @@ def load_h5ad_dataset(
     cell_type_key: str = "cell_type",
     min_cells_per_celltype: int = 1,
     covariate_obs_key: Optional[str] = None,
+    obs_filters: Optional[dict] = None,
+    obs_indices: Optional[str] = None,
+    obs_drop_na: Optional[list[str]] = None,
 ) -> DatasetBundle:
-    adata = _safe_read_h5ad(h5ad_path)
-    if top_var_genes and int(top_var_genes) > 0:
+    needs_subset = bool(obs_filters or obs_indices or obs_drop_na)
+    if needs_subset:
+        adata = ad.read_h5ad(h5ad_path, backed="r")
+        adata = _apply_obs_subset(
+            adata,
+            obs_filters=obs_filters,
+            obs_indices=obs_indices,
+            obs_drop_na=obs_drop_na,
+        )
+    else:
+        adata = _safe_read_h5ad(h5ad_path)
+    if getattr(adata, "isbacked", False):
+        adata = adata.to_memory()
+    # In cell_type="separate" mode every expression statistic (HVG dispersion,
+    # gene support, z-score mean/std) must be computed *within each cell type*,
+    # not across the pooled multi-type matrix.  Defer HVG selection and all
+    # expression transforms to per-cell-type processing (see
+    # methods.permutation._process_single_celltype_separate); keep raw counts here.
+    defer_preprocessing = isinstance(cell_type, str) and cell_type == "separate"
+    if top_var_genes and int(top_var_genes) > 0 and not defer_preprocessing:
         n_top = int(top_var_genes)
         if n_top >= adata.n_vars:
             warnings.warn(
@@ -172,11 +367,8 @@ def load_h5ad_dataset(
                 "keeping all genes."
             )
         else:
-            import scanpy as sc
-
-            sc.pp.highly_variable_genes(adata, flavor="seurat", n_top_genes=n_top)
-            # Subset the var dimension so X, layers, and var_names stay aligned downstream.
-            adata = adata[:, adata.var["highly_variable"].to_numpy()].copy()
+            hvg_mask = _select_hvg_mask(adata, n_top)
+            adata = adata[:, hvg_mask].copy()
     s = _extract_coordinates(
         adata,
         spatial_key=spatial_key,
@@ -257,7 +449,15 @@ def load_h5ad_dataset(
         if covariate_values is not None:
             covariate_values = covariate_values[idx]
 
-    if cell_type_mode == "separate" and cell_type_labels is not None and q is not None:
+    if defer_preprocessing:
+        # Keep raw counts; per-cell-type preprocessing happens downstream.  Mark
+        # every gene as retained so var_names lines up with the raw matrix.
+        a = np.asarray(a, dtype=np.float32)
+        transform_meta = {
+            "gene_keep_mask": np.ones(a.shape[1], dtype=bool),
+            "representation": "raw_counts_deferred",
+        }
+    elif cell_type_mode == "separate" and cell_type_labels is not None and q is not None:
         a, transform_meta = apply_expression_transforms_by_celltype(
             a,
             cell_type_labels,
@@ -272,6 +472,7 @@ def load_h5ad_dataset(
         a, transform_meta = apply_expression_transforms(
             a,
             min_cells_per_gene=min_cells_per_gene,
+            normalize_total=normalize_total,
             log1p=log1p,
             standardize_expression=standardize_expression,
             q=q,
@@ -286,16 +487,22 @@ def load_h5ad_dataset(
     else:
         feature_names = [str(name) for name in raw_var_names[keep_mask]]
 
+    coordinate_um_per_unit = _detect_coordinate_um_per_unit(adata)
+
     meta = {
         "source": "h5ad",
         "h5ad": h5ad_path,
         "spatial_key": spatial_key,
+        "obs_filters": obs_filters,
+        "obs_indices": obs_indices,
+        "obs_drop_na": obs_drop_na,
         "obs_x_col": obs_x_col,
         "obs_y_col": obs_y_col,
         "layer": layer,
         "use_raw": use_raw,
         "min_cells_per_gene": int(min_cells_per_gene),
         "top_var_genes": int(top_var_genes),
+        "normalize_total": bool(normalize_total),
         "log1p": bool(log1p),
         "standardize_expression": bool(standardize_expression),
         "q": None if q is None else int(q),
@@ -304,8 +511,22 @@ def load_h5ad_dataset(
         "feature_space": str(transform_meta["representation"]),
         "var_names": feature_names,
     }
+    if coordinate_um_per_unit is not None:
+        meta["coordinate_um_per_unit"] = float(coordinate_um_per_unit)
     if transform_meta.get("q_by_celltype"):
         meta["q_by_celltype"] = True
+    if defer_preprocessing:
+        # Parameters the per-cell-type path needs (these live on DataConfig, which
+        # the permutation code does not otherwise see).
+        meta["separate_preprocessing"] = {
+            "min_cells_per_gene": int(min_cells_per_gene),
+            "top_var_genes": int(top_var_genes),
+            "normalize_total": bool(normalize_total),
+            "log1p": bool(log1p),
+            "standardize_expression": bool(standardize_expression),
+            "q": None if q is None else int(q),
+            "seed": int(seed),
+        }
     if cell_type_labels is not None and cell_type_names is not None:
         meta["cell_type_labels"] = cell_type_labels
         meta["cell_type_names"] = cell_type_names
@@ -342,6 +563,7 @@ def load_dataset_from_config(
         use_raw=config.use_raw,
         min_cells_per_gene=config.min_cells_per_gene,
         top_var_genes=config.top_var_genes,
+        normalize_total=config.normalize_total,
         log1p=config.log1p,
         standardize_expression=config.standardize_expression,
         q=config.q,
@@ -351,4 +573,7 @@ def load_dataset_from_config(
         cell_type_key=config.cell_type_key,
         min_cells_per_celltype=config.min_cells_per_celltype,
         covariate_obs_key=covariate_obs_key,
+        obs_filters=config.obs_filters,
+        obs_indices=config.obs_indices,
+        obs_drop_na=config.obs_drop_na,
     )

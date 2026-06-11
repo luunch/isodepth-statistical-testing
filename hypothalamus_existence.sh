@@ -25,4 +25,4 @@ export LD_LIBRARY_PATH="$CONDA_PREFIX/lib/python3.10/site-packages/nvidia/nvjitl
 
 # Step 5: Run the hypothalamus existence permutation test.
 python run_permutation.py \
-  --config configs/hypothalamus_existence.json
+  --config configs/hypothalamus/hypothalamus_existence.json

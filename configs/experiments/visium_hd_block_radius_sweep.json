@@ -1,0 +1,17 @@
+{
+  "experiment_name": "visium_hd_block_radius_sweep",
+  "data": {
+    "h5ad": "data/h5ad/hippocampal_pyramidal.h5ad",
+    "spatial_key": "spatial",
+    "coordinate_um_per_unit": 0.2738242950835738,
+    "bin_size_um": 8.0
+  },
+  "sweep": {
+    "block_radii_um": [8, 16, 24, 32, 40, 48, 56],
+    "block_jitter": true,
+    "seed": 42
+  },
+  "output": {
+    "out_dir": "results/hippocampus/visium_hd_block_radius_sweep"
+  }
+}

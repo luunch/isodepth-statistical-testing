@@ -1,0 +1,18 @@
+{
+  "experiment_name": "cosmx_celltype_regions",
+  "manifest": "data/h5ad/cosmx_celltype_regions/manifest.csv",
+  "config_dir": "configs/cosmx_celltype_regions",
+  "output": {
+    "out_dir": "results/cosmx_celltype_regions",
+    "save_per_region_outputs": true,
+    "write_summary_after_each": true
+  },
+  "run": {
+    "skip_finished": true,
+    "sort_by": "sample_then_size",
+    "limit": 0
+  },
+  "summary": {
+    "alpha": 0.05
+  }
+}

@@ -14,7 +14,7 @@ from torch.optim import lr_scheduler
 from tqdm import tqdm
 
 from data.schemas import TestConfig
-from data.transforms import zscore_covariate
+from data.transforms import celltype_expression_residuals, zscore_covariate
 from methods.architectures import (
     CellTypeIsoDepthNet,
     DecoderOnlyNet,
@@ -22,10 +22,13 @@ from methods.architectures import (
     HybridMidlineLatent,
     HybridMidlineParallelNet,
     IsoDepthNet,
+    MidlineEncoderNet,
     ParallelCellTypeIsoDepthNet,
     ParallelDecoderOnlyNetFixed,
     ParallelIsoDepthNet,
     ParallelLinear,
+    ParallelMidlineEncoderNet,
+    ParallelParameterizedMidlineEncoder,
     ParallelQuadraticDecoder,
 )
 from methods.metrics import canonicalize_metric_name, compute_metric, metric_prefers_lower
@@ -76,6 +79,198 @@ def _resolve_decoder_type(config: TestConfig) -> str:
     return str(getattr(config, "decoder", "nn"))
 
 
+def _resolve_encoder_type(config: TestConfig) -> str:
+    return str(getattr(config, "encoder", "mlp"))
+
+
+def covariate_decoder_is_closed_form(config: TestConfig) -> bool:
+    """True when the covariate decoder admits a closed-form OLS fit.
+
+    Linear and quadratic decoders are affine in their (fixed) latent features, so a
+    decoder-only covariate model has a unique global least-squares solution and does
+    not need iterative neural-network training.
+    """
+    return _resolve_decoder_type(config) in ("linear", "quadratic")
+
+
+def poisson_parametric_decoder_uses_irls(config: TestConfig) -> bool:
+    """True when isodepth metrics should use an exact Poisson-GLM decoder refit.
+
+    Applies to ``nll_poisson_mse`` with ``decoder`` in {``linear``, ``quadratic``}.
+    The encoder is still trained with gradient descent; after the best rerun is chosen,
+    the decoder is replaced by :func:`fit_poisson_glm_irls` on the learned latent so
+    true/null metrics match the covariate path.  ``decoder="nn"`` keeps full GD.
+    """
+    return (
+        canonicalize_metric_name(config.metric) == "nll_poisson_mse"
+        and _resolve_decoder_type(config) in ("linear", "quadratic")
+    )
+
+
+def fit_closed_form_decoder(
+    latent: np.ndarray,
+    A: np.ndarray,
+    decoder_type: str,
+) -> np.ndarray:
+    """Closed-form OLS fit of expression ``A`` on a fixed 1-D ``latent``.
+
+    Returns per-cell predictions of shape ``(N, G)`` — the exact minimizer of the
+    mean-squared reconstruction loss that decoder-only NN training approximates:
+
+    - ``linear``:    ``A_g ≈ w_g · z + b_g``            (design matrix ``[z, 1]``)
+    - ``quadratic``: ``A_g ≈ w1_g · z + w2_g · z² + b_g`` (design matrix ``[z, z², 1]``)
+
+    Solving once for all genes (shared design matrix) is equivalent to, but far
+    cheaper than, training an :class:`nn.Linear` / :class:`QuadraticDecoder` head.
+    """
+    z = np.asarray(latent, dtype=np.float64).reshape(-1)
+    a = np.asarray(A, dtype=np.float64)
+    if z.shape[0] != a.shape[0]:
+        raise ValueError(
+            f"latent length {z.shape[0]} does not match expression rows {a.shape[0]}"
+        )
+    ones = np.ones_like(z)
+    if decoder_type == "linear":
+        design = np.column_stack([z, ones])
+    elif decoder_type == "quadratic":
+        design = np.column_stack([z, z ** 2, ones])
+    else:
+        raise ValueError(
+            f"closed-form covariate fit supports only 'linear'/'quadratic', got '{decoder_type}'"
+        )
+    beta, *_ = np.linalg.lstsq(design, a, rcond=None)
+    pred = design @ beta
+    return np.asarray(pred, dtype=np.float32)
+
+
+def _poisson_glm_design_matrix(
+    z: np.ndarray,
+    decoder_type: str,
+    *,
+    col_mean: np.ndarray | None = None,
+    col_std: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Build standardized Poisson-GLM predictors and the augmented design matrix."""
+    z_arr = np.asarray(z, dtype=np.float64)
+    if z_arr.ndim == 1:
+        z_arr = z_arr.reshape(-1, 1)
+    raw = z_arr if decoder_type == "linear" else np.concatenate([z_arr, z_arr ** 2], axis=1)
+    if col_mean is None:
+        col_mean = raw.mean(axis=0, keepdims=True)
+    if col_std is None:
+        col_std = raw.std(axis=0, keepdims=True)
+        col_std = np.where(col_std > 1e-12, col_std, 1.0)
+    predictors = (raw - col_mean) / col_std
+    design = np.concatenate([np.ones((z_arr.shape[0], 1)), predictors], axis=1)
+    return design, col_mean, col_std
+
+
+def fit_poisson_glm_irls(
+    latent: np.ndarray,
+    A: np.ndarray,
+    decoder_type: str,
+    *,
+    size_factors: np.ndarray | None = None,
+    predict_latent: np.ndarray | None = None,
+    max_iter: int = 100,
+    tol: float = 1e-10,
+) -> np.ndarray:
+    """Exact Poisson-GLM fit of counts ``A`` on a fixed ``latent`` via IRLS.
+
+    This is the count-data analogue of :func:`fit_closed_form_decoder`.  The fixed
+    latent makes each gene an independent Poisson GLM with log link and a per-cell
+    exposure offset ``log(sf_i)``:
+
+        ``E[A_ig] = sf_i · exp(λ_ig)``,  ``λ_ig = b_g + Σ_d w_dg · φ_d(z_id)``
+
+    with design ``φ = [z]`` (``linear``) or ``φ = [z, z²]`` (``quadratic``) — the same
+    decoder family as :class:`QuadraticDecoder`.  IRLS (Fisher scoring) solves the
+    weighted normal equations to the maximum-likelihood optimum, so it does not
+    diverge the way Adam/SGD on the fixed heavy-tailed midline latent can.
+
+    Returns per-cell **log-rate** predictions ``λ`` of shape ``(N, G)`` (the exposure
+    offset is applied separately by ``compute_metric``'s ``poisson_size_factors``), so
+    the result plugs directly into ``nll_poisson_mse`` evaluation.
+
+    Notes
+    -----
+    - Predictor columns are standardized before solving.  This is an invertible linear
+      reparameterization of the design, so it leaves the fitted ``λ`` (and hence the
+      likelihood/optimum) mathematically unchanged; it only conditions the IRLS solve.
+    - ``size_factors`` may be ``None`` (defaults to per-cell row sums of ``A``, matching
+      ``compute_metric``), shape ``(N, 1)``, or per-gene ``(N, G)``.
+    - ``predict_latent`` optionally supplies a second coordinate matrix (e.g. all cells
+      after fitting on a train mask).  Standardization uses the fit ``latent`` only.
+    - All-zero genes have a degenerate MLE (intercept → −∞); they are assigned a large
+      negative log-rate so their predicted mean is ≈0 (≈0 NLL contribution).
+    """
+    if decoder_type not in ("linear", "quadratic"):
+        raise ValueError(
+            f"Poisson IRLS covariate fit supports only 'linear'/'quadratic', got '{decoder_type}'"
+        )
+    z = np.asarray(latent, dtype=np.float64)
+    if z.ndim == 1:
+        z = z.reshape(-1, 1)
+    a = np.asarray(A, dtype=np.float64)
+    n_cells, n_genes = a.shape
+    if z.shape[0] != n_cells:
+        raise ValueError(
+            f"latent rows {z.shape[0]} do not match expression rows {n_cells}"
+        )
+
+    if size_factors is None:
+        sf = a.sum(axis=1, keepdims=True)
+    else:
+        sf = np.asarray(size_factors, dtype=np.float64)
+        if sf.ndim == 1:
+            sf = sf.reshape(-1, 1)
+    sf = np.maximum(sf, 1e-12)
+    log_sf = np.log(sf)  # (N, 1) or (N, G)
+
+    X, col_mean, col_std = _poisson_glm_design_matrix(z, decoder_type)
+    n_params = X.shape[1]
+
+    # Initialize intercept at the per-gene intercept-only optimum (slopes 0), which is
+    # the log-mean-rate baseline; standardized predictors are mean-zero so this is the
+    # exact intercept-only fit and IRLS starts at-or-below the floor (never above it).
+    beta = np.zeros((n_params, n_genes))
+    col_sum = a.sum(axis=0)  # (G,)
+    sf_sum = sf.sum(axis=0)  # (1,) or (G,)
+    beta[0] = np.log(np.maximum(col_sum, 1e-12) / np.maximum(sf_sum, 1e-12))
+
+    zero_genes = col_sum <= 0.0
+
+    for _ in range(int(max_iter)):
+        eta = X @ beta + log_sf  # (N, G)
+        np.clip(eta, -30.0, 30.0, out=eta)  # solver-internal overflow guard only
+        mu = np.exp(eta)  # (N, G)
+        # IRLS working response for log-rate part (exposure offset cancels out):
+        #   working = X@beta + (A - mu) / mu, weights W = mu
+        working = (X @ beta) + (a - mu) / np.maximum(mu, 1e-12)
+        weights = mu
+        # Weighted normal equations per gene: (Xᵀ W X) β = Xᵀ W working
+        xtwx = np.einsum("np,nq,ng->gpq", X, X, weights, optimize=True)
+        xtwu = np.einsum("np,ng,ng->gp", X, weights, working, optimize=True)
+        # Pseudo-inverse (minimum-norm) handles rank-deficient designs without a ridge
+        # prior, so the model/objective is unchanged.
+        beta_new = (np.linalg.pinv(xtwx) @ xtwu[..., None])[..., 0].T  # (p, G)
+        if np.max(np.abs(beta_new - beta)) < tol:
+            beta = beta_new
+            break
+        beta = beta_new
+
+    query = z if predict_latent is None else np.asarray(predict_latent, dtype=np.float64)
+    if query.ndim == 1:
+        query = query.reshape(-1, 1)
+    X_query, _, _ = _poisson_glm_design_matrix(
+        query, decoder_type, col_mean=col_mean, col_std=col_std
+    )
+    lam = X_query @ beta  # log-rate; exposure offset applied downstream
+    if np.any(zero_genes):
+        lam[:, zero_genes] = -20.0
+    return np.asarray(lam, dtype=np.float32)
+
+
 def _clone_state_dict(state_dict: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return {name: tensor.detach().cpu().clone() for name, tensor in state_dict.items()}
 
@@ -117,9 +312,20 @@ def build_batched_isodepth_initial_state(
     """State dict matching ``train_batched_isodepth_model`` (ParallelIsoDepthNet or HybridMidlineParallelNet)."""
     resolved_device = device or torch.device("cpu")
     decoder_type = _resolve_decoder_type(config)
+    encoder_type = _resolve_encoder_type(config)
     n_reruns = int(config.n_reruns)
     _set_torch_seed(int(config.seed))
-    if _is_midline_covariate(config):
+    if encoder_type == "midline":
+        if latent_dim != 1:
+            raise ValueError("encoder='midline' requires latent_dim=1")
+        model = ParallelMidlineEncoderNet(
+            total_models,
+            n_genes,
+            latent_dim=1,
+            decoder_type=decoder_type,
+            init_theta=float(getattr(config, "midline_init_theta", 0.0)),
+        ).to(resolved_device)
+    elif _is_midline_covariate(config):
         if latent_dim != 1:
             raise ValueError("covariate type midline requires latent_dim == 1")
         model = HybridMidlineParallelNet(
@@ -247,7 +453,7 @@ def _parallel_model_slot_count(model: nn.Module) -> int:
 def _encoder_expects_batched_spatial_input(model: nn.Module) -> bool:
     if isinstance(
         model,
-        (ParallelIsoDepthNet, ParallelCellTypeIsoDepthNet, HybridMidlineParallelNet),
+        (ParallelIsoDepthNet, ParallelCellTypeIsoDepthNet, HybridMidlineParallelNet, ParallelMidlineEncoderNet),
     ):
         return True
     return getattr(model, "M", None) is not None
@@ -498,14 +704,21 @@ def _compute_reconstruction_loss_per_model(
     output: torch.Tensor,
     targets: torch.Tensor,
     loss_mask_t: torch.Tensor | None,
+    *,
+    poisson_size_factors: torch.Tensor | None = None,
 ) -> torch.Tensor:
     # targets may be (M, N, G) or (N, G); broadcasting handles both.
-    squared_error = (output - targets) ** 2
+    if poisson_size_factors is not None:
+        # Poisson NLL: N_i * exp(y_pred) - a_raw * y_pred
+        # poisson_size_factors shape: (N, 1) -- broadcasts with (M, N, G).
+        elementwise_loss = poisson_size_factors * torch.exp(output) - targets * output
+    else:
+        elementwise_loss = (output - targets) ** 2
     if loss_mask_t is not None:
-        squared_error = squared_error * loss_mask_t
+        elementwise_loss = elementwise_loss * loss_mask_t
         active_counts = loss_mask_t.sum(dim=(1, 2)).clamp_min(1.0)
-        return squared_error.sum(dim=(1, 2)) / active_counts
-    return squared_error.mean(dim=(1, 2))
+        return elementwise_loss.sum(dim=(1, 2)) / active_counts
+    return elementwise_loss.mean(dim=(1, 2))
 
 
 def _broadcast_targets(targets: torch.Tensor, output: torch.Tensor) -> torch.Tensor:
@@ -533,19 +746,40 @@ def _masked_metric_from_mse(
     raise ValueError(f"Unsupported masked-loss metric '{metric}'")
 
 
+def _broadcast_poisson_size_factors(
+    poisson_size_factors: torch.Tensor | None,
+    targets_b: torch.Tensor,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    if poisson_size_factors is None:
+        return targets_b.sum(dim=2, keepdim=True)
+    sf = poisson_size_factors
+    if sf.ndim == 2:
+        return sf.unsqueeze(0).expand(output.shape[0], -1, -1)
+    if sf.ndim == 3 and sf.shape[0] == 1:
+        return sf.expand(output.shape[0], -1, -1)
+    return sf
+
+
 def _compute_masked_metric_per_model(
     output: torch.Tensor,
     targets: torch.Tensor,
     loss_mask_t: torch.Tensor,
     *,
     metric: str,
+    poisson_size_factors: torch.Tensor | None = None,
 ) -> torch.Tensor:
     targets_b = _broadcast_targets(targets, output)
-    squared_error = (output - targets_b) ** 2
+    metric = canonicalize_metric_name(metric)
     loss_mask = loss_mask_t
     if loss_mask.shape[-1] == 1:
         loss_mask = loss_mask.expand(-1, -1, output.shape[-1])
     active_counts = loss_mask.sum(dim=(1, 2)).clamp_min(1.0)
+    if metric == "nll_poisson_mse":
+        sf = _broadcast_poisson_size_factors(poisson_size_factors, targets_b, output)
+        elementwise = sf * torch.exp(output) - targets_b * output
+        return elementwise.mul(loss_mask).sum(dim=(1, 2)) / active_counts
+    squared_error = (output - targets_b) ** 2
     mse = squared_error.mul(loss_mask).sum(dim=(1, 2)) / active_counts
     return _masked_metric_from_mse(mse, active_counts, metric=metric)
 
@@ -557,6 +791,166 @@ def _null_extreme_indices(model_metrics: np.ndarray, metric: str) -> tuple[int, 
     if metric_prefers_lower(metric):
         return int(np.argmin(stat_perm)), int(np.argmax(stat_perm))
     return int(np.argmax(stat_perm)), int(np.argmin(stat_perm))
+
+
+def _slot_loss_mask_np(
+    loss_mask_t: torch.Tensor | None,
+    slot: int,
+    n_genes: int,
+) -> np.ndarray | None:
+    if loss_mask_t is None:
+        return None
+    mask = loss_mask_t[slot : slot + 1].detach().cpu().numpy()
+    if mask.ndim == 3:
+        mask = mask[0]
+    if mask.shape[-1] == 1:
+        mask = np.repeat(mask, n_genes, axis=1)
+    return np.asarray(mask, dtype=np.float64)
+
+
+def _active_cell_indices_from_mask(mask: np.ndarray | None) -> np.ndarray | None:
+    if mask is None:
+        return None
+    active = mask.sum(axis=1) > 0
+    if not np.any(active):
+        return None
+    return np.flatnonzero(active)
+
+
+def _compute_masked_metric_np(
+    metric: str,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    eval_mask: np.ndarray | None,
+    *,
+    poisson_size_factors: np.ndarray | None = None,
+) -> float:
+    metric = canonicalize_metric_name(metric)
+    if eval_mask is None:
+        return float(
+            compute_metric(metric, y_true, y_pred, poisson_size_factors=poisson_size_factors)
+        )
+    mask = np.asarray(eval_mask, dtype=np.float64)
+    if mask.shape[-1] == 1:
+        mask = np.repeat(mask, y_true.shape[1], axis=1)
+    active = float(mask.sum())
+    if active <= 0.0:
+        raise ValueError("eval mask has no active entries")
+    y_true = np.asarray(y_true, dtype=np.float64)
+    y_pred = np.asarray(y_pred, dtype=np.float64)
+    if metric == "nll_poisson_mse":
+        if poisson_size_factors is not None:
+            sf = np.asarray(poisson_size_factors, dtype=np.float64)
+        else:
+            sf = y_true.sum(axis=1, keepdims=True)
+        elementwise = sf * np.exp(y_pred) - y_true * y_pred
+        return float((elementwise * mask).sum() / active)
+    mse = float(((y_pred - y_true) ** 2 * mask).sum() / active)
+    if metric == "mse":
+        return mse
+    if metric == "nll_gaussian_mse":
+        n_total = active
+        return float((n_total / 2) * np.log(2 * np.pi * mse + 1e-12) + (n_total / 2))
+    raise ValueError(f"Unsupported masked metric '{metric}'")
+
+
+def _encode_parallel_slot_latent_np(
+    model: nn.Module,
+    s_batched_t: torch.Tensor,
+    slot: int,
+) -> np.ndarray:
+    with torch.no_grad():
+        latent = _encode_parallel_model_slice(model, s_batched_t[slot : slot + 1], slot, slot + 1)
+        z = latent[0].detach().cpu().numpy().astype(np.float32)
+    if z.ndim == 2 and z.shape[1] == 1:
+        return z[:, 0]
+    if z.ndim == 1:
+        return z
+    return z.reshape(z.shape[0], -1)[:, 0]
+
+
+def _encode_celltype_slot_latent_np(
+    model: ParallelCellTypeIsoDepthNet,
+    s_batched_t: torch.Tensor,
+    slot: int,
+) -> np.ndarray:
+    with torch.no_grad():
+        latent = _encode_parallel_celltype_slice(model, s_batched_t[slot : slot + 1], slot, slot + 1)
+        z = latent[0].detach().cpu().numpy().astype(np.float32)
+    if z.ndim == 2 and z.shape[1] == 1:
+        return z[:, 0]
+    if z.ndim == 1:
+        return z
+    return z.reshape(z.shape[0], -1)[:, 0]
+
+
+def _poisson_irls_pred_for_slot(
+    *,
+    latent_full: np.ndarray,
+    a_np: np.ndarray,
+    decoder_type: str,
+    fit_mask_np: np.ndarray | None,
+    poisson_size_factors_np: np.ndarray | None,
+) -> np.ndarray:
+    cell_idx = _active_cell_indices_from_mask(fit_mask_np)
+    if cell_idx is None:
+        return fit_poisson_glm_irls(
+            latent_full,
+            a_np,
+            decoder_type,
+            size_factors=poisson_size_factors_np,
+        )
+    sf_np = poisson_size_factors_np
+    return fit_poisson_glm_irls(
+        latent_full[cell_idx],
+        a_np[cell_idx],
+        decoder_type,
+        size_factors=None if sf_np is None else sf_np[cell_idx],
+        predict_latent=latent_full,
+    )
+
+
+def _slot_metric_and_prediction(
+    *,
+    model: nn.Module,
+    s_batched_t: torch.Tensor,
+    slot: int,
+    a_np: np.ndarray,
+    config: TestConfig,
+    metric_name: str,
+    decoder_type: str,
+    fit_mask_np: np.ndarray | None,
+    eval_mask_np: np.ndarray | None,
+    poisson_size_factors_np: np.ndarray | None,
+    forward_pred_fn,
+    encode_latent_fn,
+) -> tuple[float, np.ndarray]:
+    if poisson_parametric_decoder_uses_irls(config):
+        latent_full = encode_latent_fn(model, s_batched_t, slot)
+        pred = _poisson_irls_pred_for_slot(
+            latent_full=latent_full,
+            a_np=a_np,
+            decoder_type=decoder_type,
+            fit_mask_np=fit_mask_np,
+            poisson_size_factors_np=poisson_size_factors_np,
+        )
+        metric_value = _compute_masked_metric_np(
+            metric_name,
+            a_np,
+            pred,
+            eval_mask_np,
+            poisson_size_factors=poisson_size_factors_np,
+        )
+        return metric_value, pred
+    pred = forward_pred_fn(slot)
+    metric_value = _compute_masked_metric_np(
+        metric_name,
+        a_np,
+        pred,
+        eval_mask_np,
+        poisson_size_factors=poisson_size_factors_np,
+    )
+    return metric_value, pred
 
 
 def _parallel_linear_slice_forward(
@@ -626,14 +1020,33 @@ def _hybrid_midline_latent_slice_forward(
     return out
 
 
+def _parameterized_midline_encoder_slice_forward(
+    encoder: ParallelParameterizedMidlineEncoder,
+    x: torch.Tensor,
+    start: int,
+    stop: int,
+) -> torch.Tensor:
+    """Forward pass for a contiguous slice [start, stop) of a ParallelParameterizedMidlineEncoder."""
+    s_c = x - x.mean(dim=1, keepdim=True)
+    theta_slice = encoder.theta[start:stop].unsqueeze(-1)
+    c_slice = encoder.c[start:stop].unsqueeze(-1)
+    proj = s_c[..., 0] * torch.sin(theta_slice) + s_c[..., 1] * torch.cos(theta_slice)
+    depth = (proj - c_slice).abs()
+    mu = depth.mean(dim=1, keepdim=True)
+    sigma = depth.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-8)
+    return ((depth - mu) / sigma).unsqueeze(-1)
+
+
 def _encode_parallel_model_slice(
-    model: ParallelIsoDepthNet | HybridMidlineParallelNet,
+    model: ParallelIsoDepthNet | HybridMidlineParallelNet | ParallelMidlineEncoderNet,
     x: torch.Tensor,
     start: int,
     stop: int,
 ) -> torch.Tensor:
     if isinstance(model, HybridMidlineParallelNet):
         return _hybrid_midline_latent_slice_forward(model.encoder, x, start, stop)
+    if isinstance(model, ParallelMidlineEncoderNet):
+        return _parameterized_midline_encoder_slice_forward(model.encoder, x, start, stop)
     return _parallel_module_stack_slice_forward(model.encoder, x, start, stop)
 
 
@@ -647,6 +1060,18 @@ def _forward_parallel_model_slice(
     return _parallel_module_stack_slice_forward(model.decoder, latent, start, stop)
 
 
+def _encode_parallel_celltype_slice(
+    model: ParallelCellTypeIsoDepthNet,
+    x: torch.Tensor,
+    start: int,
+    stop: int,
+) -> torch.Tensor:
+    """Encode a contiguous slot slice from a ParallelCellTypeIsoDepthNet, handling both encoder types."""
+    if isinstance(model.encoder, ParallelParameterizedMidlineEncoder):
+        return _parameterized_midline_encoder_slice_forward(model.encoder, x, start, stop)
+    return _parallel_module_stack_slice_forward(model.encoder, x, start, stop)
+
+
 def _forward_parallel_celltype_slice(
     model: ParallelCellTypeIsoDepthNet,
     x: torch.Tensor,
@@ -654,10 +1079,9 @@ def _forward_parallel_celltype_slice(
     start: int,
     stop: int,
 ) -> torch.Tensor:
-    if model._sort_idx is None or model._sort_idx.device != x.device:
-        model._build_routing_cache(cell_type_indices)
+    model._ensure_routing_cache(cell_type_indices, x.device)
 
-    latent = _parallel_module_stack_slice_forward(model.encoder, x, start, stop)
+    latent = _encode_parallel_celltype_slice(model, x, start, stop)
     m, n, _ = x.shape
     sorted_latent = latent[:, model._sort_idx, :]
     sorted_output = torch.empty(m, n, model.G, device=x.device, dtype=x.dtype)
@@ -688,6 +1112,8 @@ def _finalize_batched_parallel_training(
     device: torch.device,
     metric_loss_mask_t: torch.Tensor | None = None,
     chunk_size: int = _DEFAULT_FINALIZE_CHUNK_SIZE,
+    poisson_size_factors: torch.Tensor | None = None,
+    poisson_size_factors_np: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, BatchedTrainingOutputs, np.ndarray]:
     """Chunked post-training: rerun selection, per-model metrics, three prediction matrices."""
     total_models = int(s_batched_t.shape[0])
@@ -701,7 +1127,9 @@ def _finalize_batched_parallel_training(
         mask_chunk = None if loss_mask_t is None else loss_mask_t[start:stop]
         with torch.no_grad():
             output = _forward_parallel_model_slice(model, s_batched_t[start:stop], start, stop)
-            losses = _compute_reconstruction_loss_per_model(output, a_t, mask_chunk)
+            losses = _compute_reconstruction_loss_per_model(
+                output, a_t, mask_chunk, poisson_size_factors=poisson_size_factors
+            )
         slot_train_losses[start:stop] = losses.detach().cpu().numpy().astype(np.float64)
 
     train_loss_per_rerun = slot_train_losses.reshape(n_models, n_reruns)
@@ -709,39 +1137,44 @@ def _finalize_batched_parallel_training(
     selected_slot_indices = (np.arange(n_models, dtype=np.int64) * n_reruns) + best_rerun_index_per_model
 
     eval_mask_t = metric_loss_mask_t if metric_loss_mask_t is not None else loss_mask_t
+    decoder_type = _resolve_decoder_type(config)
+
+    def _forward_pred(slot: int) -> np.ndarray:
+        with torch.no_grad():
+            return (
+                _forward_parallel_model_slice(
+                    model,
+                    s_batched_t[slot : slot + 1],
+                    slot,
+                    slot + 1,
+                )[0]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32)
+            )
+
     model_metrics = np.empty(n_models, dtype=np.float64)
-    if eval_mask_t is None:
-        for model_index in range(n_models):
-            slot = int(selected_slot_indices[model_index])
-            with torch.no_grad():
-                pred = _forward_parallel_model_slice(
-                    model,
-                    s_batched_t[slot : slot + 1],
-                    slot,
-                    slot + 1,
-                )[0].detach().cpu().numpy().astype(np.float32)
-            model_metrics[model_index] = compute_metric(metric_name, a_np, pred)
-    else:
-        for model_index in range(n_models):
-            slot = int(selected_slot_indices[model_index])
-            with torch.no_grad():
-                output = _forward_parallel_model_slice(
-                    model,
-                    s_batched_t[slot : slot + 1],
-                    slot,
-                    slot + 1,
-                )
-                if a_t.ndim == 2:
-                    targets = a_t
-                else:
-                    targets = a_t[slot : slot + 1]
-                metric_value = _compute_masked_metric_per_model(
-                    output,
-                    targets,
-                    eval_mask_t[slot : slot + 1],
-                    metric=metric_name,
-                )
-            model_metrics[model_index] = float(metric_value[0].detach().cpu().numpy())
+    for model_index in range(n_models):
+        slot = int(selected_slot_indices[model_index])
+        fit_mask_np = _slot_loss_mask_np(loss_mask_t, slot, n_genes)
+        eval_mask_np = (
+            _slot_loss_mask_np(eval_mask_t, slot, n_genes) if eval_mask_t is not None else None
+        )
+        model_metrics[model_index], _ = _slot_metric_and_prediction(
+            model=model,
+            s_batched_t=s_batched_t,
+            slot=slot,
+            a_np=a_np,
+            config=config,
+            metric_name=metric_name,
+            decoder_type=decoder_type,
+            fit_mask_np=fit_mask_np,
+            eval_mask_np=eval_mask_np,
+            poisson_size_factors_np=poisson_size_factors_np,
+            forward_pred_fn=_forward_pred,
+            encode_latent_fn=_encode_parallel_slot_latent_np,
+        )
 
     best_null_index, worst_null_index = _null_extreme_indices(model_metrics, metric_name)
     slots_for_predictions = {0}
@@ -751,13 +1184,24 @@ def _finalize_batched_parallel_training(
     stored_predictions: dict[int, np.ndarray] = {}
     for model_index in slots_for_predictions:
         slot = int(selected_slot_indices[model_index])
-        with torch.no_grad():
-            pred = _forward_parallel_model_slice(
-                model,
-                s_batched_t[slot : slot + 1],
-                slot,
-                slot + 1,
-            )[0].detach().cpu().numpy().astype(np.float32)
+        fit_mask_np = _slot_loss_mask_np(loss_mask_t, slot, n_genes)
+        eval_mask_np = (
+            _slot_loss_mask_np(eval_mask_t, slot, n_genes) if eval_mask_t is not None else None
+        )
+        _, pred = _slot_metric_and_prediction(
+            model=model,
+            s_batched_t=s_batched_t,
+            slot=slot,
+            a_np=a_np,
+            config=config,
+            metric_name=metric_name,
+            decoder_type=decoder_type,
+            fit_mask_np=fit_mask_np,
+            eval_mask_np=eval_mask_np,
+            poisson_size_factors_np=poisson_size_factors_np,
+            forward_pred_fn=_forward_pred,
+            encode_latent_fn=_encode_parallel_slot_latent_np,
+        )
         stored_predictions[model_index] = pred
 
     pred_true = stored_predictions[0]
@@ -791,53 +1235,37 @@ def _finalize_batched_parallel_training(
 
 
 
-def _celltype_expression_predictions(
-    model: ParallelCellTypeIsoDepthNet,
-    s_batched_t: torch.Tensor,
-    cell_type_t: torch.Tensor,
-    type_means: np.ndarray,
-    cell_type_labels_np: np.ndarray,
-    *,
-    start: int | None = None,
-    stop: int | None = None,
-) -> torch.Tensor:
-    if start is None or stop is None:
-        residual = model(s_batched_t, cell_type_t)
-    else:
-        residual = _forward_parallel_celltype_slice(model, s_batched_t, cell_type_t, start, stop)
-    return residual + torch.tensor(
-        type_means[cell_type_labels_np],
-        dtype=residual.dtype,
-        device=residual.device,
-    ).unsqueeze(0)
-
-
 def _finalize_celltype_parallel_training(
     model: ParallelCellTypeIsoDepthNet,
     s_batched_t: torch.Tensor,
-    a_batched_t: torch.Tensor,
+    a_residual_t: torch.Tensor,
     cell_type_t: torch.Tensor,
-    A: np.ndarray,
-    type_means: np.ndarray,
-    cell_type_labels_np: np.ndarray,
+    a_residual_np: np.ndarray,
     config: TestConfig,
     *,
     n_models: int,
     n_reruns: int,
     latent_dim: int,
     chunk_size: int = _DEFAULT_FINALIZE_CHUNK_SIZE,
+    loss_mask_t: torch.Tensor | None = None,
+    metric_loss_mask_t: torch.Tensor | None = None,
+    poisson_size_factors: torch.Tensor | None = None,
+    poisson_size_factors_np: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, BatchedTrainingOutputs, np.ndarray]:
     total_models = int(s_batched_t.shape[0])
     metric_name = canonicalize_metric_name(config.metric)
     chunk_size = max(1, min(int(chunk_size), total_models))
-    a_np = np.asarray(A, dtype=np.float32)
+    a_np = np.asarray(a_residual_np, dtype=np.float32)
 
     slot_train_losses = np.empty(total_models, dtype=np.float64)
     for start in range(0, total_models, chunk_size):
         stop = min(start + chunk_size, total_models)
+        mask_chunk = None if loss_mask_t is None else loss_mask_t[start:stop]
         with torch.no_grad():
             output = _forward_parallel_celltype_slice(model, s_batched_t[start:stop], cell_type_t, start, stop)
-            losses = (output - a_batched_t[start:stop]).pow(2).mean(dim=(1, 2))
+            losses = _compute_reconstruction_loss_per_model(
+                output, a_residual_t, mask_chunk, poisson_size_factors=poisson_size_factors
+            )
         slot_train_losses[start:stop] = losses.detach().cpu().numpy().astype(np.float64)
 
     train_loss_per_rerun = slot_train_losses.reshape(n_models, n_reruns)
@@ -846,36 +1274,71 @@ def _finalize_celltype_parallel_training(
         + np.argmin(train_loss_per_rerun, axis=1).astype(np.int64)
     )
 
+    eval_mask_t = metric_loss_mask_t if metric_loss_mask_t is not None else loss_mask_t
+    decoder_type = _resolve_decoder_type(config)
+    n_genes = int(a_np.shape[1])
+
+    def _forward_pred(slot: int) -> np.ndarray:
+        with torch.no_grad():
+            return (
+                _forward_parallel_celltype_slice(
+                    model,
+                    s_batched_t[slot : slot + 1],
+                    cell_type_t,
+                    slot,
+                    slot + 1,
+                )[0]
+                .detach()
+                .cpu()
+                .numpy()
+                .astype(np.float32)
+            )
+
     model_metrics = np.empty(n_models, dtype=np.float64)
     for model_index in range(n_models):
         slot = int(selected_slot_indices[model_index])
-        with torch.no_grad():
-            pred = _celltype_expression_predictions(
-                model,
-                s_batched_t[slot : slot + 1],
-                cell_type_t,
-                type_means,
-                cell_type_labels_np,
-                start=slot,
-                stop=slot + 1,
-            )[0].detach().cpu().numpy().astype(np.float32)
-        model_metrics[model_index] = compute_metric(metric_name, a_np, pred)
+        fit_mask_np = _slot_loss_mask_np(loss_mask_t, slot, n_genes)
+        eval_mask_np = (
+            _slot_loss_mask_np(eval_mask_t, slot, n_genes) if eval_mask_t is not None else None
+        )
+        model_metrics[model_index], _ = _slot_metric_and_prediction(
+            model=model,
+            s_batched_t=s_batched_t,
+            slot=slot,
+            a_np=a_np,
+            config=config,
+            metric_name=metric_name,
+            decoder_type=decoder_type,
+            fit_mask_np=fit_mask_np,
+            eval_mask_np=eval_mask_np,
+            poisson_size_factors_np=poisson_size_factors_np,
+            forward_pred_fn=_forward_pred,
+            encode_latent_fn=_encode_celltype_slot_latent_np,
+        )
 
     best_null_index, worst_null_index = _null_extreme_indices(model_metrics, metric_name)
     slots_for_predictions = {0, int(best_null_index + 1), int(worst_null_index + 1)}
     stored_predictions: dict[int, np.ndarray] = {}
     for model_index in slots_for_predictions:
         slot = int(selected_slot_indices[model_index])
-        with torch.no_grad():
-            pred = _celltype_expression_predictions(
-                model,
-                s_batched_t[slot : slot + 1],
-                cell_type_t,
-                type_means,
-                cell_type_labels_np,
-                start=slot,
-                stop=slot + 1,
-            )[0].detach().cpu().numpy().astype(np.float32)
+        fit_mask_np = _slot_loss_mask_np(loss_mask_t, slot, n_genes)
+        eval_mask_np = (
+            _slot_loss_mask_np(eval_mask_t, slot, n_genes) if eval_mask_t is not None else None
+        )
+        _, pred = _slot_metric_and_prediction(
+            model=model,
+            s_batched_t=s_batched_t,
+            slot=slot,
+            a_np=a_np,
+            config=config,
+            metric_name=metric_name,
+            decoder_type=decoder_type,
+            fit_mask_np=fit_mask_np,
+            eval_mask_np=eval_mask_np,
+            poisson_size_factors_np=poisson_size_factors_np,
+            forward_pred_fn=_forward_pred,
+            encode_latent_fn=_encode_celltype_slot_latent_np,
+        )
         stored_predictions[model_index] = pred
 
     outputs = BatchedTrainingOutputs(
@@ -889,7 +1352,7 @@ def _finalize_celltype_parallel_training(
 
     with torch.no_grad():
         true_rerun_isodepths = (
-            _parallel_module_stack_slice_forward(model.encoder, s_batched_t[:n_reruns], 0, n_reruns)
+            _encode_parallel_celltype_slice(model, s_batched_t[:n_reruns], 0, n_reruns)
             .detach()
             .cpu()
             .numpy()
@@ -1000,6 +1463,56 @@ def get_training_metadata(model: nn.Module) -> dict[str, Any]:
     }
 
 
+def _compact_parallel_midline_encoder_model(
+    expanded_model: ParallelMidlineEncoderNet,
+    *,
+    selected_indices: np.ndarray,
+    n_models: int,
+    n_genes: int,
+    decoder_type: str,
+    device: torch.device,
+) -> ParallelMidlineEncoderNet:
+    n_expanded = _parallel_slot_count(expanded_model)
+    compact = ParallelMidlineEncoderNet(n_models, n_genes, decoder_type=decoder_type).to(device)
+    exp_sd = expanded_model.state_dict()
+    comp_sd = compact.state_dict()
+    slot_indices = [int(i) for i in np.asarray(selected_indices, dtype=np.int64).tolist()]
+    restored: dict[str, torch.Tensor] = {}
+    for name, tensor in comp_sd.items():
+        src = exp_sd[name].detach().cpu()
+        if src.ndim > 0 and src.shape[0] == n_expanded:
+            restored[name] = src[slot_indices].clone().to(device=device)
+        else:
+            restored[name] = src.clone().to(device=device)
+    compact.load_state_dict(restored)
+    return compact
+
+
+def _compact_single_midline_encoder_model(
+    expanded_model: ParallelMidlineEncoderNet,
+    *,
+    selected_index: int,
+    n_genes: int,
+    decoder_type: str,
+    device: torch.device,
+) -> MidlineEncoderNet:
+    compact = MidlineEncoderNet(n_genes, decoder_type=decoder_type).to(device)
+    idx = int(selected_index)
+    with torch.no_grad():
+        compact.encoder.theta.copy_(expanded_model.encoder.theta[idx])
+        compact.encoder.c.copy_(expanded_model.encoder.c[idx])
+        slot_dec_state = {
+            name: (
+                tensor[idx].detach().clone().to(device=device)
+                if tensor.ndim > 0 and tensor.shape[0] > idx
+                else tensor.detach().clone().to(device=device)
+            )
+            for name, tensor in expanded_model.decoder.state_dict().items()
+        }
+    compact.decoder.load_state_dict(slot_dec_state)
+    return compact
+
+
 def _compact_parallel_model(
     expanded_model: nn.Module,
     *,
@@ -1017,6 +1530,16 @@ def _compact_parallel_model(
             n_models=n_models,
             n_genes=n_genes,
             latent_dim=latent_dim,
+            decoder_type=decoder_type,
+            device=device,
+        )
+
+    if isinstance(expanded_model, ParallelMidlineEncoderNet):
+        return _compact_parallel_midline_encoder_model(
+            expanded_model,
+            selected_indices=selected_indices,
+            n_models=n_models,
+            n_genes=n_genes,
             decoder_type=decoder_type,
             device=device,
         )
@@ -1143,6 +1666,7 @@ def train_batched_isodepth_model(
     model_label: str = "parallel isodepth batch",
     initial_state: Mapping[str, torch.Tensor] | None = None,
     gradient_scale_divisor: float | None = None,
+    poisson_size_factors_override: np.ndarray | None = None,
 ) -> tuple[nn.Module, BatchedTrainingOutputs]:
     device = device or resolve_device(config.device)
     _set_torch_seed(config.seed)
@@ -1189,6 +1713,20 @@ def train_batched_isodepth_model(
     else:
         expanded_a_batched = _repeat_batched_inputs(base_a_batched, n_reruns)
         a_t = torch.tensor(expanded_a_batched, dtype=torch.float32, device=device)
+
+    # Poisson NLL: compute per-cell size factors from A (row sums by default), or
+    # use the caller-supplied override (e.g. per-gene cell-type means for the
+    # cell-type-together covariate model).
+    is_poisson = canonicalize_metric_name(config.metric) == "nll_poisson_mse"
+    if is_poisson:
+        if poisson_size_factors_override is not None:
+            sf_np = np.asarray(poisson_size_factors_override, dtype=np.float32)
+        else:
+            sf_np = np.asarray(A, dtype=np.float32).sum(axis=1, keepdims=True)  # (N, 1)
+        poisson_sf_t: torch.Tensor | None = torch.tensor(sf_np, dtype=torch.float32, device=device)
+    else:
+        poisson_sf_t = None
+
     loss_mask_t = _prepare_loss_mask(
         expanded_loss_mask,
         n_models=total_models,
@@ -1205,7 +1743,18 @@ def train_batched_isodepth_model(
         device=device,
     )
 
-    if _is_midline_covariate(config):
+    encoder_type = _resolve_encoder_type(config)
+    if encoder_type == "midline":
+        if latent_dim != 1:
+            raise ValueError("encoder='midline' requires latent_dim=1")
+        model = ParallelMidlineEncoderNet(
+            total_models,
+            n_genes,
+            latent_dim=1,
+            decoder_type=decoder_type,
+            init_theta=float(getattr(config, "midline_init_theta", 0.0)),
+        ).to(device)
+    elif _is_midline_covariate(config):
         model = HybridMidlineParallelNet(
             total_models,
             n_genes,
@@ -1275,7 +1824,9 @@ def train_batched_isodepth_model(
         if sgd_batch_size is None:
             optimizer.zero_grad()
             output = model(s_batched_t)
-            loss_per_model = _compute_reconstruction_loss_per_model(output, a_t, loss_mask_t)
+            loss_per_model = _compute_reconstruction_loss_per_model(
+                output, a_t, loss_mask_t, poisson_size_factors=poisson_sf_t
+            )
             divisor = float(gradient_scale_divisor) if gradient_scale_divisor is not None else max(active_count, 1.0)
             total_loss = (loss_per_model * active_mask_t).sum() / divisor
             total_loss.backward()
@@ -1291,10 +1842,13 @@ def train_batched_isodepth_model(
                 batch_s = s_batched_t.index_select(1, batch_indices)
                 batch_a = a_t.index_select(-2, batch_indices)
                 batch_mask = None if loss_mask_t is None else loss_mask_t.index_select(1, batch_indices)
+                batch_sf = None if poisson_sf_t is None else poisson_sf_t.index_select(0, batch_indices)
 
                 optimizer.zero_grad()
                 batch_output = model(batch_s)
-                batch_loss_per_model = _compute_reconstruction_loss_per_model(batch_output, batch_a, batch_mask)
+                batch_loss_per_model = _compute_reconstruction_loss_per_model(
+                    batch_output, batch_a, batch_mask, poisson_size_factors=batch_sf
+                )
                 divisor = float(gradient_scale_divisor) if gradient_scale_divisor is not None else max(active_count, 1.0)
                 batch_total_loss = (batch_loss_per_model * active_mask_t).sum() / divisor
                 batch_total_loss.backward()
@@ -1316,7 +1870,9 @@ def train_batched_isodepth_model(
         if use_patience:
             with torch.no_grad():
                 output = model(s_batched_t)
-                loss_per_model = _compute_reconstruction_loss_per_model(output, a_t, loss_mask_t)
+                loss_per_model = _compute_reconstruction_loss_per_model(
+                    output, a_t, loss_mask_t, poisson_size_factors=poisson_sf_t
+                )
             loss_values = loss_per_model.detach().cpu().numpy().astype(np.float64)
             improved_mask = active_mask_np & (loss_values < (best_loss_per_model - 1e-5))
             if np.any(improved_mask):
@@ -1352,7 +1908,7 @@ def train_batched_isodepth_model(
                 with torch.no_grad():
                     hist_output = model(s_batched_t)
                     hist_loss_per_model = _compute_reconstruction_loss_per_model(
-                        hist_output, a_t, loss_mask_t
+                        hist_output, a_t, loss_mask_t, poisson_size_factors=poisson_sf_t
                     )
                 true_loss = float(hist_loss_per_model[0].detach().cpu().item())
             loss_history.append(true_loss)
@@ -1378,6 +1934,8 @@ def train_batched_isodepth_model(
             latent_dim=latent_dim,
             device=device,
             metric_loss_mask_t=metric_loss_mask_t,
+            poisson_size_factors=poisson_sf_t,
+            poisson_size_factors_np=sf_np if is_poisson else None,
         )
     )
     compact_model = _compact_parallel_model(
@@ -1482,9 +2040,15 @@ def _merge_chunked_training_results(
     )
 
     is_hybrid = isinstance(chunk_models[0], HybridMidlineParallelNet)
+    is_midline_encoder = isinstance(chunk_models[0], ParallelMidlineEncoderNet)
     if is_hybrid:
         merged_model = HybridMidlineParallelNet(
             n_perm_models, n_genes, slot_split=1,
+            latent_dim=latent_dim, decoder_type=decoder_type,
+        )
+    elif is_midline_encoder:
+        merged_model = ParallelMidlineEncoderNet(
+            n_perm_models, n_genes,
             latent_dim=latent_dim, decoder_type=decoder_type,
         )
     else:
@@ -1671,6 +2235,7 @@ def train_isodepth_model(
     model_label: str = "model",
     initial_state: Mapping[str, torch.Tensor] | None = None,
     gradient_scale_divisor: float | None = None,
+    poisson_size_factors_override: np.ndarray | None = None,
 ) -> tuple[nn.Module, np.ndarray]:
     device = device or resolve_device(config.device)
     if latent_dim <= 0:
@@ -1686,6 +2251,7 @@ def train_isodepth_model(
         model_label=model_label,
         initial_state=initial_state,
         gradient_scale_divisor=gradient_scale_divisor,
+        poisson_size_factors_override=poisson_size_factors_override,
     )
     metadata = get_training_metadata(parallel_model)
     dec_type = _resolve_decoder_type(config)
@@ -1695,6 +2261,14 @@ def train_isodepth_model(
             selected_index=0,
             n_genes=A.shape[1],
             latent_dim=latent_dim,
+            decoder_type=dec_type,
+            device=device,
+        )
+    elif isinstance(parallel_model, ParallelMidlineEncoderNet):
+        model = _compact_single_midline_encoder_model(
+            parallel_model,
+            selected_index=0,
+            n_genes=A.shape[1],
             decoder_type=dec_type,
             device=device,
         )
@@ -1727,6 +2301,8 @@ def train_celltype_parallel_isodepth_model(
     n_cell_types: int,
     device: Optional[torch.device] = None,
     s_batched: Optional[np.ndarray] = None,
+    loss_mask_batched: Optional[np.ndarray] = None,
+    metric_loss_mask_batched: Optional[np.ndarray] = None,
     latent_dim: int = 1,
     model_label: Optional[str] = None,
 ) -> tuple[nn.Module, BatchedTrainingOutputs, np.ndarray]:
@@ -1767,28 +2343,67 @@ def train_celltype_parallel_isodepth_model(
             model_label = "cell-type parallel batch"
 
     decoder_type = _resolve_decoder_type(config)
+    encoder_type = _resolve_encoder_type(config)
     n_reruns = int(config.n_reruns)
     total_models = n_models * n_reruns
 
     expanded_s_batched = _repeat_batched_inputs(s_batched_np, n_reruns)
     s_batched_t = torch.tensor(expanded_s_batched, dtype=torch.float32, device=device)
-
-    # Subtract per-cell-type mean expression so decoders cannot trivially memorize
-    # type means and the encoder is forced to capture within-type spatial variation.
-    a_np = np.asarray(A, dtype=np.float32)
-    type_means = np.zeros((n_cell_types, n_genes), dtype=np.float32)
-    for c in range(n_cell_types):
-        mask = cell_type_labels_np == c
-        if mask.any():
-            type_means[c] = a_np[mask].mean(axis=0)
-    a_residual = a_np - type_means[cell_type_labels_np]
-
-    a_batched_t = torch.tensor(
-        np.repeat(a_residual[None, :, :], total_models, axis=0),
-        dtype=torch.float32,
+    expanded_loss_mask = _repeat_batched_inputs(loss_mask_batched, n_reruns)
+    loss_mask_t = _prepare_loss_mask(
+        expanded_loss_mask,
+        n_models=total_models,
+        n_cells=n_cells,
+        n_genes=n_genes,
         device=device,
     )
+    expanded_metric_loss_mask = _repeat_batched_inputs(metric_loss_mask_batched, n_reruns)
+    metric_loss_mask_t = _prepare_loss_mask(
+        expanded_metric_loss_mask,
+        n_models=total_models,
+        n_cells=n_cells,
+        n_genes=n_genes,
+        device=device,
+    )
+
     cell_type_t = torch.tensor(cell_type_labels_np, dtype=torch.long, device=device)
+
+    # For Poisson NLL, cell-type residuals (A − per-type mean) can be negative for
+    # cells with below-average expression.  A negative "count" makes the Poisson loss
+    # unbounded below (gradient = N_i·exp(ŷ) + |a| > 0 always → ŷ → −∞), causing
+    # training divergence.
+    #
+    # Using raw A with a global per-cell size factor N_i also fails: cell-type effects
+    # dominate the loss (some cell types express genes at 10× the rate of others), so
+    # the per-cell-type decoder biases absorb all that variance, leaving near-zero
+    # gradient for the spatial encoder (encoder collapse, p ≈ 1.0).
+    #
+    # Fix: use per-gene per-cell-type mean counts as the Poisson size factors.  These
+    # act as a cell-type baseline offset in the Poisson model so the loss measures
+    # spatial log-fold-changes relative to the cell-type mean — exactly what Gaussian
+    # residuals do for the MSE path, but preserving the non-negativity of the targets.
+    # For Gaussian MSE, keep the standard residuals.
+    is_poisson_ct = canonicalize_metric_name(config.metric) == "nll_poisson_mse"
+    sf_ct_np: np.ndarray | None
+    if is_poisson_ct:
+        a_targets = np.asarray(A, dtype=np.float32)
+        # Per-gene, per-cell-type mean counts — shape (C, G).
+        ct_means = np.zeros((n_cell_types, n_genes), dtype=np.float32)
+        for ct in range(n_cell_types):
+            mask = cell_type_labels_np == ct
+            if mask.any():
+                ct_means[ct] = a_targets[mask].mean(axis=0)
+        # Expand to (N, G) and clamp to a small epsilon so genes that are never
+        # expressed in a particular cell type don't cause log(0) issues.
+        sf_ct_np = np.maximum(ct_means[cell_type_labels_np], 1e-3)
+        poisson_sf_ct_t: torch.Tensor | None = torch.tensor(sf_ct_np, dtype=torch.float32, device=device)
+    else:
+        a_targets = celltype_expression_residuals(A, cell_type_labels_np, n_cell_types=n_cell_types)
+        sf_ct_np = None
+        poisson_sf_ct_t = None
+    a_targets_t = torch.tensor(a_targets, dtype=torch.float32, device=device)
+    # Keep a_residual_t as an alias so the rest of the function body is unchanged.
+    a_residual_t = a_targets_t
 
     model = ParallelCellTypeIsoDepthNet(
         total_models,
@@ -1796,34 +2411,98 @@ def train_celltype_parallel_isodepth_model(
         n_genes,
         latent_dim=latent_dim,
         decoder_type=decoder_type,
+        encoder_type=encoder_type,
     ).to(device)
 
     optimizer = optim.Adam(model.parameters(), lr=config.lr, foreach=False)
+    sgd_batch_size = _resolve_sgd_batch_size(config, n_cells)
+    lr_scheduler_step: lr_scheduler.CosineAnnealingLR | None = None
+    if sgd_batch_size is not None and config.sgd_cosine_lr_decay:
+        steps_per_epoch = _sgd_steps_per_epoch(n_cells, sgd_batch_size)
+        t_max = config.sgd_cosine_t_max_steps
+        if t_max is None:
+            t_max = int(config.epochs) * steps_per_epoch
+        t_max = max(int(t_max), 1)
+        lr_scheduler_step = lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=t_max,
+            eta_min=float(config.sgd_cosine_eta_min),
+        )
 
     use_patience = config.patience > 0
     best_loss_per_model = np.full(total_models, np.inf, dtype=np.float64)
     patience_counter_per_model = np.zeros(total_models, dtype=np.int64)
     active_mask_np = np.ones(total_models, dtype=bool)
     active_mask_t = torch.ones(total_models, dtype=torch.float32, device=device)
+    minibatch_generator = None
+    if sgd_batch_size is not None:
+        minibatch_generator = torch.Generator(device="cpu")
+        minibatch_generator.manual_seed(config.seed)
     if use_patience:
         best_state = _snapshot_parallel_model_state(model, total_models)
 
+    def _full_train_loss_per_model() -> torch.Tensor:
+        losses: list[torch.Tensor] = []
+        chunk_size = min(_DEFAULT_FINALIZE_CHUNK_SIZE, total_models)
+        for start in range(0, total_models, chunk_size):
+            stop = min(start + chunk_size, total_models)
+            output_chunk = _forward_parallel_celltype_slice(
+                model,
+                s_batched_t[start:stop],
+                cell_type_t,
+                start,
+                stop,
+            )
+            losses.append(_compute_reconstruction_loss_per_model(
+                output_chunk, a_residual_t, loss_mask_t[start:stop] if loss_mask_t is not None else None,
+                poisson_size_factors=poisson_sf_ct_t,
+            ))
+        return torch.cat(losses, dim=0)
+
     iterator = tqdm(range(config.epochs), disable=not config.verbose)
+    executed_epochs = 0
+    executed_gradient_steps = 0
     for epoch in iterator:
         active_mask_t.copy_(torch.from_numpy(active_mask_np.astype(np.float32)))
         active_count = float(active_mask_np.sum())
 
-        optimizer.zero_grad()
-        output = model(s_batched_t, cell_type_t)
-        loss_per_model = (output - a_batched_t).pow(2).mean(dim=(1, 2))
-        total_loss = (loss_per_model * active_mask_t).sum() / max(active_count, 1.0)
-        total_loss.backward()
-        optimizer.step()
+        if sgd_batch_size is None:
+            optimizer.zero_grad()
+            output = model(s_batched_t, cell_type_t)
+            loss_per_model = _compute_reconstruction_loss_per_model(
+                output, a_residual_t, loss_mask_t, poisson_size_factors=poisson_sf_ct_t
+            )
+            total_loss = (loss_per_model * active_mask_t).sum() / max(active_count, 1.0)
+            total_loss.backward()
+            optimizer.step()
+            executed_gradient_steps += 1
+        else:
+            permutation = torch.randperm(n_cells, generator=minibatch_generator)
+            for batch_start in range(0, n_cells, sgd_batch_size):
+                batch_indices = permutation[batch_start : batch_start + sgd_batch_size].to(device=device)
+                batch_s = s_batched_t.index_select(1, batch_indices)
+                batch_a = a_residual_t.index_select(0, batch_indices)
+                batch_cell_type = cell_type_t.index_select(0, batch_indices)
+                batch_sf_ct = None if poisson_sf_ct_t is None else poisson_sf_ct_t.index_select(0, batch_indices)
+                batch_mask = None if loss_mask_t is None else loss_mask_t.index_select(1, batch_indices)
+
+                optimizer.zero_grad()
+                batch_output = model.forward_masked(batch_s, batch_cell_type)
+                batch_loss_per_model = _compute_reconstruction_loss_per_model(
+                    batch_output, batch_a, batch_mask, poisson_size_factors=batch_sf_ct
+                )
+                batch_total_loss = (batch_loss_per_model * active_mask_t).sum() / max(active_count, 1.0)
+                batch_total_loss.backward()
+                optimizer.step()
+                if lr_scheduler_step is not None:
+                    lr_scheduler_step.step()
+                executed_gradient_steps += 1
+
+        executed_epochs = epoch + 1
 
         if use_patience:
             with torch.no_grad():
-                output = model(s_batched_t, cell_type_t)
-                loss_per_model = (output - a_batched_t).pow(2).mean(dim=(1, 2))
+                loss_per_model = _full_train_loss_per_model()
             loss_values = loss_per_model.detach().cpu().numpy().astype(np.float64)
 
             improved_mask = active_mask_np & (loss_values < (best_loss_per_model - 1e-5))
@@ -1851,15 +2530,17 @@ def train_celltype_parallel_isodepth_model(
         _finalize_celltype_parallel_training(
             model,
             s_batched_t,
-            a_batched_t,
+            a_residual_t,
             cell_type_t,
-            A,
-            type_means,
-            cell_type_labels_np,
+            a_targets,
             config,
             n_models=n_models,
             n_reruns=n_reruns,
             latent_dim=latent_dim,
+            loss_mask_t=loss_mask_t,
+            metric_loss_mask_t=metric_loss_mask_t,
+            poisson_size_factors=poisson_sf_ct_t,
+            poisson_size_factors_np=sf_ct_np,
         )
     )
 
@@ -1869,6 +2550,7 @@ def train_celltype_parallel_isodepth_model(
         n_genes,
         latent_dim=latent_dim,
         decoder_type=decoder_type,
+        encoder_type=encoder_type,
     ).to(device)
     expanded_state = model.state_dict()
     compact_state = compact_model.state_dict()
@@ -1893,6 +2575,8 @@ def train_celltype_parallel_isodepth_model(
         best_rerun_index_per_model=best_rerun_index_per_model,
         train_loss_per_rerun=train_loss_per_rerun,
         true_rerun_isodepths=true_rerun_isodepths,
+        executed_epochs=executed_epochs,
+        executed_gradient_steps=executed_gradient_steps,
     )
     return compact_model, training_outputs, s_batched_np
 
@@ -1915,6 +2599,7 @@ def train_fixed_covariate_model(
     *,
     device: Optional[torch.device] = None,
     model_label: str = "obs-key covariate",
+    poisson_size_factors: np.ndarray | None = None,
 ) -> tuple[nn.Module, np.ndarray]:
     """Train a decoder-only model using pre-computed per-cell latent values from ``adata.obs``.
 
@@ -1954,6 +2639,28 @@ def train_fixed_covariate_model(
     n_reruns = int(config.n_reruns)
     dec_type = _resolve_decoder_type(config)
     values_np = zscore_covariate(covariate_values).reshape(n_cells, 1)
+    metric = canonicalize_metric_name(config.metric)
+    is_poisson = metric == "nll_poisson_mse"
+    if is_poisson:
+        if poisson_size_factors is not None:
+            sf_np = np.asarray(poisson_size_factors, dtype=np.float32)
+        else:
+            sf_np = a_np.sum(axis=1, keepdims=True)
+        poisson_sf_t: torch.Tensor | None = torch.tensor(sf_np, dtype=torch.float32, device=device)
+    else:
+        poisson_sf_t = None
+
+    def _loss_per_model(
+        output: torch.Tensor,
+        targets: torch.Tensor,
+        size_factors: torch.Tensor | None = poisson_sf_t,
+    ) -> torch.Tensor:
+        return _compute_reconstruction_loss_per_model(
+            output,
+            targets,
+            None,
+            poisson_size_factors=size_factors,
+        )
 
     _set_torch_seed(config.seed)
     parallel_model = ParallelDecoderOnlyNetFixed(
@@ -1992,7 +2699,7 @@ def train_fixed_covariate_model(
         if sgd_batch_size is None:
             optimizer.zero_grad()
             output = parallel_model()
-            loss_per_model = _compute_reconstruction_loss_per_model(output, a_t, None)
+            loss_per_model = _loss_per_model(output, a_t)
             total_loss = (loss_per_model * active_mask_t).sum() / max(active_count, 1.0)
             total_loss.backward()
             optimizer.step()
@@ -2003,14 +2710,11 @@ def train_fixed_covariate_model(
                 batch_latent = parallel_model.encoder.latent_values.index_select(0, batch_indices)
                 batch_latent = batch_latent.unsqueeze(0).expand(n_reruns, -1, -1)
                 batch_a = a_t.index_select(0, batch_indices)
+                batch_sf = None if poisson_sf_t is None else poisson_sf_t.index_select(0, batch_indices)
 
                 optimizer.zero_grad()
                 batch_output = parallel_model.decoder(batch_latent)
-                batch_loss_per_model = _compute_reconstruction_loss_per_model(
-                    batch_output,
-                    batch_a,
-                    None,
-                )
+                batch_loss_per_model = _loss_per_model(batch_output, batch_a, batch_sf)
                 batch_total_loss = (batch_loss_per_model * active_mask_t).sum() / max(active_count, 1.0)
                 batch_total_loss.backward()
                 optimizer.step()
@@ -2018,7 +2722,7 @@ def train_fixed_covariate_model(
         if use_best_state or use_patience:
             with torch.no_grad():
                 output = parallel_model()
-                loss_per_model = _compute_reconstruction_loss_per_model(output, a_t, None)
+                loss_per_model = _loss_per_model(output, a_t)
             loss_values = loss_per_model.detach().cpu().numpy().astype(np.float64)
             improved_mask = active_mask_np & (loss_values < (best_loss_per_model - 1e-5))
             if np.any(improved_mask):
@@ -2061,11 +2765,7 @@ def train_fixed_covariate_model(
 
     with torch.no_grad():
         output = parallel_model()
-        train_loss_per_rerun = _compute_reconstruction_loss_per_model(
-            output,
-            a_t,
-            None,
-        ).detach().cpu().numpy().astype(np.float64)
+        train_loss_per_rerun = _loss_per_model(output, a_t).detach().cpu().numpy().astype(np.float64)
 
     best_rerun_index = int(np.argmin(train_loss_per_rerun))
     best_train_loss = float(train_loss_per_rerun[best_rerun_index])
@@ -2087,8 +2787,9 @@ def train_fixed_covariate_model(
         train_loss_per_rerun=train_loss_per_rerun,
     )
     if n_reruns > 1 and config.verbose:
+        loss_label = "Poisson NLL" if is_poisson else "MSE"
         print(
             f"{model_label}: selected rerun {best_rerun_index + 1}/{n_reruns} "
-            f"(train MSE={best_train_loss:.6f})"
+            f"(train {loss_label}={best_train_loss:.6f})"
         )
     return compact_model, np.asarray(pred, dtype=np.float32)

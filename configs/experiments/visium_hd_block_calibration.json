@@ -1,0 +1,24 @@
+{
+  "experiment_name": "visium_hd_block_calibration",
+  "base_config": "configs/hippocampus/visium_hd_block_permutation.json",
+  "calibration": {
+    "block_radii_um": [16, 24, 32, 40],
+    "local_autocorr_bandwidth_um": 16.0,
+    "gradient_axis": 0,
+    "controls": [
+      "negative_local_autocorr",
+      "positive_synthetic_gradient",
+      "positive_real_expression"
+    ]
+  },
+  "test_overrides": {
+    "n_perms": 49,
+    "epochs": 250,
+    "n_reruns": 5,
+    "patience": 30,
+    "verbose": false
+  },
+  "output": {
+    "out_dir": "results/hippocampus/visium_hd_block_calibration"
+  }
+}

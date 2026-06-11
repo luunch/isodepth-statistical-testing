@@ -1,0 +1,44 @@
+{
+  "data": {
+    "source": "h5ad",
+    "h5ad": "data/h5ad/dlpfc_new/spatialDLPFC_Visium.h5ad",
+    "spatial_key": "spatial",
+    "obs_x_col": null,
+    "obs_y_col": null,
+    "layer": null,
+    "use_raw": false,
+    "obs_filters": {"sample_id": "Br6522_ant"},
+    "obs_drop_na": ["manual_layer_label"],
+    "cell_type_key": "BayesSpace_pca_09",
+    "cell_type": "separate",
+    "min_cells_per_gene": 3,
+    "min_cells_per_celltype": 10,
+    "top_var_genes": 1000,
+    "normalize_total": false,
+    "standardize_expression": false,
+    "standardize_coordinates": true,
+    "log1p": false,
+    "max_cells": null,
+    "seed": 42
+  },
+  "test": {
+    "method": "parallel_permutation",
+    "metric": "nll_poisson_mse",
+    "n_perms": 999,
+    "epochs": 500,
+    "n_reruns": 10,
+    "sgd_batch_size": 128,
+    "lr": 0.001,
+    "seed": 42,
+    "device": "cuda",
+    "decoder": "nn",
+    "batch_size": null,
+    "verbose": true
+  },
+  "output": {
+    "out_dir": "results/dlpfc_new",
+    "run_name": "poisson_BR6522_ant_BS_pca_09_1000_genes",
+    "save_preds": false,
+    "save_perm_stats": true
+  }
+}

@@ -5,11 +5,12 @@ from typing import Any, Dict, Mapping, Optional
 
 import numpy as np
 
-from methods.architectures import SUPPORTED_DECODER_TYPES
+from methods.architectures import SUPPORTED_DECODER_TYPES, SUPPORTED_ENCODER_TYPES
 
 
 CANONICAL_METRICS = {
     "nll_gaussian_mse",
+    "nll_poisson_mse",
     "mse",
     "pearson_corr_mean",
     "spearman_corr_mean",
@@ -25,6 +26,8 @@ SUPPORTED_SYNTHETIC_MODES = {
 SUPPORTED_SPATIAL_SHAPES = frozenset({"square", "semicircle", "circle", "triangle", "square_cutout"})
 
 SUPPORTED_SAMPLING_BIAS = frozenset({"uniform", "normal", "anisotropic_normal"})
+
+SUPPORTED_EXPRESSION_DISTRIBUTIONS = frozenset({"gaussian", "poisson"})
 
 
 @dataclass
@@ -122,8 +125,93 @@ def _sampling_bias_from_raw(raw: Any) -> Optional[SamplingBiasConfig]:
         f"got {type(raw).__name__}"
     )
 
+
+SUPPORTED_KERNEL_TYPES = frozenset({"exp"})
+
+_KERNEL_ALLOWED_KEYS = frozenset({"type", "distance", "max_interaction_distance"})
+
+
+@dataclass
+class KernelConfig:
+    """Spatial autocorrelation kernel for synthetic datasets.
+
+    Adds a correlated noise component to expression with covariance
+    ``Σ = σ²(I + δ·K)`` where ``K_ij = exp(-d_ij / distance)`` and
+    ``d_ij`` is the Euclidean distance between cells i and j in microns.
+
+    Parameters
+    ----------
+    type : str
+        Kernel type.  Currently only ``"exp"`` (exponential) is supported.
+    distance : float
+        Length-scale ``p`` in microns.  Controls how quickly spatial
+        correlation decays: correlation halves at ``d ≈ 0.69 * distance``.
+    max_interaction_distance : float or None
+        Hard cutoff beyond which ``K_ij`` is set to zero.  Defaults to
+        ``4 * distance`` (where ``K`` has decayed to < 2%), which bounds
+        memory usage via a KDTree neighbor query instead of a full N×N
+        distance matrix.
+    """
+
+    type: str = "exp"
+    distance: float = 100.0
+    max_interaction_distance: Optional[float] = None
+
+    @property
+    def effective_cutoff(self) -> float:
+        """Upper distance (µm) beyond which kernel is treated as zero."""
+        return (
+            self.max_interaction_distance
+            if self.max_interaction_distance is not None
+            else 4.0 * self.distance
+        )
+
+    def validate(self) -> "KernelConfig":
+        if self.type not in SUPPORTED_KERNEL_TYPES:
+            raise ValueError(
+                f"data.kernel.type {self.type!r} not supported; "
+                f"expected one of {sorted(SUPPORTED_KERNEL_TYPES)}"
+            )
+        if self.distance <= 0:
+            raise ValueError("data.kernel.distance must be > 0")
+        if self.max_interaction_distance is not None:
+            if self.max_interaction_distance <= 0:
+                raise ValueError("data.kernel.max_interaction_distance must be > 0")
+            if self.max_interaction_distance < self.distance:
+                raise ValueError(
+                    "data.kernel.max_interaction_distance should be >= distance "
+                    f"(got {self.max_interaction_distance} < {self.distance})"
+                )
+        return self
+
+    def to_meta(self) -> Dict[str, Any]:
+        m: Dict[str, Any] = {"type": self.type, "distance": float(self.distance)}
+        if self.max_interaction_distance is not None:
+            m["max_interaction_distance"] = float(self.max_interaction_distance)
+        return m
+
+
+def _kernel_from_raw(raw: Any) -> Optional["KernelConfig"]:
+    if raw is None:
+        return None
+    if isinstance(raw, KernelConfig):
+        return raw
+    if isinstance(raw, Mapping):
+        unknown = set(raw.keys()) - _KERNEL_ALLOWED_KEYS
+        if unknown:
+            raise ValueError(
+                f"data.kernel has unsupported keys {sorted(unknown)}; "
+                f"allowed: {sorted(_KERNEL_ALLOWED_KEYS)}"
+            )
+        return KernelConfig(**dict(raw))
+    raise TypeError(
+        "data.kernel must be a mapping like {\"type\": \"exp\", \"distance\": 150} or null; "
+        f"got {type(raw).__name__}"
+    )
+
 SUPPORTED_PERMUTATION_METHODS = {
     "parallel_permutation",
+    "block_permutation",
     "cross_validation",
     "full_retraining",
     "comparison_perturbation_test",
@@ -134,6 +222,7 @@ SUPPORTED_PERMUTATION_METHODS = {
 
 SUPPORTED_EXISTENCE_METHODS = {
     "parallel_permutation",
+    "block_permutation",
     "cross_validation",
 }
 
@@ -183,6 +272,7 @@ class DataConfig:
     use_raw: bool = False
     min_cells_per_gene: int = 0
     top_var_genes: int = 0
+    normalize_total: bool = False
     log1p: bool = False
     standardize_expression: bool = True
     q: Optional[int] = None
@@ -193,6 +283,8 @@ class DataConfig:
     n_cells: int = 900
     n_genes: int = 20
     sigma: float = 0.1
+    expression_distribution: str = "gaussian"
+    mean_count: float = 5.0
     k: Optional[int] = None
     k_min: Optional[int] = None
     k_max: Optional[int] = None
@@ -201,14 +293,22 @@ class DataConfig:
     side_length: Optional[int] = None
     shape: str = "square"
     sampling_bias: Optional[SamplingBiasConfig] = None
+    scale: Optional[float] = None
+    kernel: Optional[KernelConfig] = None
+    delta: float = 0.0
     standardize_coordinates: bool = True
     cell_type: Any = False
     cell_type_key: str = "cell_type"
     min_cells_per_celltype: int = 1
+    obs_filters: Optional[dict] = None
+    obs_indices: Optional[str] = None
+    obs_drop_na: Optional[list[str]] = None
 
     def __post_init__(self) -> None:
         if self.sampling_bias is not None and not isinstance(self.sampling_bias, SamplingBiasConfig):
             self.sampling_bias = _sampling_bias_from_raw(self.sampling_bias)
+        if self.kernel is not None and not isinstance(self.kernel, KernelConfig):
+            self.kernel = _kernel_from_raw(self.kernel)
 
     @property
     def cell_type_mode(self) -> str:
@@ -238,6 +338,13 @@ class DataConfig:
             raise ValueError("data.top_var_genes is only supported when data.source='h5ad'")
         if self.log1p and self.q is not None:
             raise ValueError("data.log1p cannot be combined with data.q")
+        if self.normalize_total and self.q is not None:
+            raise ValueError(
+                "data.normalize_total cannot be combined with data.q; the Poisson low-rank "
+                "factorization handles library size via a size-factor offset, not by rescaling counts"
+            )
+        if self.normalize_total and self.source != "h5ad":
+            raise ValueError("data.normalize_total is only supported when data.source='h5ad'")
         if self.q is not None and self.q <= 0:
             raise ValueError("data.q must be > 0 when provided")
         if self.source == "synthetic" and self.q is not None:
@@ -268,6 +375,19 @@ class DataConfig:
             raise ValueError("data.shape is only supported when data.source='synthetic'")
         if self.source != "synthetic" and self.sampling_bias is not None:
             raise ValueError("data.sampling_bias is only supported when data.source='synthetic'")
+        if self.source != "synthetic" and self.expression_distribution != "gaussian":
+            raise ValueError(
+                "data.expression_distribution is only supported when data.source='synthetic'"
+            )
+        if self.source != "synthetic" and self.mean_count != 5.0:
+            raise ValueError("data.mean_count is only supported when data.source='synthetic'")
+        if self.expression_distribution not in SUPPORTED_EXPRESSION_DISTRIBUTIONS:
+            raise ValueError(
+                f"Unsupported data.expression_distribution '{self.expression_distribution}'. "
+                f"Expected one of {sorted(SUPPORTED_EXPRESSION_DISTRIBUTIONS)}"
+            )
+        if self.mean_count <= 0:
+            raise ValueError("data.mean_count must be > 0 when provided")
         if self.shape not in SUPPORTED_SPATIAL_SHAPES:
             raise ValueError(
                 f"Unsupported data.shape '{self.shape}'. Expected one of {sorted(SUPPORTED_SPATIAL_SHAPES)}"
@@ -279,6 +399,18 @@ class DataConfig:
             raise ValueError("data.cell_type is only supported when data.source='h5ad'")
         if self.min_cells_per_celltype < 1:
             raise ValueError("data.min_cells_per_celltype must be >= 1")
+        if self.obs_filters is not None:
+            if not isinstance(self.obs_filters, dict) or not self.obs_filters:
+                raise ValueError("data.obs_filters must be a non-empty dict when provided")
+        if self.obs_indices is not None and not str(self.obs_indices).strip():
+            raise ValueError("data.obs_indices must be a non-empty path when provided")
+        if self.obs_filters and self.obs_indices:
+            raise ValueError("Provide either data.obs_filters or data.obs_indices, not both")
+        if self.obs_drop_na is not None:
+            if not isinstance(self.obs_drop_na, list) or not self.obs_drop_na:
+                raise ValueError("data.obs_drop_na must be a non-empty list of obs column names when provided")
+            if any(not isinstance(col, str) or not col.strip() for col in self.obs_drop_na):
+                raise ValueError("data.obs_drop_na entries must be non-empty strings")
         if self.n_cells <= 0 or self.n_genes <= 0:
             raise ValueError("Synthetic data requires positive n_cells and n_genes")
         if self.source == "synthetic":
@@ -286,6 +418,21 @@ class DataConfig:
                 if not isinstance(self.sampling_bias, SamplingBiasConfig):
                     self.sampling_bias = _sampling_bias_from_raw(self.sampling_bias)
                 self.sampling_bias = self.sampling_bias.validate()
+            if self.kernel is not None or self.delta != 0.0:
+                if self.source != "synthetic":
+                    raise ValueError("data.kernel and data.delta are only supported when data.source='synthetic'")
+                if self.scale is None:
+                    raise ValueError(
+                        "data.scale (tissue width in microns) is required when data.kernel is set"
+                    )
+                if self.scale <= 0:
+                    raise ValueError("data.scale must be > 0")
+                if self.delta < 0:
+                    raise ValueError("data.delta must be >= 0")
+                if self.kernel is not None:
+                    if not isinstance(self.kernel, KernelConfig):
+                        self.kernel = _kernel_from_raw(self.kernel)
+                    self.kernel = self.kernel.validate()
             if self.mode not in SUPPORTED_SYNTHETIC_MODES:
                 raise ValueError(
                     f"Unsupported synthetic data mode '{self.mode}'. Expected one of {sorted(SUPPORTED_SYNTHETIC_MODES)}"
@@ -365,6 +512,7 @@ class TestConfig:
     metric: str = "nll_gaussian_mse"
     n_perms: int = 100
     train_fraction: float = 0.8
+    n_folds: int = 5
     n_reruns: int = 30
     alpha: float = 0.05
     n_nulls: int = 50
@@ -374,6 +522,8 @@ class TestConfig:
     seed: int = 0
     device: str = "cuda"
     decoder: str = "nn"
+    encoder: str = "mlp"
+    midline_init_theta: float = 0.0
     batch_size: Optional[int] = None
     sgd_batch_size: Optional[int] = None
     sgd_cosine_lr_decay: bool = False
@@ -386,6 +536,11 @@ class TestConfig:
     subset_fractions: list[float] = field(default_factory=lambda: [0.5, 0.7, 0.9])
     verbose: bool = True
     covariate: Optional[CovariateConfig] = None
+    recursive: bool = False
+    max_gradients: int = 10
+    block_radius: Optional[float] = None
+    coordinate_um_per_unit: Optional[float] = None
+    block_jitter: bool = True
 
     def validate(self) -> "TestConfig":
         if self.method not in SUPPORTED_PERMUTATION_METHODS:
@@ -413,6 +568,10 @@ class TestConfig:
         if self.decoder not in SUPPORTED_DECODER_TYPES:
             raise ValueError(
                 f"Unsupported test.decoder '{self.decoder}'. Expected one of {sorted(SUPPORTED_DECODER_TYPES)}"
+            )
+        if self.encoder not in SUPPORTED_ENCODER_TYPES:
+            raise ValueError(
+                f"Unsupported test.encoder '{self.encoder}'. Expected one of {sorted(SUPPORTED_ENCODER_TYPES)}"
             )
         if self.batch_size is not None and self.batch_size <= 0:
             raise ValueError("test.batch_size must be > 0 when provided")
@@ -448,6 +607,7 @@ class TestConfig:
 
         if self.method in {
             "parallel_permutation",
+            "block_permutation",
             "cross_validation",
             "full_retraining",
             "comparison_perturbation_test",
@@ -457,13 +617,31 @@ class TestConfig:
         } and self.n_perms <= 0:
             raise ValueError("test.n_perms must be > 0")
 
-        if self.method == "cross_validation" and self.metric not in {
-            "nll_gaussian_mse",
-            "mse",
-        }:
-            raise ValueError(
-                "test.metric for cross_validation must be one of ['mse', 'nll_gaussian_mse']"
-            )
+        if self.method == "block_permutation":
+            if self.block_radius is None:
+                raise ValueError(
+                    "test.block_radius (in microns) is required when test.method='block_permutation'"
+                )
+            if float(self.block_radius) <= 0:
+                raise ValueError("test.block_radius must be > 0")
+        if self.block_radius is not None and float(self.block_radius) <= 0:
+            raise ValueError("test.block_radius must be > 0 when provided")
+        if self.coordinate_um_per_unit is not None and float(self.coordinate_um_per_unit) <= 0:
+            raise ValueError("test.coordinate_um_per_unit must be > 0 when provided")
+
+        if self.method == "cross_validation":
+            if self.n_folds < 2:
+                raise ValueError("test.n_folds must be >= 2 for cross_validation")
+            if self.metric not in {
+                "nll_gaussian_mse",
+                "nll_poisson_mse",
+                "poisson",
+                "mse",
+            }:
+                raise ValueError(
+                    "test.metric for cross_validation must be one of "
+                    "['mse', 'nll_gaussian_mse', 'nll_poisson_mse']"
+                )
         if self.method == "comparison_subsampling_test" and self.metric not in {
             "nll_gaussian_mse",
             "mse",
@@ -485,6 +663,19 @@ class TestConfig:
             raise ValueError(
                 "test.metric for subsampling_test must be one of ['mse', 'nll_gaussian_mse']"
             )
+
+        if self.max_gradients <= 0:
+            raise ValueError("test.max_gradients must be > 0")
+        if self.recursive:
+            if self.method != "parallel_permutation":
+                raise ValueError(
+                    "test.recursive requires test.method == 'parallel_permutation'"
+                )
+            if self.decoder not in {"linear", "quadratic"}:
+                raise ValueError(
+                    f"test.recursive requires a parametric decoder ('linear' or 'quadratic'); "
+                    f"got '{self.decoder}'. The nn decoder does not support recursive SVG detection."
+                )
 
         if self.covariate is not None:
             self.covariate.validate()
@@ -611,6 +802,7 @@ def run_config_from_mapping(mapping: Optional[Mapping[str, Any]]) -> RunConfig:
 __all__ = [
     "CANONICAL_METRICS",
     "CovariateConfig",
+    "SUPPORTED_ENCODER_TYPES",
     "DataConfig",
     "DatasetBundle",
     "MIDLINE_COVARIATE",
@@ -621,6 +813,7 @@ __all__ = [
     "SUPPORTED_SAMPLING_BIAS",
     "SamplingBiasConfig",
     "SUPPORTED_SPATIAL_SHAPES",
+    "SUPPORTED_EXPRESSION_DISTRIBUTIONS",
     "SUPPORTED_SYNTHETIC_MODES",
     "SUPPORTED_PERMUTATION_METHODS",
     "TestConfig",

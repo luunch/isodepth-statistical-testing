@@ -1,7 +1,7 @@
 """Regenerate gene expression vs coordinates summary plots from saved results.
 
 Usage:
-    python regen_gene_expression_plots.py configs/hypothalamus_existence.json \
+    python scripts/regen_gene_expression_plots.py configs/hypothalamus_existence.json \
         results/hypothalamus_existence_one_perm/hypothalamus_existence_one_perm_result.json
 
 The script loads the dataset using the config, reads the saved isodepth arrays
@@ -15,11 +15,19 @@ import json
 import sys
 from pathlib import Path
 
+# This script lives in scripts/; add the project root so package imports work
+# when invoked as `python scripts/<name>.py`.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import numpy as np
 
 from data.schemas import DataConfig
 from data import load_dataset
-from experiments.configuration import load_json_config, _decoder_df_from_config
+from experiments.configuration import (
+    load_json_config,
+    _decoder_df_from_config,
+    _dataset_for_gene_expression_plots,
+)
 from analysis.plots import (
     save_gene_expression_vs_coordinates_comparison,
     save_gene_expression_vs_isodepth_plot,
@@ -37,7 +45,10 @@ def main(config_path: str, result_json_path: str) -> None:
     # covariate=None: midline is computed from coords (not loaded from h5ad),
     # so no obs-column loading is required to reconstruct expression arrays.
     dataset = load_dataset(data_cfg)
+    plot_dataset = _dataset_for_gene_expression_plots(dataset)
     print(f"  {dataset.A.shape[0]} cells × {dataset.A.shape[1]} genes", flush=True)
+    if plot_dataset is not dataset:
+        print("  using cell-type expression residuals for gene-expression plots", flush=True)
 
     with open(result_json_path) as f:
         saved = json.load(f)
@@ -76,7 +87,7 @@ def main(config_path: str, result_json_path: str) -> None:
         covariate_str = cfg.get("test", {}).get("covariate", "covariate")
         covariate_label = "Midline" if covariate_str == "midline" else str(covariate_str)
         save_gene_expression_vs_coordinates_comparison(
-            dataset, iso, cov, out_path,
+            plot_dataset, iso, cov, out_path,
             isodepth_label="Isodepth",
             covariate_label=covariate_label,
             pred_isodepth=pred_iso,
@@ -87,7 +98,7 @@ def main(config_path: str, result_json_path: str) -> None:
         out_path = out_dir / f"{run_name}_gene_expression_vs_isodepth.png"
         print(f"Generating isodepth-only plot → {out_path}", flush=True)
         save_gene_expression_vs_isodepth_plot(
-            dataset, iso, out_path,
+            plot_dataset, iso, out_path,
             decoder_preds=pred_iso,
             decoder_df=decoder_df,
         )

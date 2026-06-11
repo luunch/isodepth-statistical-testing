@@ -6,8 +6,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
 import torch
+from scipy.spatial import KDTree
 
-from data.schemas import DataConfig, DatasetBundle, SamplingBiasConfig
+from data.schemas import DataConfig, DatasetBundle, KernelConfig, SamplingBiasConfig
 
 
 def _point_in_spatial_shape(shape: str, x: float, y: float, *, eps: float = 1e-9) -> bool:
@@ -205,6 +206,11 @@ class SpatialDataSimulator:
         shape: str = "square",
         lattice_seed: int = 0,
         sampling_bias: Optional[SamplingBiasConfig] = None,
+        expression_distribution: str = "gaussian",
+        mean_count: float = 5.0,
+        scale: Optional[float] = None,
+        kernel: Optional[KernelConfig] = None,
+        delta: float = 0.0,
     ):
         self.N_requested = int(N)
         self.side_length = side_length
@@ -215,6 +221,19 @@ class SpatialDataSimulator:
         self.shape = shape
         self.lattice_seed = int(lattice_seed)
         self.lattice_resolution: Optional[int] = None
+        self.expression_distribution = str(expression_distribution)
+        self.mean_count = float(mean_count)
+        self.scale = scale
+        self.kernel = kernel
+        self.delta = float(delta)
+        self._L: Optional[np.ndarray] = None
+        if self.expression_distribution not in {"gaussian", "poisson"}:
+            raise ValueError(
+                f"Unsupported expression_distribution {self.expression_distribution!r}; "
+                "expected 'gaussian' or 'poisson'"
+            )
+        if self.mean_count <= 0.0:
+            raise ValueError("mean_count must be > 0")
 
         if sampling_bias is not None:
             rng = np.random.RandomState(int(lattice_seed))
@@ -283,7 +302,7 @@ class SpatialDataSimulator:
         if mode == "radial":
             d = np.sqrt((self.S[:, 0] - 0.5) ** 2 + (self.S[:, 1] - 0.5) ** 2)
             H = self._apply_expression_manifold(d)
-            A = H + self.sigma * np.random.randn(self.N, self.G)
+            A = self._sample_expression_from_manifold(H)
         elif mode == "checkerboard":
             d = np.zeros(self.N)
             for i in range(self.N):
@@ -292,21 +311,41 @@ class SpatialDataSimulator:
                 row = min(int(yi * 3), 2)
                 d[i] = xi if (row + col) % 2 == 0 else yi
             H = self._apply_expression_manifold(d)
-            A = H + self.sigma * np.random.randn(self.N, self.G)
+            A = self._sample_expression_from_manifold(H)
         elif mode == "fourier":
             if k_min is None or k_max is None:
                 raise ValueError("k_min and k_max must be provided when mode='fourier'")
             d = self._generate_fourier_latent(k_min, k_max, dependent_xy=dependent_xy)
             H = self._apply_expression_manifold(d)
-            A = H + self.sigma * np.random.randn(self.N, self.G)
+            A = self._sample_expression_from_manifold(H)
         elif mode == "noise":
             d = np.zeros(self.N, dtype=np.float64)
-            A = np.random.randn(self.N, self.G)
+            A = self._sample_expression_from_manifold(None)
         else:
             raise ValueError(f"Unsupported synthetic data mode '{mode}'")
 
-        A = (A - A.mean(axis=0)) / (A.std(axis=0) + 1e-8)
         return self.S, A.astype(np.float32), d.astype(np.float32)
+
+    def _sample_expression_from_manifold(self, H: Optional[np.ndarray]) -> np.ndarray:
+        if self.expression_distribution == "poisson":
+            if H is None:
+                log_rate = np.full((self.N, self.G), np.log(self.mean_count), dtype=np.float64)
+            else:
+                log_rate = H.astype(np.float64)
+            if self.sigma > 0.0:
+                log_rate = log_rate + self._draw_correlated_noise(self.N, self.G)
+            log_rate = log_rate - log_rate.mean() + np.log(self.mean_count)
+            rates = np.exp(log_rate)
+            rates = np.clip(rates, 1e-8, None)
+            return np.random.poisson(rates).astype(np.float32)
+
+        noise = self._draw_correlated_noise(self.N, self.G)
+        if H is None:
+            A = noise if self.sigma > 0.0 else np.random.randn(self.N, self.G)
+        else:
+            A = H + noise
+        A = (A - A.mean(axis=0)) / (A.std(axis=0) + 1e-8)
+        return A.astype(np.float32)
 
     def _generate_fourier_latent(self, k_min: int, k_max: int, *, dependent_xy: bool = True) -> np.ndarray:
         x = self.S[:, 0]
@@ -334,6 +373,39 @@ class SpatialDataSimulator:
         if d_max - d_min <= 1e-12:
             return np.zeros(self.N, dtype=np.float64)
         return (d_raw - d_min) / (d_max - d_min)
+
+    def _build_cholesky(self) -> np.ndarray:
+        """Compute and cache Cholesky of C = I + δ·K.
+
+        K is the exponential kernel at pairwise micron distances, truncated
+        beyond ``kernel.effective_cutoff`` (KDTree avoids the full N×N matrix).
+        Returns L with L @ L.T = C; draw correlated noise as ``σ·L @ z``.
+        """
+        if self._L is not None:
+            return self._L
+        assert self.kernel is not None and self.scale is not None
+        S_um = self.S * float(self.scale)
+        r_max = self.kernel.effective_cutoff
+        p = float(self.kernel.distance)
+        tree = KDTree(S_um)
+        pairs = tree.query_pairs(r_max, output_type="ndarray")
+        C = np.eye(self.N, dtype=np.float64)
+        np.fill_diagonal(C, 1.0 + self.delta)
+        if pairs.shape[0] > 0:
+            d_vals = np.linalg.norm(S_um[pairs[:, 0]] - S_um[pairs[:, 1]], axis=1)
+            k_vals = self.delta * np.exp(-d_vals / p)
+            C[pairs[:, 0], pairs[:, 1]] += k_vals
+            C[pairs[:, 1], pairs[:, 0]] += k_vals
+        self._L = np.linalg.cholesky(C)
+        return self._L
+
+    def _draw_correlated_noise(self, N: int, G: int) -> np.ndarray:
+        """Draw noise from N(0, σ²·C) — correlated when kernel active, IID otherwise."""
+        Z = np.random.randn(N, G)
+        if self.kernel is not None and self.delta > 0.0 and self.scale is not None:
+            L = self._build_cholesky()
+            return self.sigma * (L @ Z)
+        return self.sigma * Z
 
     def _apply_expression_manifold(self, d: np.ndarray) -> np.ndarray:
         H = np.zeros((self.N, self.G))
@@ -423,6 +495,11 @@ def generate_synthetic_dataset(config: DataConfig) -> DatasetBundle:
         shape=config.shape,
         lattice_seed=config.seed,
         sampling_bias=config.sampling_bias,
+        expression_distribution=config.expression_distribution,
+        mean_count=config.mean_count,
+        scale=config.scale,
+        kernel=config.kernel,
+        delta=config.delta,
     )
     s, a, true_curve = simulator.generate(
         mode=config.mode,
@@ -436,6 +513,7 @@ def generate_synthetic_dataset(config: DataConfig) -> DatasetBundle:
         "mode": config.mode,
         "seed": int(config.seed),
         "sigma": float(config.sigma),
+        "expression_distribution": str(config.expression_distribution),
         "poly_degree": int(config.poly_degree),
         "n_cells_requested": int(config.n_cells),
         "n_cells_generated": int(s.shape[0]),
@@ -444,6 +522,8 @@ def generate_synthetic_dataset(config: DataConfig) -> DatasetBundle:
         "grid_height": int(simulator.grid_height),
         "grid_width": int(simulator.grid_width),
     }
+    if config.expression_distribution == "poisson":
+        meta["mean_count"] = float(config.mean_count)
     if config.sampling_bias is not None:
         meta["sampling_bias"] = config.sampling_bias.to_meta()
     if config.shape != "square":
@@ -458,4 +538,16 @@ def generate_synthetic_dataset(config: DataConfig) -> DatasetBundle:
     if config.side_length is not None and config.shape == "square" and config.sampling_bias is None:
         meta["side_length"] = int(config.side_length)
         meta["other_side_length"] = int(s.shape[0] // config.side_length)
+    if config.kernel is not None and config.delta > 0.0:
+        meta["kernel"] = config.kernel.to_meta()
+        meta["delta"] = float(config.delta)
+        meta["scale_um"] = float(config.scale)
+        meta["local_fraction"] = config.delta / (1.0 + config.delta)
+        # Store one example noise draw for the kernel diagnostic plot
+        if simulator._L is not None:
+            rng_state = np.random.get_state()
+            np.random.seed(int(config.seed) + 9999)
+            noise_sample = float(config.sigma) * (simulator._L @ np.random.randn(simulator.N))
+            np.random.set_state(rng_state)
+            meta["kernel_noise_sample"] = noise_sample.astype(np.float32)
     return DatasetBundle(S=s, A=a, meta=meta).validate()

@@ -141,7 +141,7 @@ class TestExistenceSigmaSpec(unittest.TestCase):
                             "method": "cross_validation",
                             "metric": "mse",
                             "n_perms": 2,
-                            "train_fraction": 0.75,
+                            "n_folds": 4,
                             "epochs": 2,
                             "lr": 0.01,
                             "patience": 2,
@@ -183,7 +183,7 @@ class TestExistenceSigmaSpec(unittest.TestCase):
             )
 
         self.assertEqual(run_config.test.method, "cross_validation")
-        self.assertEqual(run_config.test.train_fraction, 0.75)
+        self.assertEqual(run_config.test.n_folds, 4)
 
 
 class TestExistenceSigmaHelpers(unittest.TestCase):

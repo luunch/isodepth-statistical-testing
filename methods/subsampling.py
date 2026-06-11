@@ -96,6 +96,7 @@ def compute_masked_losses(
     loss_mask_batched: np.ndarray,
     *,
     metric: str = "mse",
+    poisson_size_factors: np.ndarray | None = None,
 ) -> np.ndarray:
     metric = canonicalize_metric_name(metric)
     predictions = np.asarray(predictions, dtype=np.float64)
@@ -121,6 +122,17 @@ def compute_masked_losses(
     active_counts = loss_mask.sum(axis=(1, 2))
     if np.any(active_counts <= 0):
         raise ValueError("Each model must have at least one active masked entry")
+
+    if metric == "nll_poisson_mse":
+        if poisson_size_factors is not None:
+            sf = np.asarray(poisson_size_factors, dtype=np.float64)
+            if sf.ndim == 2:
+                sf = np.repeat(sf[None, :, :], predictions.shape[0], axis=0)
+        else:
+            sf = targets.sum(axis=2, keepdims=True)
+        elementwise = sf * np.exp(predictions) - targets * predictions
+        poisson_loss = (elementwise * loss_mask).sum(axis=(1, 2)) / active_counts
+        return np.asarray(poisson_loss, dtype=np.float64)
 
     squared_error = (predictions - targets) ** 2
     mse = (squared_error * loss_mask).sum(axis=(1, 2)) / active_counts

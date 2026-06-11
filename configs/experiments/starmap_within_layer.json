@@ -1,0 +1,34 @@
+{
+  "experiment_name": "starmap_within_layer",
+  "data": {
+    "h5ad": "data/h5ad/starmap_mvc_BY3.h5ad",
+    "layer_obs": "layer",
+    "depth_obs": "cortical_depth",
+    "n_hvg": 0
+  },
+  "negative": {
+    "layers": ["L1", "L2/3", "L4", "L5", "L6", "CC"],
+    "within_layer_min_cells": 80
+  },
+  "preprocessing": {
+    "min_cells_per_gene": 3,
+    "normalize_total": true,
+    "log1p": true,
+    "standardize_expression": true
+  },
+  "test": {
+    "method": "parallel_permutation",
+    "metric": "nll_gaussian_mse",
+    "n_perms": 99,
+    "epochs": 500,
+    "n_reruns": 10,
+    "lr": 0.001,
+    "patience": 50,
+    "seed": 42,
+    "device": "cuda",
+    "decoder": "nn"
+  },
+  "output": {
+    "out_dir": "results/starmap_within_layer"
+  }
+}

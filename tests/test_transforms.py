@@ -13,9 +13,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from data.transforms import (
+    _CPM_TARGET,
     apply_expression_transforms,
     apply_expression_transforms_by_celltype,
+    celltype_expression_residuals,
     filter_genes_by_min_cells,
+    normalize_total_expression,
     zscore_covariate,
 )
 
@@ -84,6 +87,34 @@ class TestBasicTransforms(unittest.TestCase):
             standardize_expression=False,
         )
         np.testing.assert_allclose(transformed, np.log1p(counts).astype(np.float32), atol=1e-6)
+
+    def test_normalize_total_scales_to_cpm(self) -> None:
+        counts = np.asarray(
+            [
+                [2.0, 3.0],
+                [10.0, 0.0],
+                [0.0, 0.0],
+            ],
+            dtype=np.float32,
+        )
+        normalized = normalize_total_expression(counts)
+        np.testing.assert_allclose(normalized.sum(axis=1), [_CPM_TARGET, _CPM_TARGET, 0.0], atol=1e-3)
+        np.testing.assert_allclose(
+            normalized[0],
+            counts[0] / counts[0].sum() * _CPM_TARGET,
+            atol=1e-3,
+        )
+
+    def test_normalize_total_then_log1p_is_log_cpm(self) -> None:
+        counts = np.asarray([[2.0, 3.0], [10.0, 0.0]], dtype=np.float32)
+        transformed = apply_expression_transforms(
+            counts,
+            normalize_total=True,
+            log1p=True,
+            standardize_expression=False,
+        )
+        cpm = counts / counts.sum(axis=1, keepdims=True) * _CPM_TARGET
+        np.testing.assert_allclose(transformed, np.log1p(cpm).astype(np.float32), atol=1e-6)
 
     def test_log1p_rejects_negative_values(self) -> None:
         expression = np.asarray(
@@ -197,6 +228,21 @@ class TestPoissonLowRankTransform(unittest.TestCase):
         self.assertFalse(np.allclose(per_type, global_latent, atol=1e-4))
         np.testing.assert_allclose(per_type[labels == 0].mean(axis=0), np.zeros(2), atol=1e-5)
         np.testing.assert_allclose(per_type[labels == 1].mean(axis=0), np.zeros(2), atol=1e-5)
+
+    def test_celltype_expression_residuals_zero_means_per_type(self) -> None:
+        expression = np.asarray(
+            [
+                [1.0, 10.0],
+                [3.0, 14.0],
+                [20.0, 2.0],
+                [24.0, 6.0],
+            ],
+            dtype=np.float32,
+        )
+        labels = np.asarray([0, 0, 1, 1], dtype=np.int64)
+        residuals = celltype_expression_residuals(expression, labels, n_cell_types=2)
+        np.testing.assert_allclose(residuals[labels == 0].mean(axis=0), np.zeros(2), atol=1e-6)
+        np.testing.assert_allclose(residuals[labels == 1].mean(axis=0), np.zeros(2), atol=1e-6)
 
 
 if __name__ == "__main__":
