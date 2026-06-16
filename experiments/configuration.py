@@ -25,6 +25,7 @@ from analysis.plots import (
     save_gene_expression_vs_isodepth_plot,
     save_isodepth_triptych,
     save_metric_distribution_plot,
+    save_permutation_null_comparison,
     save_perturbation_delta_pvalue_plot,
     save_synthetic_kernel_plot,
     save_synthetic_true_curve_plot,
@@ -240,6 +241,8 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
         "alpha",
         "recursive",
         "max_gradients",
+        "gaussian_pretrain_epochs",
+        "gaussian_pretrain_freeze_encoder",
     }
     if method in {
         "parallel_permutation",
@@ -257,6 +260,7 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
             "block_radius",
             "coordinate_um_per_unit",
             "block_jitter",
+            "save_permutation_null_comparison",
         }
     if method == "cross_validation":
         test_keys.add("n_folds")
@@ -661,6 +665,47 @@ def _resolve_covariate_label(run_config: RunConfig) -> str:
     return "Covariate"
 
 
+def _save_block_permutation_overlay_artifact(
+    S_true_raw: np.ndarray,
+    s_permuted_slot1_raw: np.ndarray | None,
+    block_ids_true: np.ndarray | None,
+    out_path: Path,
+    *,
+    run_name: str,
+    radius_units: float | None,
+) -> str | None:
+    overlay_path = save_block_permutation_overlay(
+        S_true_raw,
+        s_permuted_slot1_raw,
+        block_ids_true,
+        out_path,
+        run_name=run_name,
+        radius_units=radius_units,
+    )
+    return str(overlay_path) if overlay_path is not None else None
+
+
+def _save_permutation_null_comparison_artifact(
+    S_true_raw: np.ndarray,
+    s_permuted_slot1_raw: np.ndarray | None,
+    A: np.ndarray,
+    out_path: Path,
+    *,
+    seed: int,
+    run_name: str,
+) -> str | None:
+    if s_permuted_slot1_raw is None:
+        return None
+    comparison_path = save_permutation_null_comparison(
+        S_true_raw,
+        np.asarray(s_permuted_slot1_raw, dtype=np.float32),
+        A,
+        out_path,
+        seed=int(seed),
+        run_name=run_name,
+    )
+    return str(comparison_path) if comparison_path is not None else None
+
 
 def save_standardized_outputs(
     dataset: DatasetBundle,
@@ -726,7 +771,7 @@ def save_standardized_outputs(
 
     if result.method_name == "block_permutation":
         S_true_raw = raw_coordinates_from_standardized(dataset.S, dataset.meta)
-        block_overlay_path = save_block_permutation_overlay(
+        block_overlay_path = _save_block_permutation_overlay_artifact(
             S_true_raw,
             result.artifacts.get("s_permuted_slot1_raw"),
             result.artifacts.get("block_ids_true"),
@@ -735,7 +780,18 @@ def save_standardized_outputs(
             radius_units=result.artifacts.get("block_radius_units"),
         )
         if block_overlay_path is not None:
-            artifact_paths["block_permutation_overlay_plot"] = str(block_overlay_path)
+            artifact_paths["block_permutation_overlay_plot"] = block_overlay_path
+        if run_config.test.save_permutation_null_comparison:
+            null_comparison_path = _save_permutation_null_comparison_artifact(
+                S_true_raw,
+                result.artifacts.get("s_permuted_slot1_raw"),
+                np.asarray(dataset.A, dtype=np.float32),
+                out_dir / f"{run_config.output.run_name}_permutation_null_comparison.png",
+                seed=int(run_config.test.seed),
+                run_name=run_config.output.run_name,
+            )
+            if null_comparison_path is not None:
+                artifact_paths["permutation_null_comparison_plot"] = null_comparison_path
 
     if result.method_name == "cross_validation":
         fold_isodepths = result.artifacts.get("per_fold_true_isodepth")
@@ -865,6 +921,28 @@ def _save_separate_celltype_outputs(
             metric=result.metric,
             decoder_df=_ct_decoder_df,
         )
+        if result.method_name == "block_permutation" and type_data.get("S_raw") is not None:
+            overlay_path = _save_block_permutation_overlay_artifact(
+                np.asarray(type_data["S_raw"], dtype=np.float32),
+                type_data.get("s_permuted_slot1_raw"),
+                type_data.get("block_ids_true"),
+                type_dir / f"{safe_name}_block_permutation_overlay.png",
+                run_name=safe_name,
+                radius_units=type_data.get("block_radius_units"),
+            )
+            if overlay_path is not None:
+                type_artifact_paths["block_permutation_overlay_plot"] = overlay_path
+            if run_config.test.save_permutation_null_comparison:
+                null_comparison_path = _save_permutation_null_comparison_artifact(
+                    np.asarray(type_data["S_raw"], dtype=np.float32),
+                    type_data.get("s_permuted_slot1_raw"),
+                    np.asarray(type_data["A"], dtype=np.float32),
+                    type_dir / f"{safe_name}_permutation_null_comparison.png",
+                    seed=int(run_config.test.seed),
+                    run_name=safe_name,
+                )
+                if null_comparison_path is not None:
+                    type_artifact_paths["permutation_null_comparison_plot"] = null_comparison_path
         per_type_artifact_paths[type_name] = type_artifact_paths
         type_summary: dict[str, Any] = {
             "p_value": float(type_data["p_value"]),
@@ -924,6 +1002,30 @@ def _save_separate_celltype_outputs(
         top_level_artifacts["piecewise_residual_ratio_rankings_csv"] = str(combined_residual_csv_path)
     if combined_residual_plot_path is not None:
         top_level_artifacts["piecewise_residual_ratio_distribution_plot"] = str(combined_residual_plot_path)
+
+    if result.method_name == "block_permutation":
+        S_true_raw = raw_coordinates_from_standardized(dataset.S, dataset.meta)
+        block_overlay_path = _save_block_permutation_overlay_artifact(
+            S_true_raw,
+            result.artifacts.get("s_permuted_slot1_raw"),
+            result.artifacts.get("block_ids_true"),
+            out_dir / f"{run_config.output.run_name}_block_permutation_overlay.png",
+            run_name=run_config.output.run_name,
+            radius_units=result.artifacts.get("block_radius_units"),
+        )
+        if block_overlay_path is not None:
+            top_level_artifacts["block_permutation_overlay_plot"] = block_overlay_path
+        if run_config.test.save_permutation_null_comparison:
+            null_comparison_path = _save_permutation_null_comparison_artifact(
+                S_true_raw,
+                result.artifacts.get("s_permuted_slot1_raw"),
+                np.asarray(dataset.A, dtype=np.float32),
+                out_dir / f"{run_config.output.run_name}_permutation_null_comparison.png",
+                seed=int(run_config.test.seed),
+                run_name=run_config.output.run_name,
+            )
+            if null_comparison_path is not None:
+                top_level_artifacts["permutation_null_comparison_plot"] = null_comparison_path
 
     payload = result.to_json_dict(
         config=_compact_run_config(run_config),

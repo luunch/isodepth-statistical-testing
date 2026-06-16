@@ -3505,3 +3505,65 @@ def save_block_permutation_overlay(
     plt.close(fig)
     return out_path
 
+
+def save_permutation_null_comparison(
+    S_true: np.ndarray,
+    S_block_perm: np.ndarray,
+    A: np.ndarray,
+    out_path: str | Path,
+    *,
+    seed: int,
+    run_name: str = "",
+) -> Path | None:
+    """Three-panel mean |expression| map: true layout, block null, global coordinate null."""
+    from methods.permutation import global_coordinate_permute_slot
+
+    out_path = Path(out_path)
+    S_true = np.asarray(S_true, dtype=np.float32)
+    S_block_perm = np.asarray(S_block_perm, dtype=np.float32)
+    A = np.asarray(A, dtype=np.float32)
+    n_cells = int(S_true.shape[0])
+    if S_true.ndim != 2 or S_true.shape[1] != 2 or n_cells == 0:
+        return None
+    if S_block_perm.shape != S_true.shape:
+        raise ValueError(
+            f"S_block_perm shape {S_block_perm.shape} must match S_true {S_true.shape}"
+        )
+    if A.shape[0] != n_cells:
+        raise ValueError(f"A must have {n_cells} rows, got {A.shape[0]}")
+
+    S_global_perm = global_coordinate_permute_slot(S_true, seed=int(seed), slot=1)
+    signal = _cell_expression_signal(A)
+    vmin = float(signal.min())
+    vmax = float(signal.max())
+    spatial_limits = _spatial_axis_limits(S_true)
+    xlim, ylim = spatial_limits
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5.5))
+    panels = [
+        (S_true, "True coordinates"),
+        (S_block_perm, "Block null (slot 1)"),
+        (S_global_perm, "Global coordinate null (slot 1)"),
+    ]
+    for ax, (S_panel, title) in zip(axes, panels):
+        _plot_spatial_dataset_heatmap(
+            ax,
+            S_panel,
+            signal,
+            title,
+            vmin=vmin,
+            vmax=vmax,
+        )
+        ax.set_xlim(float(xlim[0]), float(xlim[1]))
+        ax.set_ylim(float(ylim[0]), float(ylim[1]))
+
+    title_parts = ["Permutation null comparison (mean |expression|)"]
+    if run_name:
+        title_parts[0] = f"Permutation null comparison — {run_name}"
+    fig.suptitle(title_parts[0], fontsize=11)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+

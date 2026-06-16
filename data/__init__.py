@@ -110,6 +110,9 @@ def load_dataset(config: DataConfig, *, covariate=None) -> DatasetBundle:
         dataset = generate_synthetic_dataset(config)
     else:
         raise ValueError(f"Unsupported data source '{config.source}'")
+    if getattr(config, "spatial_region_split", False):
+        from data.spatial_regions import split_spatial_regions
+        dataset = split_spatial_regions(dataset, config)
     if bool(getattr(config, "standardize_coordinates", True)):
         dataset = _standardize_coordinates_inplace(dataset)
     return dataset

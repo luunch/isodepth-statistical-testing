@@ -14,7 +14,7 @@ from torch.optim import lr_scheduler
 from tqdm import tqdm
 
 from data.schemas import TestConfig
-from data.transforms import celltype_expression_residuals, zscore_covariate
+from data.transforms import celltype_expression_residuals, gaussian_log_cpm_targets_from_counts, zscore_covariate
 from methods.architectures import (
     CellTypeIsoDepthNet,
     DecoderOnlyNet,
@@ -1379,6 +1379,30 @@ def _resolve_sgd_batch_size(config: TestConfig, n_cells: int) -> int | None:
     return min(int(config.sgd_batch_size), int(n_cells))
 
 
+def _uses_gaussian_poisson_pretrain(config: TestConfig) -> bool:
+    return (
+        canonicalize_metric_name(config.metric) == "nll_poisson_mse"
+        and int(getattr(config, "gaussian_pretrain_epochs", 0) or 0) > 0
+    )
+
+
+def _forward_batched_parallel_output(
+    model: nn.Module,
+    s_batched_t: torch.Tensor,
+    *,
+    batch_indices: torch.Tensor | None,
+    fixed_latent_t: torch.Tensor | None,
+) -> torch.Tensor:
+    if fixed_latent_t is not None:
+        if batch_indices is None:
+            return model.decoder(fixed_latent_t)
+        return model.decoder(fixed_latent_t.index_select(1, batch_indices))
+    if batch_indices is None:
+        return model(s_batched_t)
+    batch_s = s_batched_t.index_select(1, batch_indices)
+    return model(batch_s)
+
+
 def _sgd_steps_per_epoch(n_cells: int, sgd_batch_size: int) -> int:
     return (int(n_cells) + int(sgd_batch_size) - 1) // int(sgd_batch_size)
 
@@ -1439,7 +1463,7 @@ def get_training_metadata(model: nn.Module) -> dict[str, Any]:
         "loss_history_elapsed_sec": None,
         "loss_history_gradient_updates": None,
     }
-    return {
+    result = {
         "n_reruns": int(metadata.get("n_reruns", 1)),
         "selection_loss": str(metadata.get("selection_loss", "training_reconstruction_loss")),
         "best_train_loss_per_model": np.asarray(metadata.get("best_train_loss_per_model", [0.0]), dtype=np.float64),
@@ -1461,6 +1485,13 @@ def get_training_metadata(model: nn.Module) -> dict[str, Any]:
         if metadata.get("loss_history_gradient_updates") is None
         else np.asarray(metadata.get("loss_history_gradient_updates"), dtype=np.int64),
     }
+    if "gaussian_pretrain_epochs" in metadata:
+        result["gaussian_pretrain_epochs"] = int(metadata["gaussian_pretrain_epochs"])
+    if "gaussian_pretrain_freeze_encoder" in metadata:
+        result["gaussian_pretrain_freeze_encoder"] = bool(
+            metadata["gaussian_pretrain_freeze_encoder"]
+        )
+    return result
 
 
 def _compact_parallel_midline_encoder_model(
@@ -1727,6 +1758,18 @@ def train_batched_isodepth_model(
     else:
         poisson_sf_t = None
 
+    use_gaussian_pretrain = _uses_gaussian_poisson_pretrain(config)
+    warm_epochs = int(config.gaussian_pretrain_epochs) if use_gaussian_pretrain else 0
+    freeze_encoder_after_warm = (
+        bool(config.gaussian_pretrain_freeze_encoder) if use_gaussian_pretrain else False
+    )
+    gaussian_a_t: torch.Tensor | None = None
+    fixed_latent_t: torch.Tensor | None = None
+    encoder_frozen = False
+    if use_gaussian_pretrain:
+        gaussian_targets_np = gaussian_log_cpm_targets_from_counts(np.asarray(A, dtype=np.float32))
+        gaussian_a_t = torch.tensor(gaussian_targets_np, dtype=torch.float32, device=device)
+
     loss_mask_t = _prepare_loss_mask(
         expanded_loss_mask,
         n_models=total_models,
@@ -1772,6 +1815,14 @@ def train_batched_isodepth_model(
     _load_initial_state(model, initial_state, device=device)
     optimizer = optim.Adam(model.parameters(), lr=config.lr, foreach=False)
     sgd_batch_size = _resolve_sgd_batch_size(config, n_cells)
+    if use_gaussian_pretrain and config.verbose:
+        poisson_epochs = int(config.epochs) - warm_epochs
+        mode = "decoder-only" if freeze_encoder_after_warm else "encoder+decoder"
+        print(
+            f"[gaussian-pretrain] {warm_epochs} MSE epochs (log-CPM) then "
+            f"{poisson_epochs} Poisson epochs ({mode})",
+            flush=True,
+        )
     lr_scheduler_step: lr_scheduler.CosineAnnealingLR | None = None
     if sgd_batch_size is not None and config.sgd_cosine_lr_decay:
         steps_per_epoch = _sgd_steps_per_epoch(n_cells, sgd_batch_size)
@@ -1819,13 +1870,48 @@ def train_batched_isodepth_model(
                     f"(max_wall_time_sec={float(max_wall_time_sec):.3f})"
                 )
             break
+
+        if (
+            use_gaussian_pretrain
+            and epoch == warm_epochs
+            and freeze_encoder_after_warm
+            and not encoder_frozen
+        ):
+            with torch.no_grad():
+                fixed_latent_t = model.encoder(s_batched_t).detach()
+            for param in model.encoder.parameters():
+                param.requires_grad = False
+            optimizer = optim.Adam(model.decoder.parameters(), lr=config.lr, foreach=False)
+            lr_scheduler_step = None
+            encoder_frozen = True
+            if config.verbose:
+                print(
+                    f"[gaussian-pretrain] epoch {epoch}: frozen encoder, decoder-only Poisson",
+                    flush=True,
+                )
+        elif use_gaussian_pretrain and epoch == warm_epochs and config.verbose:
+            print(
+                f"[gaussian-pretrain] epoch {epoch}: switched to Poisson NLL (encoder free)",
+                flush=True,
+            )
+
+        in_warm_phase = use_gaussian_pretrain and epoch < warm_epochs
+        current_a_t = gaussian_a_t if in_warm_phase else a_t
+        current_sf_t = None if in_warm_phase else poisson_sf_t
+        use_fixed_latent = encoder_frozen and fixed_latent_t is not None
+
         active_mask_t.copy_(torch.from_numpy(active_mask_np.astype(np.float32)))
         active_count = float(active_mask_np.sum())
         if sgd_batch_size is None:
             optimizer.zero_grad()
-            output = model(s_batched_t)
+            output = _forward_batched_parallel_output(
+                model,
+                s_batched_t,
+                batch_indices=None,
+                fixed_latent_t=fixed_latent_t if use_fixed_latent else None,
+            )
             loss_per_model = _compute_reconstruction_loss_per_model(
-                output, a_t, loss_mask_t, poisson_size_factors=poisson_sf_t
+                output, current_a_t, loss_mask_t, poisson_size_factors=current_sf_t
             )
             divisor = float(gradient_scale_divisor) if gradient_scale_divisor is not None else max(active_count, 1.0)
             total_loss = (loss_per_model * active_mask_t).sum() / divisor
@@ -1839,13 +1925,17 @@ def train_batched_isodepth_model(
                     stopped_by_time = True
                     break
                 batch_indices = permutation[start : start + sgd_batch_size].to(device=device)
-                batch_s = s_batched_t.index_select(1, batch_indices)
-                batch_a = a_t.index_select(-2, batch_indices)
+                batch_a = current_a_t.index_select(-2, batch_indices)
                 batch_mask = None if loss_mask_t is None else loss_mask_t.index_select(1, batch_indices)
-                batch_sf = None if poisson_sf_t is None else poisson_sf_t.index_select(0, batch_indices)
+                batch_sf = None if current_sf_t is None else current_sf_t.index_select(0, batch_indices)
 
                 optimizer.zero_grad()
-                batch_output = model(batch_s)
+                batch_output = _forward_batched_parallel_output(
+                    model,
+                    s_batched_t,
+                    batch_indices=batch_indices,
+                    fixed_latent_t=fixed_latent_t if use_fixed_latent else None,
+                )
                 batch_loss_per_model = _compute_reconstruction_loss_per_model(
                     batch_output, batch_a, batch_mask, poisson_size_factors=batch_sf
                 )
@@ -1869,9 +1959,14 @@ def train_batched_isodepth_model(
 
         if use_patience:
             with torch.no_grad():
-                output = model(s_batched_t)
+                output = _forward_batched_parallel_output(
+                    model,
+                    s_batched_t,
+                    batch_indices=None,
+                    fixed_latent_t=fixed_latent_t if use_fixed_latent else None,
+                )
                 loss_per_model = _compute_reconstruction_loss_per_model(
-                    output, a_t, loss_mask_t, poisson_size_factors=poisson_sf_t
+                    output, current_a_t, loss_mask_t, poisson_size_factors=current_sf_t
                 )
             loss_values = loss_per_model.detach().cpu().numpy().astype(np.float64)
             improved_mask = active_mask_np & (loss_values < (best_loss_per_model - 1e-5))
@@ -1906,9 +2001,14 @@ def train_batched_isodepth_model(
                 true_loss = float(loss_per_model[0].detach().cpu().item())
             else:
                 with torch.no_grad():
-                    hist_output = model(s_batched_t)
+                    hist_output = _forward_batched_parallel_output(
+                        model,
+                        s_batched_t,
+                        batch_indices=None,
+                        fixed_latent_t=fixed_latent_t if use_fixed_latent else None,
+                    )
                     hist_loss_per_model = _compute_reconstruction_loss_per_model(
-                        hist_output, a_t, loss_mask_t, poisson_size_factors=poisson_sf_t
+                        hist_output, current_a_t, loss_mask_t, poisson_size_factors=current_sf_t
                     )
                 true_loss = float(hist_loss_per_model[0].detach().cpu().item())
             loss_history.append(true_loss)
@@ -1965,6 +2065,9 @@ def train_batched_isodepth_model(
         loss_history_elapsed_sec=loss_history_elapsed_sec if record_loss_history else None,
         loss_history_gradient_updates=loss_history_gradient_updates if record_loss_history else None,
     )
+    if use_gaussian_pretrain:
+        compact_model.training_metadata["gaussian_pretrain_epochs"] = warm_epochs
+        compact_model.training_metadata["gaussian_pretrain_freeze_encoder"] = freeze_encoder_after_warm
     return compact_model, training_outputs
 
 

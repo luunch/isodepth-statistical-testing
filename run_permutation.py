@@ -185,6 +185,29 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "values from adata.obs[<key>] in the h5ad file."
         ),
     )
+    parser.add_argument(
+        "--gaussian-pretrain-epochs",
+        dest="gaussian_pretrain_epochs",
+        type=int,
+        default=argparse.SUPPRESS,
+        help=(
+            "When metric=nll_poisson_mse, train this many MSE epochs on log-CPM before "
+            "switching to Poisson NLL on raw counts (requires sgd_batch_size > 0)."
+        ),
+    )
+    parser.add_argument(
+        "--gaussian-pretrain-freeze-encoder",
+        dest="gaussian_pretrain_freeze_encoder",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="After Gaussian pretrain, freeze the encoder and train Poisson decoder-only.",
+    )
+    parser.add_argument(
+        "--no-gaussian-pretrain-freeze-encoder",
+        dest="gaussian_pretrain_freeze_encoder",
+        action="store_false",
+        default=argparse.SUPPRESS,
+    )
     return parser
 
 
@@ -246,6 +269,8 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict:
         "verbose": "verbose",
         "recursive": "recursive",
         "max_gradients": "max_gradients",
+        "gaussian_pretrain_epochs": "gaussian_pretrain_epochs",
+        "gaussian_pretrain_freeze_encoder": "gaussian_pretrain_freeze_encoder",
     }.items():
         if hasattr(args, arg_name):
             test_overrides[config_key] = getattr(args, arg_name)

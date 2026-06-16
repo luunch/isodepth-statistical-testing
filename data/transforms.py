@@ -354,3 +354,14 @@ def apply_expression_transforms_by_celltype(
     if return_metadata:
         return transformed, metadata
     return transformed
+
+
+def gaussian_log_cpm_targets_from_counts(a: np.ndarray) -> np.ndarray:
+    """Log-CPM + per-gene z-score targets for the Gaussian warm-up phase of Poisson training.
+
+    Applies ``normalize_total`` (CPM target ``1e6``), ``log1p``, then per-gene z-scoring.
+    Expects raw non-negative count-like expression; used when ``test.gaussian_pretrain_epochs > 0``.
+    """
+    cpm = normalize_total_expression(a)
+    logged = log1p_expression(cpm)
+    return _zscore_expression(logged)

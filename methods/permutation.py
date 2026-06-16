@@ -258,6 +258,31 @@ def _build_permuted_coordinate_batch(
     return s_batched, permutations
 
 
+def global_coordinate_permute_slot(
+    S: np.ndarray,
+    *,
+    seed: int,
+    slot: int = 1,
+) -> np.ndarray:
+    """Return globally shuffled coordinates for null slot ``slot`` (1-indexed).
+
+    Matches the shuffle order used by ``_build_permuted_coordinate_batch`` for the
+    same ``seed`` and ``slot``.
+    """
+    if slot < 1:
+        raise ValueError(f"slot must be >= 1, got {slot}")
+    S = np.asarray(S, dtype=np.float32)
+    if S.ndim != 2 or S.shape[1] != 2:
+        raise ValueError(f"S must be (n_cells, 2), got {S.shape}")
+    s_t = torch.tensor(S, dtype=torch.float32, device=torch.device("cpu"))
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed))
+    perm = torch.randperm(S.shape[0], generator=generator)
+    for _ in range(2, slot + 1):
+        perm = torch.randperm(S.shape[0], generator=generator)
+    return np.asarray(s_t[perm.numpy()].numpy(), dtype=np.float32)
+
+
 def _validate_cross_validation_folds(n_cells: int, n_folds: int) -> None:
     if n_folds < 2:
         raise ValueError("cross_validation requires test.n_folds >= 2")
@@ -1793,6 +1818,11 @@ def _process_single_celltype_separate_block_permutation(
     )
     s_batched_c = ((s_batched_raw_c - mean_c) / safe_std_c).astype(np.float32)
 
+    S_um_c = np.asarray(S_raw_c, dtype=np.float64) * um_per_unit
+    block_ids_c = hex_bin_ids(S_um_c, radius_um, (0.0, 0.0))
+    s_permuted_slot1_raw_c = np.asarray(s_batched_raw_c[1], dtype=np.float32)
+    block_radius_units_c = float(radius_um / um_per_unit)
+
     type_config = replace(config, seed=type_seed)
     parallel_config = replace(type_config, covariate=None) if _has_covariate(config) else type_config
     model_c, training_outputs_c, s_batched_np_c = train_parallel_isodepth_model(
@@ -1872,6 +1902,10 @@ def _process_single_celltype_separate_block_permutation(
         "var_names": var_names_c,
         "feature_space": feature_space_c,
         "n_genes": int(np.asarray(A_c).shape[1]),
+        "S_raw": S_raw_c,
+        "block_ids_true": block_ids_c,
+        "s_permuted_slot1_raw": s_permuted_slot1_raw_c,
+        "block_radius_units": block_radius_units_c,
         **covariate_artifacts,
     }
     del s_batched_np_c

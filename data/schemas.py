@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Dict, Mapping, Optional, Union
 
 import numpy as np
 
@@ -303,6 +303,12 @@ class DataConfig:
     obs_filters: Optional[dict] = None
     obs_indices: Optional[str] = None
     obs_drop_na: Optional[list[str]] = None
+    # Union[bool, int]: False = off, True = DBSCAN auto-K, int >= 2 = K-Means with that K
+    spatial_region_split: Union[bool, int] = False
+    spatial_region_split_eps: Optional[float] = None   # DBSCAN only; auto-detected if None
+    spatial_region_split_eps_mult: float = 3.0          # DBSCAN only; multiplier for auto-eps
+    spatial_region_split_min_samples: int = 10          # DBSCAN only
+    spatial_region_split_min_cells: int = 50            # drop sub-regions smaller than this
 
     def __post_init__(self) -> None:
         if self.sampling_bias is not None and not isinstance(self.sampling_bias, SamplingBiasConfig):
@@ -411,6 +417,47 @@ class DataConfig:
                 raise ValueError("data.obs_drop_na must be a non-empty list of obs column names when provided")
             if any(not isinstance(col, str) or not col.strip() for col in self.obs_drop_na):
                 raise ValueError("data.obs_drop_na entries must be non-empty strings")
+        # --- spatial_region_split validation ---
+        rs = self.spatial_region_split
+        if rs is not False:
+            # isinstance check: True is an instance of int in Python, so check bool first
+            if isinstance(rs, bool):
+                if rs is not True:
+                    raise ValueError(
+                        "data.spatial_region_split must be false (off), true (DBSCAN auto-K), "
+                        "or an integer >= 2 (K-Means); got False"
+                    )
+            elif isinstance(rs, int):
+                if rs < 2:
+                    raise ValueError(
+                        f"data.spatial_region_split integer must be >= 2 (got {rs}); "
+                        "use false to disable or true for DBSCAN auto-K"
+                    )
+            else:
+                raise ValueError(
+                    "data.spatial_region_split must be false (off), true (DBSCAN auto-K), "
+                    f"or an integer >= 2 (K-Means); got {rs!r}"
+                )
+            if self.cell_type_mode == "together":
+                raise ValueError(
+                    "data.spatial_region_split is not compatible with data.cell_type='together'; "
+                    "use data.cell_type=false (global preprocessing then spatial split) or "
+                    "data.cell_type='separate' (deferred per-region preprocessing)"
+                )
+            if self.source != "h5ad":
+                raise ValueError(
+                    "data.spatial_region_split is only supported when data.source='h5ad'"
+                )
+        if self.spatial_region_split_eps is not None and float(self.spatial_region_split_eps) <= 0:
+            raise ValueError("data.spatial_region_split_eps must be > 0 when provided")
+        if self.spatial_region_split_eps_mult <= 0:
+            raise ValueError("data.spatial_region_split_eps_mult must be > 0")
+        if self.spatial_region_split_min_samples < 1:
+            raise ValueError("data.spatial_region_split_min_samples must be >= 1")
+        if self.spatial_region_split_min_cells < 1:
+            raise ValueError("data.spatial_region_split_min_cells must be >= 1")
+        # --- end spatial_region_split validation ---
+
         if self.n_cells <= 0 or self.n_genes <= 0:
             raise ValueError("Synthetic data requires positive n_cells and n_genes")
         if self.source == "synthetic":
@@ -541,6 +588,9 @@ class TestConfig:
     block_radius: Optional[float] = None
     coordinate_um_per_unit: Optional[float] = None
     block_jitter: bool = True
+    save_permutation_null_comparison: bool = False
+    gaussian_pretrain_epochs: int = 0
+    gaussian_pretrain_freeze_encoder: bool = False
 
     def validate(self) -> "TestConfig":
         if self.method not in SUPPORTED_PERMUTATION_METHODS:
@@ -626,6 +676,10 @@ class TestConfig:
                 raise ValueError("test.block_radius must be > 0")
         if self.block_radius is not None and float(self.block_radius) <= 0:
             raise ValueError("test.block_radius must be > 0 when provided")
+        if self.save_permutation_null_comparison and self.method != "block_permutation":
+            raise ValueError(
+                "test.save_permutation_null_comparison requires test.method='block_permutation'"
+            )
         if self.coordinate_um_per_unit is not None and float(self.coordinate_um_per_unit) <= 0:
             raise ValueError("test.coordinate_um_per_unit must be > 0 when provided")
 
@@ -679,6 +733,41 @@ class TestConfig:
 
         if self.covariate is not None:
             self.covariate.validate()
+
+        if int(self.gaussian_pretrain_epochs) < 0:
+            raise ValueError("test.gaussian_pretrain_epochs must be >= 0")
+        if self.gaussian_pretrain_epochs > 0:
+            if self.metric not in {"nll_poisson_mse", "poisson"}:
+                raise ValueError(
+                    "test.gaussian_pretrain_epochs > 0 requires test.metric='nll_poisson_mse'"
+                )
+            if self.gaussian_pretrain_epochs >= self.epochs:
+                raise ValueError(
+                    "test.gaussian_pretrain_epochs must be strictly less than test.epochs "
+                    f"(got {self.gaussian_pretrain_epochs} >= {self.epochs})"
+                )
+            if self.sgd_batch_size is None or int(self.sgd_batch_size) <= 0:
+                raise ValueError(
+                    "test.gaussian_pretrain_epochs > 0 requires test.sgd_batch_size > 0 "
+                    "(minibatch SGD; optimizer and batch order must persist across the switch)"
+                )
+            if self.encoder == "midline":
+                raise ValueError(
+                    "test.gaussian_pretrain_epochs is incompatible with test.encoder='midline'"
+                )
+            if self.covariate is not None and self.covariate.type == MIDLINE_COVARIATE:
+                raise ValueError(
+                    "test.gaussian_pretrain_epochs is incompatible with test.covariate='midline'"
+                )
+            if self.gaussian_pretrain_freeze_encoder and self.sgd_cosine_lr_decay:
+                raise ValueError(
+                    "test.gaussian_pretrain_freeze_encoder=true is incompatible with "
+                    "test.sgd_cosine_lr_decay (optimizer is recreated at the Gaussian→Poisson switch)"
+                )
+        elif self.gaussian_pretrain_freeze_encoder:
+            raise ValueError(
+                "test.gaussian_pretrain_freeze_encoder requires test.gaussian_pretrain_epochs > 0"
+            )
         return self
 
 

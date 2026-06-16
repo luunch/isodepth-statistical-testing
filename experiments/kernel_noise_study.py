@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -217,7 +217,7 @@ def _build_run_config_for_condition(
     merged.setdefault("output", {})
     merged["output"]["out_dir"] = str(runs_dir_for_spec(spec))
     merged["output"]["run_name"] = condition.run_name
-    merged["data"] = _build_data_config(base_mapping, key=condition.dataset_key).to_dict()
+    merged["data"] = asdict(_build_data_config(base_mapping, key=condition.dataset_key))
     merged["test"] = copy.deepcopy(base_mapping["test"])
     merged["test"]["method"] = condition.test_method
     merged["test"]["seed"] = int(condition.dataset_key.data_seed)

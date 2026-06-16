@@ -166,14 +166,36 @@ def _extract_expression(
     return x
 
 
-def _detect_coordinate_um_per_unit(adata: ad.AnnData) -> Optional[float]:
-    """Try to detect microns-per-coordinate-unit from uns['spatial'] scalefactors.
+MOSTA_BIN50_UM_PER_UNIT = 25.0  # Stereo-seq bin50: 50 DNBs × 0.5 µm/DNB pitch
 
-    - Visium HD: reads ``scalefactors/microns_per_pixel`` directly.
-    - Classic Visium: derives from ``scalefactors/spot_diameter_fullres``
-      using the known physical spot diameter of 55 µm.
-    Returns ``None`` when no recognisable scalefactor entry is found.
+
+def _detect_coordinate_um_per_unit(
+    adata: ad.AnnData,
+    *,
+    h5ad_path: Optional[str] = None,
+) -> Optional[float]:
+    """Try to detect microns-per-coordinate-unit from file metadata.
+
+    Priority:
+    - ``uns['stereo_seq']['coordinate_um_per_unit']`` (or legacy ``uns['mosta']``)
+    - Visium ``uns['spatial']`` scalefactors
+    - MOSTA processed ``*.MOSTA.h5ad`` filenames (bin50 grid → 25 µm/unit)
+
+    Returns ``None`` when no recognisable scale entry is found.
     """
+    for meta_key in ("stereo_seq", "mosta"):
+        stereo_meta = adata.uns.get(meta_key)
+        if isinstance(stereo_meta, dict) and "coordinate_um_per_unit" in stereo_meta:
+            try:
+                val = float(stereo_meta["coordinate_um_per_unit"])
+                if val > 0:
+                    return val
+            except (TypeError, ValueError):
+                pass
+
+    if h5ad_path is not None and str(h5ad_path).endswith(".MOSTA.h5ad"):
+        return MOSTA_BIN50_UM_PER_UNIT
+
     sp = adata.uns.get("spatial") if "spatial" in adata.uns else None
     if not isinstance(sp, dict):
         return None
@@ -487,7 +509,7 @@ def load_h5ad_dataset(
     else:
         feature_names = [str(name) for name in raw_var_names[keep_mask]]
 
-    coordinate_um_per_unit = _detect_coordinate_um_per_unit(adata)
+    coordinate_um_per_unit = _detect_coordinate_um_per_unit(adata, h5ad_path=h5ad_path)
 
     meta = {
         "source": "h5ad",

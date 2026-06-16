@@ -26,16 +26,6 @@ set -euo pipefail
 CONFIG="${1:-${CONFIG:-configs/hippocampus_recursive.json}}"
 ENV_NAME="${ENV_NAME:-isodepth_env}"
 
-# Synthetic kernel-noise sweep (coordinate vs block permutation grid):
-#   sbatch --export=ALL,CONFIG=configs/experiments/kernel_noise_study.json run_config.sh
-# Runs ~360 GPU tests (90 cached datasets × coord + 3 block radii); allow several hours.
-if [[ "$(basename "${CONFIG}")" == "kernel_noise_study.json" ]]; then
-  echo "Running kernel-noise study sweep + analysis: ${CONFIG}"
-  python -m experiments.kernel_noise_study --spec "${CONFIG}"
-  python -m experiments.kernel_noise_study_analysis --spec "${CONFIG}"
-  exit 0
-fi
-
 default_repo_dir() {
   if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
     printf '%s\n' "${SLURM_SUBMIT_DIR}"
@@ -56,6 +46,16 @@ eval "$(mamba shell hook --shell bash)"
 mamba activate "${ENV_NAME}"
 
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib/python3.10/site-packages/nvidia/nvjitlink/lib:$CONDA_PREFIX/lib/python3.10/site-packages/nvidia/cusparse/lib:$CONDA_PREFIX/lib/python3.10/site-packages/nvidia/cublas/lib:$CONDA_PREFIX/lib/python3.10/site-packages/nvidia/cusolver/lib:$CONDA_PREFIX/lib/python3.10/site-packages/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH:-}"
+
+# Synthetic kernel-noise sweep (coordinate vs block permutation grid):
+#   sbatch --export=ALL,CONFIG=configs/experiments/kernel_noise_study.json run_config.sh
+# Runs ~360 GPU tests (90 cached datasets × coord + 3 block radii); allow several hours.
+if [[ "$(basename "${CONFIG}")" == "kernel_noise_study.json" ]]; then
+  echo "Running kernel-noise study sweep + analysis: ${CONFIG}"
+  python -m experiments.kernel_noise_study --spec "${CONFIG}"
+  python -m experiments.kernel_noise_study_analysis --spec "${CONFIG}"
+  exit 0
+fi
 
 args=(--config "${CONFIG}")
 

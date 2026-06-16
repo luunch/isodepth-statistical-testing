@@ -190,10 +190,12 @@ def save_kernel_noise_pvalue_comparison_plot(
                 if not subset:
                     continue
                 p_values = np.asarray([float(row["p_value"]) for row in subset], dtype=np.float64)
-                jitter = (np.random.default_rng(0).random(p_values.size) - 0.5) * 0.12
+                # Keep points centered on categorical ticks; tiny vertical jitter only
+                # so identical p-values remain readable.
+                jitter_y = (np.random.default_rng(0).random(p_values.size) - 0.5) * 0.012
                 ax.scatter(
-                    np.full(p_values.size, x_positions[x_idx]) + jitter,
-                    p_values,
+                    np.full(p_values.size, x_positions[x_idx]),
+                    p_values + jitter_y,
                     s=22,
                     alpha=0.85,
                     color=style["color"],
@@ -204,7 +206,8 @@ def save_kernel_noise_pvalue_comparison_plot(
                 )
 
             ax.axhline(alpha, color="0.35", ls="--", lw=1.0)
-            ax.set_xticks(x_positions, x_labels, fontsize=8)
+            ax.set_xticks(x_positions)
+            ax.set_xticklabels(x_labels, fontsize=8)
             ax.set_xlim(-0.5, len(x_labels) - 0.5)
             ax.set_ylim(-0.02, 1.02)
             if j == 0:
@@ -213,16 +216,26 @@ def save_kernel_noise_pvalue_comparison_plot(
                 ax.set_title(f"ρ={distance:g} µm", fontsize=10)
             ax.grid(axis="y", alpha=0.25)
 
-    handles, labels = axes[0, 0].get_legend_handles_labels()
-    if handles:
-        fig.legend(handles, labels, loc="upper center", ncol=min(4, len(labels)), fontsize=9, frameon=False)
     fig.suptitle(
         "Coordinate vs block permutation p-values on cached kernel-noise datasets "
         f"(α={alpha:g}, {len(spec.seeds)} seeds per cell)",
         fontsize=12,
-        y=1.02,
+        y=0.98,
     )
-    fig.tight_layout()
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    legend_rows = 1 if len(labels) <= 4 else 2
+    bottom_margin = 0.06 if legend_rows == 1 else 0.10
+    fig.tight_layout(rect=(0.0, bottom_margin, 1.0, 0.93))
+    if handles:
+        fig.legend(
+            handles,
+            labels,
+            loc="upper center",
+            bbox_to_anchor=(0.5, bottom_margin - 0.01),
+            ncol=min(4, len(labels)),
+            fontsize=9,
+            frameon=False,
+        )
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return out_path

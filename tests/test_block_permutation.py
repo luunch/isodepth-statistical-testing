@@ -212,6 +212,124 @@ class TestBlockPermutation(unittest.TestCase):
             self.assertIn("p_value", tr)
             self.assertIn("stat_perm", tr)
             self.assertEqual(len(tr["stat_perm"]), 3)
+            self.assertIn("S_raw", tr)
+            self.assertIn("block_ids_true", tr)
+            self.assertIn("s_permuted_slot1_raw", tr)
+            self.assertIn("block_radius_units", tr)
+
+    def test_separate_block_permutation_saves_overlay_plots(self) -> None:
+        import tempfile
+
+        from data.schemas import DataConfig, DatasetBundle, OutputConfig, RunConfig
+        from experiments.configuration import save_standardized_outputs
+        from methods.permutation import run_block_permutation_method
+
+        rng = np.random.default_rng(11)
+        n_cells, n_genes, n_types = 60, 6, 2
+        S_raw = rng.uniform(0, 300, size=(n_cells, 2)).astype(np.float32)
+        mean_s = S_raw.mean(axis=0)
+        std_s = np.maximum(S_raw.std(axis=0), 1e-8)
+        S = ((S_raw - mean_s) / std_s).astype(np.float32)
+        A = rng.standard_normal((n_cells, n_genes)).astype(np.float32)
+        labels = (np.arange(n_cells) % n_types).astype(np.int64)
+        dataset = DatasetBundle(
+            S=S,
+            A=A,
+            meta={
+                "cell_type_mode": "separate",
+                "cell_type_labels": labels,
+                "cell_type_names": [f"type{i}" for i in range(n_types)],
+                "n_cell_types": n_types,
+                "coordinate_standardization": "zscore",
+                "coord_mean": mean_s.astype(np.float32),
+                "coord_std": std_s.astype(np.float32),
+                "var_names": [f"gene{i}" for i in range(n_genes)],
+            },
+        ).validate()
+        config = TestConfig(
+            method="block_permutation",
+            n_perms=2,
+            epochs=2,
+            n_reruns=1,
+            sgd_batch_size=16,
+            block_radius=80.0,
+            coordinate_um_per_unit=1.0,
+            block_jitter=False,
+            save_permutation_null_comparison=True,
+            seed=11,
+            device="cpu",
+            verbose=False,
+        ).validate()
+        result = run_block_permutation_method(dataset, config)
+        with tempfile.TemporaryDirectory() as tmp:
+            run_config = RunConfig(
+                data=DataConfig(source="synthetic", n_cells=n_cells, n_genes=n_genes),
+                test=config,
+                output=OutputConfig(out_dir=tmp, run_name="blk_sep"),
+            )
+            save_standardized_outputs(dataset, result, run_config)
+            run_dir = Path(tmp) / "blk_sep"
+            self.assertTrue((run_dir / "blk_sep_block_permutation_overlay.png").exists())
+            self.assertTrue((run_dir / "blk_sep_permutation_null_comparison.png").exists())
+            for type_name in result.artifacts["per_type_results"]:
+                safe = type_name.replace(" ", "_").replace("/", "_")
+                self.assertTrue(
+                    (run_dir / safe / f"{safe}_block_permutation_overlay.png").exists()
+                )
+                self.assertTrue(
+                    (run_dir / safe / f"{safe}_permutation_null_comparison.png").exists()
+                )
+
+    def test_save_permutation_null_comparison_disabled_by_default(self) -> None:
+        import tempfile
+
+        from data.schemas import DataConfig, DatasetBundle, OutputConfig, RunConfig
+        from experiments.configuration import save_standardized_outputs
+        from methods.permutation import run_block_permutation_method
+
+        rng = np.random.default_rng(12)
+        n_cells, n_genes = 40, 5
+        S = rng.uniform(0, 100, size=(n_cells, 2)).astype(np.float32)
+        A = rng.standard_normal((n_cells, n_genes)).astype(np.float32)
+        dataset = DatasetBundle(S=S, A=A, meta={"var_names": [f"g{i}" for i in range(n_genes)]}).validate()
+        config = TestConfig(
+            method="block_permutation",
+            n_perms=2,
+            epochs=2,
+            n_reruns=1,
+            sgd_batch_size=16,
+            block_radius=50.0,
+            coordinate_um_per_unit=1.0,
+            block_jitter=False,
+            seed=12,
+            device="cpu",
+            verbose=False,
+        ).validate()
+        self.assertFalse(config.save_permutation_null_comparison)
+        result = run_block_permutation_method(dataset, config)
+        with tempfile.TemporaryDirectory() as tmp:
+            run_config = RunConfig(
+                data=DataConfig(source="synthetic", n_cells=n_cells, n_genes=n_genes),
+                test=config,
+                output=OutputConfig(out_dir=tmp, run_name="blk_off"),
+            )
+            save_standardized_outputs(dataset, result, run_config)
+            run_dir = Path(tmp) / "blk_off"
+            self.assertFalse((run_dir / "blk_off_permutation_null_comparison.png").exists())
+
+    def test_global_coordinate_permute_slot_matches_batch(self) -> None:
+        import torch
+
+        from methods.permutation import _build_permuted_coordinate_batch, global_coordinate_permute_slot
+
+        rng = np.random.default_rng(7)
+        S = rng.uniform(0, 100, size=(40, 2)).astype(np.float32)
+        seed = 123
+        batch, _ = _build_permuted_coordinate_batch(
+            S, n_perms=3, seed=seed, device=torch.device("cpu")
+        )
+        slot1 = global_coordinate_permute_slot(S, seed=seed, slot=1)
+        np.testing.assert_allclose(slot1, np.asarray(batch[1], dtype=np.float32))
 
 
 if __name__ == "__main__":
