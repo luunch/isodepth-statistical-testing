@@ -122,6 +122,68 @@ class ParallelIsoDepthNet(nn.Module):
         return self.decoder(self.encoder(x))
 
 
+def _zscore_covariate_buffer(values: np.ndarray) -> torch.Tensor:
+    arr = np.asarray(values, dtype=np.float32).reshape(-1)
+    mu = float(arr.mean())
+    sigma = float(arr.std())
+    if sigma < 1e-8:
+        z = np.zeros_like(arr, dtype=np.float32)
+    else:
+        z = ((arr - mu) / sigma).astype(np.float32)
+    return torch.tensor(z.reshape(-1, 1), dtype=torch.float32)
+
+
+class ParallelIsoDepthWithFixedCovariateNet(nn.Module):
+    """Spatial encoder plus a fixed per-cell covariate concatenated before the decoder.
+
+    Coordinates may be permuted across parallel slots; the covariate stays fixed per cell.
+    Implements h(d(x, y), n(x, y)) for loss-difference covariate whitening.
+    """
+
+    def __init__(
+        self,
+        M: int,
+        G: int,
+        covariate_values: np.ndarray,
+        *,
+        latent_dim: int = 1,
+        decoder_type: str = "nn",
+    ):
+        super().__init__()
+        self.M = int(M)
+        self.spatial_latent_dim = int(latent_dim)
+        self.latent_dim = self.spatial_latent_dim
+        self.decoder_type = str(decoder_type)
+        self.decoder_input_dim = self.spatial_latent_dim + 1
+        self.encoder = nn.Sequential(
+            ParallelLinear(M, 2, 20),
+            nn.ReLU(),
+            ParallelLinear(M, 20, 20),
+            nn.ReLU(),
+            ParallelLinear(M, 20, self.spatial_latent_dim),
+        )
+        self.register_buffer("covariate_values", _zscore_covariate_buffer(covariate_values))
+        self.decoder = _build_parallel_decoder(
+            M,
+            self.decoder_input_dim,
+            G,
+            decoder_type=self.decoder_type,
+        )
+
+    def _concat_covariate(self, spatial: torch.Tensor, cell_indices: torch.Tensor | None = None) -> torch.Tensor:
+        batch_rows = int(spatial.shape[0])
+        cov_rows = self.covariate_values[cell_indices] if cell_indices is not None else self.covariate_values
+        cov = cov_rows.unsqueeze(0).expand(batch_rows, -1, -1)
+        return torch.cat([spatial, cov], dim=-1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.decoder(self._concat_covariate(self.encoder(x)))
+
+    def forward_with_cell_indices(self, x: torch.Tensor, cell_indices: torch.Tensor) -> torch.Tensor:
+        """Forward for SGD mini-batches; selects covariate rows by cell_indices."""
+        return self.decoder(self._concat_covariate(self.encoder(x), cell_indices))
+
+
 class MidlineLatent(nn.Module):
     """Fixed 1D depth per layout: c = median(x), d(x, y) = |x - c|, z-scored across cells.
 
@@ -359,6 +421,126 @@ class ParallelCellTypeIsoDepthNet(nn.Module):
         output = torch.zeros(M, N, self.G, device=x.device, dtype=x.dtype)
         for c in range(self.n_cell_types):
             mask = cell_type_indices == c  # (N,) bool, stays on device
+            if mask.any():
+                output[:, mask, :] = self.decoders[c](latent[:, mask, :])
+        return output
+
+
+class ParallelCellTypeIsoDepthWithFixedCovariateNet(nn.Module):
+    """Shared spatial encoder + fixed covariate + per-cell-type decoders (parallel batch)."""
+
+    def __init__(
+        self,
+        M: int,
+        n_cell_types: int,
+        G: int,
+        covariate_values: np.ndarray,
+        *,
+        latent_dim: int = 1,
+        decoder_type: str = "nn",
+        encoder_type: str = "mlp",
+    ):
+        super().__init__()
+        self.M = int(M)
+        self.n_cell_types = int(n_cell_types)
+        self.spatial_latent_dim = int(latent_dim)
+        self.latent_dim = self.spatial_latent_dim
+        self.decoder_type = str(decoder_type)
+        self.encoder_type = str(encoder_type)
+        self.G = int(G)
+        self.decoder_input_dim = self.spatial_latent_dim + 1
+        if encoder_type == "midline":
+            if self.spatial_latent_dim != 1:
+                raise ValueError("encoder_type='midline' requires latent_dim=1")
+            self.encoder = ParallelParameterizedMidlineEncoder(self.M)
+        else:
+            self.encoder = nn.Sequential(
+                ParallelLinear(M, 2, 20),
+                nn.ReLU(),
+                ParallelLinear(M, 20, 20),
+                nn.ReLU(),
+                ParallelLinear(M, 20, self.spatial_latent_dim),
+            )
+        self.register_buffer("covariate_values", _zscore_covariate_buffer(covariate_values))
+        self.decoders = nn.ModuleList([
+            _build_parallel_decoder(
+                M,
+                self.decoder_input_dim,
+                G,
+                decoder_type=self.decoder_type,
+            )
+            for _ in range(self.n_cell_types)
+        ])
+        self._sort_idx: torch.Tensor | None = None
+        self._unsort_idx: torch.Tensor | None = None
+        self._type_offsets: list[tuple[int, int]] | None = None
+        self._cached_cell_type_indices: torch.Tensor | None = None
+
+    def _concat_covariate(self, spatial: torch.Tensor, cell_indices: torch.Tensor | None = None) -> torch.Tensor:
+        batch_rows = int(spatial.shape[0])
+        cov_rows = self.covariate_values[cell_indices] if cell_indices is not None else self.covariate_values
+        cov = cov_rows.unsqueeze(0).expand(batch_rows, -1, -1)
+        return torch.cat([spatial, cov], dim=-1)
+
+    def _build_routing_cache(self, cell_type_indices: torch.Tensor) -> None:
+        ct_np = cell_type_indices.detach().cpu().numpy()
+        sort_idx = np.argsort(ct_np, kind="stable")
+        unsort_idx = np.empty_like(sort_idx)
+        unsort_idx[sort_idx] = np.arange(len(sort_idx))
+
+        offsets: list[tuple[int, int]] = []
+        pos = 0
+        sorted_ct = ct_np[sort_idx]
+        for c in range(self.n_cell_types):
+            count = int(np.sum(sorted_ct == c))
+            offsets.append((pos, pos + count))
+            pos += count
+
+        device = cell_type_indices.device
+        self._sort_idx = torch.from_numpy(sort_idx).long().to(device)
+        self._unsort_idx = torch.from_numpy(unsort_idx).long().to(device)
+        self._type_offsets = offsets
+        self._cached_cell_type_indices = cell_type_indices.detach().clone()
+
+    def _routing_cache_matches(self, cell_type_indices: torch.Tensor, device: torch.device) -> bool:
+        if (
+            self._sort_idx is None
+            or self._unsort_idx is None
+            or self._type_offsets is None
+            or self._cached_cell_type_indices is None
+            or self._sort_idx.device != device
+            or self._cached_cell_type_indices.device != device
+            or self._cached_cell_type_indices.shape != cell_type_indices.shape
+        ):
+            return False
+        return bool(torch.equal(self._cached_cell_type_indices, cell_type_indices))
+
+    def _ensure_routing_cache(self, cell_type_indices: torch.Tensor, device: torch.device) -> None:
+        if not self._routing_cache_matches(cell_type_indices, device):
+            self._build_routing_cache(cell_type_indices)
+
+    def forward(self, x: torch.Tensor, cell_type_indices: torch.Tensor) -> torch.Tensor:
+        self._ensure_routing_cache(cell_type_indices, x.device)
+        latent = self._concat_covariate(self.encoder(x))
+        sorted_latent = latent[:, self._sort_idx, :]
+        sorted_output = torch.empty(x.shape[0], x.shape[1], self.G, device=x.device, dtype=x.dtype)
+        for c, (start, end) in enumerate(self._type_offsets):
+            if start == end:
+                continue
+            sorted_output[:, start:end, :] = self.decoders[c](sorted_latent[:, start:end, :])
+        return sorted_output[:, self._unsort_idx, :]
+
+    def forward_masked(
+        self,
+        x: torch.Tensor,
+        cell_type_indices: torch.Tensor,
+        cell_indices: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Mini-batch forward; pass cell_indices when batch is a subset of all cells."""
+        latent = self._concat_covariate(self.encoder(x), cell_indices)
+        output = torch.zeros(x.shape[0], x.shape[1], self.G, device=x.device, dtype=x.dtype)
+        for c in range(self.n_cell_types):
+            mask = cell_type_indices == c
             if mask.any():
                 output[:, mask, :] = self.decoders[c](latent[:, mask, :])
         return output

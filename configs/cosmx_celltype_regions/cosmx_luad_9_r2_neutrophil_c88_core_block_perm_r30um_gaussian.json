@@ -1,0 +1,46 @@
+{
+  "data": {
+    "source": "h5ad",
+    "h5ad": "data/h5ad/cosmx_human_nsclc_annotated.h5ad",
+    "obs_indices": "data/h5ad/cosmx_celltype_regions/luad_9_r2/cosmx_luad_9_r2_neutrophil_c88_core.indices.npy",
+    "spatial_key": "spatial",
+    "obs_x_col": null,
+    "obs_y_col": null,
+    "layer": "counts",
+    "use_raw": false,
+    "cell_type_key": "cell_type",
+    "cell_type": false,
+    "min_cells_per_gene": 1,
+    "normalize_total": true,
+    "standardize_expression": true,
+    "standardize_coordinates": true,
+    "log1p": true,
+    "max_cells": null,
+    "seed": 42
+  },
+  "test": {
+    "method": "block_permutation",
+    "metric": "nll_gaussian_mse",
+    "covariate": null,
+    "block_radius": 30,
+    "coordinate_um_per_unit": 0.12028,
+    "block_jitter": true,
+    "n_perms": 99,
+    "epochs": 500,
+    "n_reruns": 10,
+    "sgd_batch_size": 128,
+    "lr": 0.001,
+    "seed": 42,
+    "device": "cuda",
+    "decoder": "nn",
+    "batch_size": null,
+    "verbose": true,
+    "block_shape": "hexagon"
+  },
+  "output": {
+    "out_dir": "results/cosmx_celltype_regions",
+    "run_name": "cosmx_luad_9_r2_neutrophil_c88_core_block_perm_r30um_gaussian",
+    "save_preds": false,
+    "save_perm_stats": true
+  }
+}

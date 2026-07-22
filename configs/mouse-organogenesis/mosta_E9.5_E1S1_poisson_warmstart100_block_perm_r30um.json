@@ -1,0 +1,51 @@
+{
+  "data": {
+    "source": "h5ad",
+    "h5ad": "data/h5ad/mouse-organogenesis/E9.5_E1S1.MOSTA.h5ad",
+    "spatial_key": "spatial",
+    "obs_x_col": null,
+    "obs_y_col": null,
+    "layer": "count",
+    "use_raw": false,
+    "obs_drop_na": [
+      "annotation"
+    ],
+    "cell_type_key": "annotation",
+    "cell_type": "separate",
+    "top_var_genes": 1000,
+    "min_cells_per_gene": 3,
+    "min_cells_per_celltype": 10,
+    "max_cells": null,
+    "seed": 42,
+    "normalize_total": false,
+    "standardize_expression": false,
+    "standardize_coordinates": true,
+    "log1p": false
+  },
+  "test": {
+    "method": "block_permutation",
+    "metric": "nll_poisson_mse",
+    "covariate": null,
+    "block_radius": 30,
+    "coordinate_um_per_unit": 25.0,
+    "block_jitter": true,
+    "n_perms": 99,
+    "epochs": 500,
+    "gaussian_pretrain_epochs": 100,
+    "gaussian_pretrain_freeze_encoder": false,
+    "n_reruns": 10,
+    "sgd_batch_size": 128,
+    "lr": 0.001,
+    "seed": 42,
+    "device": "cuda",
+    "decoder": "nn",
+    "verbose": true,
+    "block_shape": "hexagon"
+  },
+  "output": {
+    "out_dir": "results/mouse-organogenesis",
+    "run_name": "poisson_E9.5_E1S1_1000_genes_warmstart100_block_perm_r30um",
+    "save_preds": false,
+    "save_perm_stats": true
+  }
+}

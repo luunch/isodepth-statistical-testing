@@ -10,7 +10,7 @@
       "normalize_total": true,
       "log1p": true,
       "max_cells": null,
-      "top_var_genes": 3000,
+      "top_var_genes": 1000,
       "seed": 42
     },
     "test": {

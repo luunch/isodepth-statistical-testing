@@ -1,0 +1,38 @@
+{
+  "experiment_name": "hypothalamus_encoder_loss_grid",
+  "description": "MERFISH hypothalamus: same encoder×decoder-loss grid as DLPFC Layer 3 (500+500 epochs, SGD-128, 100 reruns). All cells together, no cell-type split.",
+  "plot_title": "Hypothalamus MERFISH — encoder source × decoder loss",
+  "data": {
+    "h5ad": "data/h5ad/merfish_hypothalamus_rctd.h5ad",
+    "spatial_key": "spatial",
+    "cell_type": false,
+    "obs_x_col": null,
+    "obs_y_col": null,
+    "layer": null,
+    "use_raw": false,
+    "seed": 42
+  },
+  "preprocessing": {
+    "min_cells_per_gene": 1,
+    "top_var_genes": 0,
+    "normalize_total": false,
+    "log1p": false,
+    "standardize_expression": false,
+    "standardize_coordinates": true
+  },
+  "schedule": {
+    "pretrain_epochs": 500,
+    "warm_gaussian_epochs": 100,
+    "decoder_epochs": 500,
+    "n_reruns": 100,
+    "sgd_batch_size": 128,
+    "lr": 0.001,
+    "decoder": "nn",
+    "seed": 42,
+    "device": "cuda"
+  },
+  "output": {
+    "out_dir": "results/hypothalamus",
+    "run_name": "hypothalamus_encoder_loss_grid"
+  }
+}

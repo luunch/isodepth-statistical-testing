@@ -1,0 +1,9 @@
+{
+  "experiment_name": "kernel_noise_joint_truncated_msr_square_uniform_study",
+  "base_config": "configs/synthetic/kernel_noise_joint_truncated_msr_square_uniform.json",
+  "output_root": "results/experiments/kernel_noise_joint_truncated_msr_square_uniform_study",
+  "alpha": 0.05,
+  "kernel_distances_um": [15],
+  "deltas": [0.1, 0.5, 1],
+  "seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8]
+}

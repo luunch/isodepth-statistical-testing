@@ -13,13 +13,18 @@ if str(REPO_ROOT) not in sys.path:
 
 from data.schemas import TestConfig
 from methods.block_permutation import (
+    assign_block_ids,
     block_centroid_permute,
     block_stats,
     block_ids_to_axial_qr,
+    block_ids_to_square_ij,
     build_block_permuted_coordinate_batch,
     hex_bin_ids,
     hex_center_coord,
     hex_polygons_for_block_ids,
+    square_bin_ids,
+    square_polygons_for_block_ids,
+    square_block_grid_line_segments,
 )
 
 
@@ -37,8 +42,27 @@ class TestBlockPermutation(unittest.TestCase):
             method="block_permutation",
             n_perms=5,
             block_radius=50.0,
+            block_shape="hexagon",
             coordinate_um_per_unit=1.0,
         )
+        self.assertIs(config.validate(), config)
+
+    def test_invalid_block_shape_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            TestConfig(
+                method="block_permutation",
+                n_perms=5,
+                block_radius=50.0,
+                block_shape="triangle",
+            ).validate()
+
+    def test_block_shape_defaults_to_hexagon(self) -> None:
+        config = TestConfig(
+            method="block_permutation",
+            n_perms=5,
+            block_radius=50.0,
+        )
+        self.assertEqual(config.block_shape, "hexagon")
         self.assertIs(config.validate(), config)
 
     def test_hex_bin_ids_are_deterministic(self) -> None:
@@ -54,6 +78,53 @@ class TestBlockPermutation(unittest.TestCase):
         ids_no_jitter = hex_bin_ids(coords, 50.0, (0.0, 0.0))
         ids_jitter = hex_bin_ids(coords, 50.0, (12.3, -7.8))
         self.assertFalse(np.array_equal(ids_no_jitter, ids_jitter))
+
+    def test_square_bin_ids_are_deterministic(self) -> None:
+        rng = np.random.default_rng(0)
+        coords = rng.uniform(0, 500, size=(200, 2)).astype(np.float64)
+        ids_a = square_bin_ids(coords, 50.0, (0.0, 0.0))
+        ids_b = square_bin_ids(coords, 50.0, (0.0, 0.0))
+        np.testing.assert_array_equal(ids_a, ids_b)
+
+    def test_square_and_hex_assignments_differ(self) -> None:
+        rng = np.random.default_rng(9)
+        coords = rng.uniform(0, 500, size=(200, 2)).astype(np.float64)
+        hex_ids = assign_block_ids(coords, 50.0, block_shape="hexagon")
+        square_ids = assign_block_ids(coords, 50.0, block_shape="square")
+        self.assertFalse(np.array_equal(hex_ids, square_ids))
+
+    def test_square_mesh_polygons_match_bin_centers(self) -> None:
+        radius = 50.0
+        side = 2.0 * radius
+        ix_vals = np.array([0, 1, 2], dtype=np.int64)
+        iy_vals = np.array([0, 1, -1], dtype=np.int64)
+        ix, iy = np.meshgrid(ix_vals, iy_vals, indexing="ij")
+        ix = ix.ravel()
+        iy = iy.ravel()
+        cx = (ix.astype(np.float64) + 0.5) * side
+        cy = (iy.astype(np.float64) + 0.5) * side
+        centers = np.column_stack([cx, cy])
+        block_ids = square_bin_ids(centers, radius, (0.0, 0.0))
+        polys = square_polygons_for_block_ids(block_ids, radius)
+        self.assertEqual(len(polys), len(np.unique(block_ids)))
+        ix_dec, iy_dec = block_ids_to_square_ij(block_ids)
+        np.testing.assert_array_equal(ix_dec, ix)
+        np.testing.assert_array_equal(iy_dec, iy)
+
+    def test_square_block_grid_lines_tile_unit_square(self) -> None:
+        radius = 30.0 / 960.0
+        side = 2.0 * radius
+        lines = square_block_grid_line_segments(
+            radius,
+            x_min=0.0,
+            x_max=1.0,
+            y_min=0.0,
+            y_max=1.0,
+        )
+        self.assertEqual(len(lines), 34)
+        xs = sorted({float(seg[0, 0]) for seg in lines if seg[0, 0] == seg[1, 0]})
+        expected_xs = [k * side for k in range(17)]
+        np.testing.assert_allclose(xs, expected_xs, rtol=0.0, atol=1e-12)
 
     def test_centroid_permute_preserves_intra_block_offsets(self) -> None:
         rng = np.random.default_rng(2)

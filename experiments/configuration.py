@@ -15,6 +15,7 @@ from analysis.cosmx_region_context import (
 from analysis.plots import (
     save_block_permutation_overlay,
     save_celltype_dataset_plot,
+    save_celltype_or_spatial_split_plot,
     save_combined_celltype_residual_ratio_outputs,
     save_combined_celltype_isodepth_grid,
     save_combined_celltype_metric_distribution,
@@ -25,14 +26,29 @@ from analysis.plots import (
     save_gene_expression_vs_isodepth_plot,
     save_isodepth_triptych,
     save_metric_distribution_plot,
+    save_moran_distribution_plot,
+    save_msr_surrogate_example_plot,
+    save_obs_numeric_filter_diagnostic_plot,
+    save_obs_numeric_filter_histogram,
     save_permutation_null_comparison,
     save_perturbation_delta_pvalue_plot,
     save_synthetic_kernel_plot,
     save_synthetic_true_curve_plot,
     save_subset_fraction_pvalue_plot,
     save_true_rerun_isodepth_grid,
+    save_freedman_lane_covariate_plot,
+    save_covariate_whitening_spatial_plot,
+    save_single_type_covariate_plot,
+    save_fourier_surrogate_example_plot,
 )
-from data.schemas import DatasetBundle, RunConfig, TestResult, run_config_from_mapping
+from data.schemas import (
+    DatasetBundle,
+    MSR_METHODS,
+    RunConfig,
+    TestResult,
+    TOTAL_COUNTS_COVARIATE,
+    run_config_from_mapping,
+)
 from data import raw_coordinates_from_standardized
 from data.transforms import celltype_expression_residuals
 from methods.metrics import summarize_metric_distribution
@@ -124,6 +140,182 @@ def build_run_config(config_path: str | None, cli_overrides: Mapping[str, Any]) 
     return run_config_from_mapping(merged)
 
 
+def _obs_numeric_filter_mask(obs, obs_numeric_filters: Mapping[str, Any]) -> tuple[np.ndarray, str, dict]:
+    import pandas as pd
+
+    allowed_ops = {"gt", "ge", "gte", "lt", "le", "lte", "eq", "ne"}
+    mask = np.ones(obs.shape[0], dtype=bool)
+    first_key: str | None = None
+    first_spec: dict | None = None
+
+    for col, spec_raw in obs_numeric_filters.items():
+        spec = dict(spec_raw)
+        unknown_ops = set(spec.keys()) - allowed_ops
+        if unknown_ops:
+            raise ValueError(
+                f"obs_numeric_filters['{col}'] has unsupported operators "
+                f"{sorted(unknown_ops)}; allowed: {sorted(allowed_ops)}"
+            )
+        if col not in obs.columns:
+            raise ValueError(
+                f"obs_numeric_filters key '{col}' not in adata.obs; "
+                f"available: {list(obs.columns)}"
+            )
+        if first_key is None:
+            first_key = str(col)
+            first_spec = spec
+        values = pd.to_numeric(obs[col], errors="coerce").to_numpy(dtype=np.float64)
+        col_mask = np.isfinite(values)
+        for op, threshold_raw in spec.items():
+            threshold = float(threshold_raw)
+            if op == "gt":
+                col_mask &= values > threshold
+            elif op in {"ge", "gte"}:
+                col_mask &= values >= threshold
+            elif op == "lt":
+                col_mask &= values < threshold
+            elif op in {"le", "lte"}:
+                col_mask &= values <= threshold
+            elif op == "eq":
+                col_mask &= values == threshold
+            elif op == "ne":
+                col_mask &= values != threshold
+        mask &= col_mask
+
+    if first_key is None or first_spec is None:
+        raise ValueError("obs_numeric_filters must be non-empty")
+    return mask, first_key, first_spec
+
+
+def _load_obs_numeric_filter_context(run_config: RunConfig) -> dict[str, Any] | None:
+    if run_config.data.source != "h5ad" or not run_config.data.obs_numeric_filters:
+        return None
+
+    import anndata as ad
+    import pandas as pd
+
+    from data.h5ad_loader import _apply_obs_subset, _extract_coordinates
+
+    adata = ad.read_h5ad(run_config.data.h5ad, backed="r")
+    pre_threshold = _apply_obs_subset(
+        adata,
+        obs_filters=run_config.data.obs_filters,
+        obs_indices=run_config.data.obs_indices,
+        obs_drop_na=run_config.data.obs_drop_na,
+        obs_numeric_filters=None,
+    )
+
+    keep_mask, obs_key, filter_spec = _obs_numeric_filter_mask(
+        pre_threshold.obs,
+        run_config.data.obs_numeric_filters,
+    )
+    values = pd.to_numeric(pre_threshold.obs[obs_key], errors="coerce").to_numpy(
+        dtype=np.float32
+    )
+    S = _extract_coordinates(
+        pre_threshold,
+        spatial_key=run_config.data.spatial_key,
+        obs_x_col=run_config.data.obs_x_col,
+        obs_y_col=run_config.data.obs_y_col,
+    )
+
+    labels = None
+    label_names = None
+    if run_config.data.cell_type_key in pre_threshold.obs.columns:
+        raw_labels = pre_threshold.obs[run_config.data.cell_type_key].values
+        label_names = sorted(set(str(v) for v in raw_labels))
+        label_to_idx = {name: i for i, name in enumerate(label_names)}
+        labels = np.asarray([label_to_idx[str(v)] for v in raw_labels], dtype=np.int64)
+
+    return {
+        "S": S,
+        "labels": labels,
+        "label_names": label_names,
+        "values": values,
+        "keep_mask": keep_mask,
+        "obs_key": obs_key,
+        "filter_spec": filter_spec,
+        "label_title": (
+            "CNV clone"
+            if run_config.data.cell_type_key == "calicost_clone_label"
+            else run_config.data.cell_type_key
+        ),
+    }
+
+
+def _save_obs_numeric_filter_diagnostics(
+    run_config: RunConfig,
+    out_dir: Path,
+    *,
+    cell_type_names: list[str] | None = None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Save spatial and histogram diagnostics for obs numeric filters."""
+    try:
+        ctx = _load_obs_numeric_filter_context(run_config)
+        if ctx is None:
+            return {}, {}
+
+        top_level_paths: dict[str, str] = {}
+        per_type_paths: dict[str, str] = {}
+
+        spatial_path = save_obs_numeric_filter_diagnostic_plot(
+            ctx["S"],
+            labels=ctx["labels"],
+            label_names=ctx["label_names"],
+            values=ctx["values"],
+            keep_mask=ctx["keep_mask"],
+            obs_key=ctx["obs_key"],
+            filter_spec=ctx["filter_spec"],
+            out_path=out_dir / f"{run_config.output.run_name}_obs_threshold.png",
+            label_title=ctx["label_title"],
+        )
+        if spatial_path is not None:
+            top_level_paths["obs_numeric_filter_diagnostic_plot"] = str(spatial_path)
+
+        if cell_type_names:
+            labels_arr = ctx["labels"]
+            label_names = ctx["label_names"] or []
+            if labels_arr is None:
+                return top_level_paths, per_type_paths
+            for type_name in cell_type_names:
+                if type_name not in label_names:
+                    continue
+                label_idx = label_names.index(type_name)
+                type_mask = labels_arr == label_idx
+                if not np.any(type_mask):
+                    continue
+                safe_name = type_name.replace(" ", "_").replace("/", "_")
+                type_dir = out_dir / safe_name
+                type_dir.mkdir(parents=True, exist_ok=True)
+                hist_path = save_obs_numeric_filter_histogram(
+                    ctx["values"][type_mask],
+                    ctx["keep_mask"][type_mask],
+                    ctx["obs_key"],
+                    ctx["filter_spec"],
+                    type_dir / f"{safe_name}_obs_threshold_histogram.png",
+                    subset_label=type_name,
+                )
+                if hist_path is not None:
+                    per_type_paths[type_name] = str(hist_path)
+        else:
+            hist_path = save_obs_numeric_filter_histogram(
+                ctx["values"],
+                ctx["keep_mask"],
+                ctx["obs_key"],
+                ctx["filter_spec"],
+                out_dir / f"{run_config.output.run_name}_obs_threshold_histogram.png",
+            )
+            if hist_path is not None:
+                top_level_paths["obs_numeric_filter_histogram_plot"] = str(hist_path)
+
+        return top_level_paths, per_type_paths
+    except Exception as exc:
+        import warnings
+
+        warnings.warn(f"Could not save obs numeric-filter diagnostic plots: {exc}")
+        return {}, {}
+
+
 def build_manifest_config_snapshot(
     spec_path: str | Path,
     base_config_paths: dict[str, str | Path],
@@ -154,6 +346,16 @@ def _compact_dataset_meta(meta: Mapping[str, Any]) -> dict[str, Any]:
     synthetic_true_curve = compact.pop("synthetic_true_curve", None)
     if synthetic_true_curve is not None:
         compact["has_synthetic_true_curve"] = True
+    spatial_split_diag = compact.pop("spatial_region_split_diag", None)
+    if spatial_split_diag is not None:
+        compact["has_spatial_region_split_diag"] = True
+        compact["spatial_region_split_algorithm"] = spatial_split_diag.get("algorithm")
+        compact["spatial_region_split_n_removed"] = int(
+            np.sum(np.asarray(spatial_split_diag.get("removed", []), dtype=bool))
+        )
+        compact["spatial_region_split_region_names"] = list(
+            spatial_split_diag.get("region_color_names") or []
+        )
     return compact
 
 
@@ -208,8 +410,9 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
             "min_cells_per_celltype",
             "obs_filters",
             "obs_indices",
-            "obs_drop_na",
-        }
+        "obs_drop_na",
+        "covariate_whitening",
+    }
     if data.get("mode") == "fourier":
         data_keys |= {"k_min", "k_max"}
     if data.get("source") == "synthetic":
@@ -219,6 +422,8 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
         data_keys.add("expression_distribution")
         if data.get("expression_distribution") == "poisson":
             data_keys.add("mean_count")
+        if data.get("kernel") is not None:
+            data_keys |= {"kernel", "delta", "scale"}
     if data.get("mode") == "noise":
         data_keys.add("side_length")
 
@@ -243,10 +448,16 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
         "max_gradients",
         "gaussian_pretrain_epochs",
         "gaussian_pretrain_freeze_encoder",
+        "moran",
+        "moran_neighbor_radius_um",
     }
     if method in {
         "parallel_permutation",
         "block_permutation",
+        "binning",
+        "joint_truncated_msr",
+        "joint_truncated_rank_msr",
+        "fourier_spectral_randomization",
         "cross_validation",
         "full_retraining",
         "comparison_perturbation_test",
@@ -262,6 +473,22 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
             "block_jitter",
             "save_permutation_null_comparison",
         }
+    if method == "binning":
+        test_keys |= {
+            "bin_shape",
+            "bin_spot_distance_um",
+            "coordinate_um_per_unit",
+            "block_jitter",
+        }
+    if method in MSR_METHODS:
+        test_keys |= {
+            "msr_truncate_um",
+            "msr_neighbor_radius_um",
+            "msr_calibration_um",
+            "coordinate_um_per_unit",
+        }
+        if method == "joint_truncated_rank_msr":
+            test_keys.add("msr_shared_rank")
     if method == "cross_validation":
         test_keys.add("n_folds")
     if method in {"comparison_perturbation_test", "perturbation_test"}:
@@ -296,6 +523,9 @@ def _method_artifact_keys(method_name: str) -> set[str]:
     if method_name in {
         "parallel_permutation",
         "block_permutation",
+        "binning",
+        "joint_truncated_msr",
+        "joint_truncated_rank_msr",
         "cross_validation",
         "full_retraining",
         "subsampling_test",
@@ -328,6 +558,31 @@ def _method_artifact_keys(method_name: str) -> set[str]:
             }
         if method_name == "block_permutation":
             extra.add("block_stats")
+        if method_name == "binning":
+            extra |= {
+                "binning_summary",
+                "binning_cell_counts",
+            }
+        if method_name in MSR_METHODS:
+            extra.add("msr_surrogate_example")
+        if method_name == "fourier_spectral_randomization":
+            extra.add("fourier_surrogate_example")
+        extra |= {
+            "moran_skipped",
+            "moran_skip_reason",
+            "moran_true_mean",
+            "moran_p_value",
+            "moran_rank",
+            "moran_neighbor_radius_um",
+            "moran_mean_per_slot",
+            "moran_null_mean_per_perm",
+        "moran_n_slots",
+        "moran_n_perms",
+        "freedman_lane_obs_key",
+        "freedman_lane_covariate_values",
+        "freedman_lane_latent",
+        "freedman_lane_pred",
+    }
         return shared | extra
     if method_name == "perturbation_test":
         return shared | {
@@ -374,6 +629,7 @@ def _save_single_type_outputs(
     dataset_meta: dict,
     type_dir: Path,
     *,
+    method_name: str = "parallel_permutation",
     metric: str = "nll_gaussian_mse",
     decoder_df: int | None = None,
 ) -> dict[str, str]:
@@ -385,10 +641,14 @@ def _save_single_type_outputs(
     subset_meta.pop("cell_type_names", None)
     subset_meta.pop("n_cell_types", None)
     subset_meta.pop("cell_type_mode", None)
+    if type_data.get("var_names") is not None:
+        subset_meta["var_names"] = list(type_data["var_names"])
+    if type_data.get("feature_space") is not None:
+        subset_meta["feature_space"] = type_data["feature_space"]
     subset_dataset = DatasetBundle(S=S_c, A=A_c, meta=subset_meta).validate()
 
     subset_result = TestResult(
-        method_name="parallel_permutation",
+        method_name=method_name,
         metric=metric,
         p_value=float(type_data["p_value"]),
         stat_true=float(type_data["stat_true"]),
@@ -419,6 +679,7 @@ def _save_single_type_outputs(
             "highest_perm_index": type_data.get("highest_perm_index", 0),
             "highest_rerun_index": type_data.get("highest_rerun_index", 0),
             "highest_train_loss": type_data.get("highest_train_loss", 0.0),
+            "msr_surrogate_example": type_data.get("msr_surrogate_example"),
         },
     ).validate()
 
@@ -429,8 +690,71 @@ def _save_single_type_outputs(
     if p is not None:
         paths["isodepth_triptych_plot"] = str(p)
 
+    if type_data.get("freedman_lane_pred") is not None:
+        fl_spatial = np.asarray(type_data.get("S_original", S_c), dtype=np.float32)
+        fl_subset_dataset = DatasetBundle(S=fl_spatial, A=A_c, meta=subset_meta).validate()
+        fl_subset_result = TestResult(
+            method_name=method_name,
+            metric=metric,
+            p_value=float(type_data["p_value"]),
+            stat_true=float(type_data["stat_true"]),
+            stat_perm=np.asarray(type_data["stat_perm"], dtype=np.float64),
+            runtime_sec=0.0,
+            n_cells=int(fl_spatial.shape[0]),
+            n_genes=int(A_c.shape[1]),
+            config={},
+            artifacts={
+                "freedman_lane_obs_key": type_data.get("freedman_lane_obs_key"),
+                "freedman_lane_covariate_values": type_data.get("freedman_lane_covariate_values"),
+                "freedman_lane_pred": type_data.get("freedman_lane_pred"),
+            },
+        ).validate()
+        p_fl = save_freedman_lane_covariate_plot(
+            fl_subset_dataset,
+            fl_subset_result,
+            type_dir / f"{type_name}_freedman_lane_covariate.png",
+        )
+        if p_fl is not None:
+            paths["freedman_lane_covariate_plot"] = str(p_fl)
+
     p_dist = save_metric_distribution_plot(subset_result, type_dir / f"{type_name}_metric_distribution.png")
     paths["metric_distribution_plot"] = str(p_dist)
+
+    if type_data.get("moran_true_mean") is not None and not type_data.get("moran_skipped"):
+        moran_result = TestResult(
+            method_name=method_name,
+            metric=metric,
+            p_value=float(type_data["p_value"]),
+            stat_true=float(type_data["stat_true"]),
+            stat_perm=np.asarray(type_data["stat_perm"], dtype=np.float64),
+            runtime_sec=0.0,
+            n_cells=int(S_c.shape[0]),
+            n_genes=int(A_c.shape[1]),
+            config={},
+            artifacts={
+                "moran_true_mean": type_data.get("moran_true_mean"),
+                "moran_null_mean_per_perm": type_data.get("moran_null_mean_per_perm"),
+                "moran_p_value": type_data.get("moran_p_value"),
+                "moran_rank": type_data.get("moran_rank"),
+                "moran_neighbor_radius_um": type_data.get("moran_neighbor_radius_um"),
+            },
+        ).validate()
+        p_moran = save_moran_distribution_plot(
+            moran_result,
+            type_dir / f"{type_name}_moran_distribution.png",
+        )
+        if p_moran is not None:
+            paths["moran_distribution_plot"] = str(p_moran)
+
+    if method_name in MSR_METHODS:
+        p_msr = save_msr_surrogate_example_plot(
+            subset_dataset,
+            subset_result,
+            type_dir / f"{type_name}_msr_surrogate_example.png",
+            n_genes=5,
+        )
+        if p_msr is not None:
+            paths["msr_surrogate_example_plot"] = str(p_msr)
 
     if type_data.get("per_fold_true_isodepth") is not None:
         fold_isodepths = np.asarray(type_data["per_fold_true_isodepth"], dtype=np.float32)
@@ -515,6 +839,16 @@ def _save_single_type_outputs(
         pred_cov = type_data.get("pred_true_covariate")
         if pred_cov is not None:
             npz_payload["pred_true_covariate"] = np.asarray(pred_cov, dtype=np.float32)
+        msr_surrogate = type_data.get("msr_surrogate_example")
+        if msr_surrogate is not None:
+            npz_payload["msr_surrogate_example"] = np.asarray(
+                msr_surrogate, dtype=np.float32
+            )
+        moran_i_slots = type_data.get("moran_i_per_gene_per_slot")
+        if moran_i_slots is not None:
+            npz_payload["moran_i_per_gene_per_slot"] = np.asarray(
+                moran_i_slots, dtype=np.float64
+            )
         np.savez(npz_path, **npz_payload)
         paths["isodepths_npz"] = str(npz_path)
 
@@ -660,6 +994,8 @@ def _resolve_covariate_label(run_config: RunConfig) -> str:
         return "Covariate"
     if cov.type == "midline":
         return "Midline"
+    if cov.type == TOTAL_COUNTS_COVARIATE:
+        return "Log total counts"
     if cov.is_obs_key and cov.type:
         return str(cov.type).capitalize()
     return "Covariate"
@@ -673,6 +1009,7 @@ def _save_block_permutation_overlay_artifact(
     *,
     run_name: str,
     radius_units: float | None,
+    block_shape: str = "hexagon",
 ) -> str | None:
     overlay_path = save_block_permutation_overlay(
         S_true_raw,
@@ -681,6 +1018,7 @@ def _save_block_permutation_overlay_artifact(
         out_path,
         run_name=run_name,
         radius_units=radius_units,
+        block_shape=block_shape,
     )
     return str(overlay_path) if overlay_path is not None else None
 
@@ -716,6 +1054,11 @@ def save_standardized_outputs(
     out_dir = out_root / run_config.output.run_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    if result.method_name == "binning":
+        binned_dataset = result.artifacts.get("binned_dataset")
+        if isinstance(binned_dataset, DatasetBundle):
+            dataset = binned_dataset
+
     if result.artifacts.get("cell_type_mode") == "separate":
         return _save_separate_celltype_outputs(dataset, result, run_config, out_dir)
 
@@ -748,12 +1091,13 @@ def save_standardized_outputs(
     if synthetic_true_curve_path is not None:
         artifact_paths["synthetic_true_curve_plot"] = str(synthetic_true_curve_path)
 
-    synthetic_kernel_path = save_synthetic_kernel_plot(
+    synthetic_kernel_paths = save_synthetic_kernel_plot(
         dataset,
         out_dir / f"{run_config.output.run_name}_kernel_diagnostics.png",
     )
-    if synthetic_kernel_path is not None:
-        artifact_paths["synthetic_kernel_plot"] = str(synthetic_kernel_path)
+    if synthetic_kernel_paths is not None:
+        for key, path in synthetic_kernel_paths.items():
+            artifact_paths[key] = str(path)
 
     isodepth_plot_path = save_isodepth_triptych(
         dataset,
@@ -763,11 +1107,33 @@ def save_standardized_outputs(
     if isodepth_plot_path is not None:
         artifact_paths["isodepth_triptych_plot"] = str(isodepth_plot_path)
 
+    freedman_lane_plot_path = save_freedman_lane_covariate_plot(
+        dataset,
+        result,
+        out_dir / f"{run_config.output.run_name}_freedman_lane_covariate.png",
+    )
+    if freedman_lane_plot_path is not None:
+        artifact_paths["freedman_lane_covariate_plot"] = str(freedman_lane_plot_path)
+
+    covariate_whitening_plot_path = save_covariate_whitening_spatial_plot(
+        dataset,
+        out_dir / f"{run_config.output.run_name}_covariate_whitening.png",
+    )
+    if covariate_whitening_plot_path is not None:
+        artifact_paths["covariate_whitening_plot"] = str(covariate_whitening_plot_path)
+
     distribution_plot_path = save_metric_distribution_plot(
         result,
         out_dir / f"{run_config.output.run_name}_metric_distribution.png",
     )
     artifact_paths["metric_distribution_plot"] = str(distribution_plot_path)
+
+    moran_plot_path = save_moran_distribution_plot(
+        result,
+        out_dir / f"{run_config.output.run_name}_moran_distribution.png",
+    )
+    if moran_plot_path is not None:
+        artifact_paths["moran_distribution_plot"] = str(moran_plot_path)
 
     if result.method_name == "block_permutation":
         S_true_raw = raw_coordinates_from_standardized(dataset.S, dataset.meta)
@@ -778,6 +1144,7 @@ def save_standardized_outputs(
             out_dir / f"{run_config.output.run_name}_block_permutation_overlay.png",
             run_name=run_config.output.run_name,
             radius_units=result.artifacts.get("block_radius_units"),
+            block_shape=run_config.test.block_shape,
         )
         if block_overlay_path is not None:
             artifact_paths["block_permutation_overlay_plot"] = block_overlay_path
@@ -792,6 +1159,24 @@ def save_standardized_outputs(
             )
             if null_comparison_path is not None:
                 artifact_paths["permutation_null_comparison_plot"] = null_comparison_path
+
+    if result.method_name in MSR_METHODS:
+        surr_plot_path = save_msr_surrogate_example_plot(
+            dataset,
+            result,
+            out_dir / f"{run_config.output.run_name}_msr_surrogate_example.png",
+        )
+        if surr_plot_path is not None:
+            artifact_paths["msr_surrogate_example_plot"] = str(surr_plot_path)
+
+    if result.method_name == "fourier_spectral_randomization":
+        fourier_surr_plot_path = save_fourier_surrogate_example_plot(
+            dataset,
+            result,
+            out_dir / f"{run_config.output.run_name}_fourier_surrogate_example.png",
+        )
+        if fourier_surr_plot_path is not None:
+            artifact_paths["fourier_surrogate_example_plot"] = str(fourier_surr_plot_path)
 
     if result.method_name == "cross_validation":
         fold_isodepths = result.artifacts.get("per_fold_true_isodepth")
@@ -837,12 +1222,15 @@ def save_standardized_outputs(
     if perturbation_delta_plot_path is not None:
         artifact_paths["delta_pvalue_plot"] = str(perturbation_delta_plot_path)
 
-    celltype_plot_path = save_celltype_dataset_plot(
+    celltype_plot_path = save_celltype_or_spatial_split_plot(
         dataset,
         out_dir / f"{run_config.output.run_name}_celltype.png",
     )
     if celltype_plot_path is not None:
         artifact_paths["celltype_dataset_plot"] = str(celltype_plot_path)
+
+    obs_diag_paths, _ = _save_obs_numeric_filter_diagnostics(run_config, out_dir)
+    artifact_paths.update(obs_diag_paths)
 
     model = result.artifacts.get("model")
     training_metadata = getattr(model, "training_metadata", None)
@@ -901,7 +1289,7 @@ def _save_separate_celltype_outputs(
     per_type_results: dict[str, dict] = result.artifacts["per_type_results"]
     cell_type_names: list[str] = result.artifacts["cell_type_names"]
 
-    celltype_overview_path = save_celltype_dataset_plot(
+    celltype_overview_path = save_celltype_or_spatial_split_plot(
         dataset,
         out_dir / f"{run_config.output.run_name}_celltype.png",
     )
@@ -911,6 +1299,17 @@ def _save_separate_celltype_outputs(
 
     _ct_decoder_df = _decoder_df_from_config(getattr(run_config.test, "decoder", None))
 
+    obs_diag_paths, obs_hist_by_type = _save_obs_numeric_filter_diagnostics(
+        run_config,
+        out_dir,
+        cell_type_names=cell_type_names,
+    )
+
+    cov_values_all = dataset.meta.get("covariate_whitening_values")
+    cov_obs_key = dataset.meta.get("covariate_whitening_obs_key")
+    full_labels = dataset.meta.get("cell_type_labels")
+    full_type_names = dataset.meta.get("cell_type_names")
+
     for type_name in cell_type_names:
         type_data = per_type_results[type_name]
         safe_name = type_name.replace(" ", "_").replace("/", "_")
@@ -918,6 +1317,7 @@ def _save_separate_celltype_outputs(
 
         type_artifact_paths = _save_single_type_outputs(
             safe_name, type_data, dataset.meta, type_dir,
+            method_name=result.method_name,
             metric=result.metric,
             decoder_df=_ct_decoder_df,
         )
@@ -929,6 +1329,7 @@ def _save_separate_celltype_outputs(
                 type_dir / f"{safe_name}_block_permutation_overlay.png",
                 run_name=safe_name,
                 radius_units=type_data.get("block_radius_units"),
+                block_shape=run_config.test.block_shape,
             )
             if overlay_path is not None:
                 type_artifact_paths["block_permutation_overlay_plot"] = overlay_path
@@ -943,6 +1344,25 @@ def _save_separate_celltype_outputs(
                 )
                 if null_comparison_path is not None:
                     type_artifact_paths["permutation_null_comparison_plot"] = null_comparison_path
+        if type_name in obs_hist_by_type:
+            type_artifact_paths["obs_numeric_filter_histogram_plot"] = obs_hist_by_type[
+                type_name
+            ]
+        if cov_values_all is not None and cov_obs_key and full_labels is not None and full_type_names:
+            if type_name in full_type_names:
+                type_idx = list(full_type_names).index(type_name)
+                type_mask = np.asarray(full_labels) == type_idx
+                cov_for_type = np.asarray(cov_values_all)[type_mask]
+                if cov_for_type.shape[0] == int(type_data["n_cells"]):
+                    cov_plot_path = save_single_type_covariate_plot(
+                        np.asarray(type_data["S"], dtype=np.float32),
+                        cov_for_type,
+                        type_dir / f"{safe_name}_covariate_whitening.png",
+                        covariate_label=cov_obs_key,
+                        type_name=type_name,
+                    )
+                    if cov_plot_path is not None:
+                        type_artifact_paths["covariate_whitening_plot"] = str(cov_plot_path)
         per_type_artifact_paths[type_name] = type_artifact_paths
         type_summary: dict[str, Any] = {
             "p_value": float(type_data["p_value"]),
@@ -998,10 +1418,35 @@ def _save_separate_celltype_outputs(
     }
     if celltype_overview_path is not None:
         top_level_artifacts["celltype_dataset_plot"] = str(celltype_overview_path)
+    top_level_artifacts.update(obs_diag_paths)
     if combined_residual_csv_path is not None:
         top_level_artifacts["piecewise_residual_ratio_rankings_csv"] = str(combined_residual_csv_path)
     if combined_residual_plot_path is not None:
         top_level_artifacts["piecewise_residual_ratio_distribution_plot"] = str(combined_residual_plot_path)
+
+    for key in (
+        "freedman_lane_obs_key",
+        "freedman_lane_covariate_values",
+        "freedman_lane_latent",
+        "freedman_lane_pred",
+    ):
+        if key in result.artifacts:
+            top_level_artifacts[key] = result.artifacts[key]
+
+    freedman_lane_plot_path = save_freedman_lane_covariate_plot(
+        dataset,
+        result,
+        out_dir / f"{run_config.output.run_name}_freedman_lane_covariate.png",
+    )
+    if freedman_lane_plot_path is not None:
+        top_level_artifacts["freedman_lane_covariate_plot"] = str(freedman_lane_plot_path)
+
+    covariate_whitening_plot_path = save_covariate_whitening_spatial_plot(
+        dataset,
+        out_dir / f"{run_config.output.run_name}_covariate_whitening.png",
+    )
+    if covariate_whitening_plot_path is not None:
+        top_level_artifacts["covariate_whitening_plot"] = str(covariate_whitening_plot_path)
 
     if result.method_name == "block_permutation":
         S_true_raw = raw_coordinates_from_standardized(dataset.S, dataset.meta)
@@ -1012,6 +1457,7 @@ def _save_separate_celltype_outputs(
             out_dir / f"{run_config.output.run_name}_block_permutation_overlay.png",
             run_name=run_config.output.run_name,
             radius_units=result.artifacts.get("block_radius_units"),
+            block_shape=run_config.test.block_shape,
         )
         if block_overlay_path is not None:
             top_level_artifacts["block_permutation_overlay_plot"] = block_overlay_path

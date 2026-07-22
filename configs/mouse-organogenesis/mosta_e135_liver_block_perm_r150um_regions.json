@@ -4,8 +4,12 @@
     "h5ad": "data/h5ad/mouse-organogenesis/E13.5_E1S1.MOSTA.h5ad",
     "spatial_key": "spatial",
     "layer": "count",
-    "obs_filters": {"annotation": "Liver"},
-    "obs_drop_na": ["annotation"],
+    "obs_filters": {
+      "annotation": "Liver"
+    },
+    "obs_drop_na": [
+      "annotation"
+    ],
     "spatial_region_split": 2,
     "top_var_genes": 1000,
     "min_cells_per_gene": 3,
@@ -32,7 +36,8 @@
     "seed": 42,
     "device": "cuda",
     "decoder": "nn",
-    "verbose": true
+    "verbose": true,
+    "block_shape": "hexagon"
   },
   "output": {
     "out_dir": "results/mouse-organogenesis",

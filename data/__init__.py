@@ -6,17 +6,24 @@ from typing import Optional
 
 import numpy as np
 
-from data.schemas import DataConfig, DatasetBundle
+from data.schemas import DataConfig, DatasetBundle, TOTAL_COUNTS_COVARIATE
 
 
 def load_h5ad_dataset_from_config(
     config: DataConfig,
     *,
     covariate_obs_key: Optional[str] = None,
+    compute_total_counts_covariate: bool = False,
+    covariate_whitening_obs_key: Optional[str] = None,
 ) -> DatasetBundle:
     from data.h5ad_loader import load_dataset_from_config as _impl
 
-    return _impl(config, covariate_obs_key=covariate_obs_key)
+    return _impl(
+        config,
+        covariate_obs_key=covariate_obs_key,
+        compute_total_counts_covariate=compute_total_counts_covariate,
+        covariate_whitening_obs_key=covariate_whitening_obs_key,
+    )
 
 
 def load_h5ad_dataset(**kwargs) -> DatasetBundle:
@@ -91,30 +98,64 @@ def load_dataset(config: DataConfig, *, covariate=None) -> DatasetBundle:
         Data configuration.
     covariate:
         Optional :class:`~data.schemas.CovariateConfig`.  When set and the covariate
-        is an obs-key type (not ``"midline"``), the corresponding ``adata.obs`` column
-        is extracted and stored in ``dataset.meta["covariate_values"]``.  Raises
-        ``ValueError`` if the key is absent from the h5ad file.
+        is an obs-key type, the corresponding ``adata.obs`` column is extracted and
+        stored in ``dataset.meta["covariate_values"]``.  When ``type='total_counts'``,
+        per-cell ``log1p`` row sums are computed from raw counts before normalization.
+        Raises ``ValueError`` if an obs key is absent from the h5ad file.
     """
     config.validate()
     covariate_obs_key: Optional[str] = None
-    if covariate is not None and getattr(covariate, "is_obs_key", False):
-        covariate_obs_key = covariate.type
+    compute_total_counts = False
+    if covariate is not None:
+        if getattr(covariate, "is_obs_key", False):
+            covariate_obs_key = covariate.type
+        elif covariate.type == TOTAL_COUNTS_COVARIATE:
+            compute_total_counts = True
+    whitening_obs_key: Optional[str] = None
+    if config.covariate_whitening is not None:
+        whitening_obs_key = config.covariate_whitening.obs_key
     if config.source == "h5ad":
-        dataset = load_h5ad_dataset_from_config(config, covariate_obs_key=covariate_obs_key)
+        dataset = load_h5ad_dataset_from_config(
+            config,
+            covariate_obs_key=covariate_obs_key,
+            compute_total_counts_covariate=compute_total_counts,
+            covariate_whitening_obs_key=whitening_obs_key,
+        )
     elif config.source == "synthetic":
         if covariate_obs_key is not None:
             raise ValueError(
                 f"test.covariate obs key '{covariate_obs_key}' is only supported with "
                 "data.source='h5ad'; synthetic data does not have an obs table."
             )
+        if whitening_obs_key is not None:
+            raise ValueError(
+                "data.covariate_whitening is only supported with data.source='h5ad'; "
+                "synthetic data does not have an obs table."
+            )
         dataset = generate_synthetic_dataset(config)
+        if compute_total_counts:
+            from data.transforms import total_counts_covariate_values
+
+            dataset.meta["covariate_values"] = total_counts_covariate_values(dataset.A)
+            dataset.meta["covariate_obs_key"] = TOTAL_COUNTS_COVARIATE
     else:
         raise ValueError(f"Unsupported data source '{config.source}'")
+    if config.covariate_whitening is not None:
+        dataset.meta["covariate_whitening"] = {
+            "method": config.covariate_whitening.method,
+            "obs_key": config.covariate_whitening.obs_key,
+        }
+    if getattr(config, "spatial_denoise_radius_um", None):
+        from data.spatial_regions import denoise_spatial_outliers
+        dataset = denoise_spatial_outliers(dataset, config)
     if getattr(config, "spatial_region_split", False):
         from data.spatial_regions import split_spatial_regions
         dataset = split_spatial_regions(dataset, config)
     if bool(getattr(config, "standardize_coordinates", True)):
         dataset = _standardize_coordinates_inplace(dataset)
+    if getattr(config, "spatial_crop", None):
+        from data.spatial_regions import apply_spatial_crop
+        dataset = apply_spatial_crop(dataset, config)
     return dataset
 
 

@@ -13,7 +13,7 @@
     "normalize_total": true,
     "log1p": true,
     "max_cells": null,
-    "seed": 42  
+    "seed": 42
   },
   "test": {
     "method": "block_permutation",
@@ -31,7 +31,8 @@
     "seed": 42,
     "device": "cuda",
     "decoder": "nn",
-    "verbose": true
+    "verbose": true,
+    "block_shape": "hexagon"
   },
   "output": {
     "out_dir": "results/hippocampus",

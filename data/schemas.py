@@ -25,7 +25,9 @@ SUPPORTED_SYNTHETIC_MODES = {
 
 SUPPORTED_SPATIAL_SHAPES = frozenset({"square", "semicircle", "circle", "triangle", "square_cutout"})
 
-SUPPORTED_SAMPLING_BIAS = frozenset({"uniform", "normal", "anisotropic_normal"})
+SUPPORTED_BLOCK_SHAPES = frozenset({"hexagon", "square"})
+
+SUPPORTED_SAMPLING_BIAS = frozenset({"uniform", "normal", "anisotropic_normal", "lattice"})
 
 SUPPORTED_EXPRESSION_DISTRIBUTIONS = frozenset({"gaussian", "poisson"})
 
@@ -42,6 +44,11 @@ class SamplingBiasConfig:
       with covariance ``diag(variance[0], variance[1])`` (per-axis variances `\sigma_x^2`,
       `\sigma_y^2`); ``variance`` must be a length-2 list/tuple of positive floats. Useful for
       midline-style densities (e.g. ``variance=[0.003, 0.05]`` produces a vertical strip).
+    - ``type='lattice'`` builds the full ``data.side_length`` × ``data.side_length`` square
+      lattice (honouring ``data.lattice_cell_centers``), then uniformly subsamples
+      ``data.n_cells`` lattice sites without replacement. Cells stay on the regular grid so
+      block-permutation meshes stay aligned; use this instead of ``uniform`` when you want
+      random sparsity without breaking block tiling.
 
     All Gaussian variants are rejection-sampled inside the spatial mask intersected with
     ``[0, 1]^2``.
@@ -126,7 +133,7 @@ def _sampling_bias_from_raw(raw: Any) -> Optional[SamplingBiasConfig]:
     )
 
 
-SUPPORTED_KERNEL_TYPES = frozenset({"exp"})
+SUPPORTED_KERNEL_TYPES = frozenset({"exp", "trunc", "smooth"})
 
 _KERNEL_ALLOWED_KEYS = frozenset({"type", "distance", "max_interaction_distance"})
 
@@ -135,22 +142,33 @@ _KERNEL_ALLOWED_KEYS = frozenset({"type", "distance", "max_interaction_distance"
 class KernelConfig:
     """Spatial autocorrelation kernel for synthetic datasets.
 
-    Adds a correlated noise component to expression with covariance
-    ``Σ = σ²(I + δ·K)`` where ``K_ij = exp(-d_ij / distance)`` and
-    ``d_ij`` is the Euclidean distance between cells i and j in microns.
+    Two generative modes:
+
+    - ``"exp"`` / ``"trunc"`` (with ``data.delta > 0``): correlated Gaussian noise
+      with covariance ``Σ = σ²(I + δ·K)`` where ``d_ij`` is Euclidean distance
+      between cells i and j in microns.
+    - ``"smooth"``: draw white noise ``Z`` and replace each cell with a
+      Gaussian-weighted local average over nearby cells
+      (``Z'_i ∝ Σ_j Z_j exp(-‖S_i-S_j‖² / (2 p²))``).  Does not use ``delta``.
 
     Parameters
     ----------
     type : str
-        Kernel type.  Currently only ``"exp"`` (exponential) is supported.
+        Kernel type.  ``"exp"``: ``K_ij = exp(-d_ij / distance)``.
+        ``"trunc"``: ``K_ij = 1`` for ``d_ij ≤ cutoff``, else ``0`` (flat compact
+        support).  ``"smooth"``: Gaussian bandwidth smoother of white noise;
+        ``distance`` is the bandwidth ``p`` (µm).  Cutoff is
+        ``max_interaction_distance`` when set, otherwise ``distance`` for
+        ``"trunc"`` and ``4 * distance`` for ``"exp"`` / ``"smooth"``.
     distance : float
-        Length-scale ``p`` in microns.  Controls how quickly spatial
-        correlation decays: correlation halves at ``d ≈ 0.69 * distance``.
+        Length-scale ``p`` in microns.  For ``"exp"``, correlation halves at
+        ``d ≈ 0.69 * distance``.  For ``"trunc"`` without
+        ``max_interaction_distance``, this is also the hard cutoff.  For
+        ``"smooth"``, this is the Gaussian bandwidth ``σ_bw``.
     max_interaction_distance : float or None
-        Hard cutoff beyond which ``K_ij`` is set to zero.  Defaults to
-        ``4 * distance`` (where ``K`` has decayed to < 2%), which bounds
-        memory usage via a KDTree neighbor query instead of a full N×N
-        distance matrix.
+        Hard cutoff beyond which kernel weights are treated as zero.  Defaults to
+        ``distance`` for ``"trunc"``, else ``4 * distance`` for ``"exp"`` /
+        ``"smooth"``.
     """
 
     type: str = "exp"
@@ -160,11 +178,11 @@ class KernelConfig:
     @property
     def effective_cutoff(self) -> float:
         """Upper distance (µm) beyond which kernel is treated as zero."""
-        return (
-            self.max_interaction_distance
-            if self.max_interaction_distance is not None
-            else 4.0 * self.distance
-        )
+        if self.max_interaction_distance is not None:
+            return float(self.max_interaction_distance)
+        if self.type == "trunc":
+            return float(self.distance)
+        return 4.0 * self.distance
 
     def validate(self) -> "KernelConfig":
         if self.type not in SUPPORTED_KERNEL_TYPES:
@@ -212,6 +230,10 @@ def _kernel_from_raw(raw: Any) -> Optional["KernelConfig"]:
 SUPPORTED_PERMUTATION_METHODS = {
     "parallel_permutation",
     "block_permutation",
+    "binning",
+    "fourier_spectral_randomization",
+    "joint_truncated_msr",
+    "joint_truncated_rank_msr",
     "cross_validation",
     "full_retraining",
     "comparison_perturbation_test",
@@ -223,8 +245,14 @@ SUPPORTED_PERMUTATION_METHODS = {
 SUPPORTED_EXISTENCE_METHODS = {
     "parallel_permutation",
     "block_permutation",
+    "binning",
+    "fourier_spectral_randomization",
+    "joint_truncated_msr",
+    "joint_truncated_rank_msr",
     "cross_validation",
 }
+
+MSR_METHODS = frozenset({"joint_truncated_msr", "joint_truncated_rank_msr"})
 
 
 @dataclass
@@ -291,6 +319,7 @@ class DataConfig:
     dependent_xy: bool = True
     poly_degree: int = 3
     side_length: Optional[int] = None
+    lattice_cell_centers: bool = False
     shape: str = "square"
     sampling_bias: Optional[SamplingBiasConfig] = None
     scale: Optional[float] = None
@@ -301,14 +330,25 @@ class DataConfig:
     cell_type_key: str = "cell_type"
     min_cells_per_celltype: int = 1
     obs_filters: Optional[dict] = None
+    obs_numeric_filters: Optional[dict] = None
     obs_indices: Optional[str] = None
     obs_drop_na: Optional[list[str]] = None
+    # Largest-connected-component outlier removal (applied before spatial_region_split and
+    # before coordinate z-scoring).  Per clone, spots not in the largest connected component
+    # within this radius are dropped.  Radius is in µm; requires coordinate_um_per_unit.
+    spatial_denoise_radius_um: Optional[float] = None
     # Union[bool, int]: False = off, True = DBSCAN auto-K, int >= 2 = K-Means with that K
     spatial_region_split: Union[bool, int] = False
     spatial_region_split_eps: Optional[float] = None   # DBSCAN only; auto-detected if None
     spatial_region_split_eps_mult: float = 3.0          # DBSCAN only; multiplier for auto-eps
     spatial_region_split_min_samples: int = 10          # DBSCAN only
     spatial_region_split_min_cells: int = 50            # drop sub-regions smaller than this
+    # Axis-aligned crop applied on already-standardized coordinates (post-zscore), e.g.
+    # {"x": {"gt": -3}} keeps only cells with standardized x > -3. Same operator syntax
+    # as obs_numeric_filters ("gt"/"ge"/"lt"/"le"/"eq"/"ne"). Applied after
+    # standardize_coordinates and after spatial_region_split.
+    spatial_crop: Optional[dict] = None
+    covariate_whitening: Optional[CovariateWhiteningConfig] = None
 
     def __post_init__(self) -> None:
         if self.sampling_bias is not None and not isinstance(self.sampling_bias, SamplingBiasConfig):
@@ -408,6 +448,31 @@ class DataConfig:
         if self.obs_filters is not None:
             if not isinstance(self.obs_filters, dict) or not self.obs_filters:
                 raise ValueError("data.obs_filters must be a non-empty dict when provided")
+        if self.obs_numeric_filters is not None:
+            if not isinstance(self.obs_numeric_filters, dict) or not self.obs_numeric_filters:
+                raise ValueError("data.obs_numeric_filters must be a non-empty dict when provided")
+            allowed_ops = {"gt", "ge", "gte", "lt", "le", "lte", "eq", "ne"}
+            for col, spec in self.obs_numeric_filters.items():
+                if not isinstance(col, str) or not col.strip():
+                    raise ValueError("data.obs_numeric_filters keys must be non-empty obs column names")
+                if not isinstance(spec, Mapping) or not spec:
+                    raise ValueError(
+                        "data.obs_numeric_filters values must be non-empty mappings "
+                        "such as {\"gt\": 0.8}"
+                    )
+                unknown_ops = set(spec.keys()) - allowed_ops
+                if unknown_ops:
+                    raise ValueError(
+                        f"data.obs_numeric_filters[{col!r}] has unsupported operators "
+                        f"{sorted(unknown_ops)}; allowed: {sorted(allowed_ops)}"
+                    )
+                for op, val in spec.items():
+                    try:
+                        float(val)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError(
+                            f"data.obs_numeric_filters[{col!r}][{op!r}] must be numeric"
+                        ) from exc
         if self.obs_indices is not None and not str(self.obs_indices).strip():
             raise ValueError("data.obs_indices must be a non-empty path when provided")
         if self.obs_filters and self.obs_indices:
@@ -458,6 +523,32 @@ class DataConfig:
             raise ValueError("data.spatial_region_split_min_cells must be >= 1")
         # --- end spatial_region_split validation ---
 
+        # --- spatial_crop validation ---
+        if self.spatial_crop is not None:
+            allowed_ops = {"gt", "ge", "gte", "lt", "le", "lte", "eq", "ne"}
+            if not isinstance(self.spatial_crop, dict) or not self.spatial_crop:
+                raise ValueError(
+                    "data.spatial_crop must be a non-empty mapping such as "
+                    '{"x": {"gt": -3}}'
+                )
+            for axis, ops in self.spatial_crop.items():
+                if axis not in ("x", "y"):
+                    raise ValueError(
+                        f"data.spatial_crop key must be 'x' or 'y'; got '{axis}'"
+                    )
+                if not isinstance(ops, dict) or not ops:
+                    raise ValueError(
+                        f"data.spatial_crop['{axis}'] must be a non-empty mapping "
+                        "such as {'gt': -3}"
+                    )
+                unknown_ops = set(ops.keys()) - allowed_ops
+                if unknown_ops:
+                    raise ValueError(
+                        f"data.spatial_crop['{axis}'] has unsupported operators "
+                        f"{sorted(unknown_ops)}; allowed: {sorted(allowed_ops)}"
+                    )
+        # --- end spatial_crop validation ---
+
         if self.n_cells <= 0 or self.n_genes <= 0:
             raise ValueError("Synthetic data requires positive n_cells and n_genes")
         if self.source == "synthetic":
@@ -470,7 +561,8 @@ class DataConfig:
                     raise ValueError("data.kernel and data.delta are only supported when data.source='synthetic'")
                 if self.scale is None:
                     raise ValueError(
-                        "data.scale (tissue width in microns) is required when data.kernel is set"
+                        "data.scale (tissue width in microns) is required when data.kernel is set "
+                        "or data.delta != 0"
                     )
                 if self.scale <= 0:
                     raise ValueError("data.scale must be > 0")
@@ -480,6 +572,12 @@ class DataConfig:
                     if not isinstance(self.kernel, KernelConfig):
                         self.kernel = _kernel_from_raw(self.kernel)
                     self.kernel = self.kernel.validate()
+                    if self.kernel.type == "smooth" and self.delta != 0.0:
+                        raise ValueError(
+                            "data.kernel.type='smooth' does not use data.delta; "
+                            "set data.delta=0 (got "
+                            f"{self.delta})"
+                        )
             if self.mode not in SUPPORTED_SYNTHETIC_MODES:
                 raise ValueError(
                     f"Unsupported synthetic data mode '{self.mode}'. Expected one of {sorted(SUPPORTED_SYNTHETIC_MODES)}"
@@ -518,21 +616,129 @@ class DataConfig:
                     raise ValueError(
                         "When data.side_length is set for noise mode, data.n_cells must be divisible by data.side_length"
                     )
+            if (
+                self.lattice_cell_centers
+                and self.sampling_bias is not None
+                and self.sampling_bias.type != "lattice"
+            ):
+                raise ValueError(
+                    "data.lattice_cell_centers requires a regular lattice; use "
+                    "data.sampling_bias.type='lattice' or omit data.sampling_bias"
+                )
+            if self.sampling_bias is not None and self.sampling_bias.type == "lattice":
+                if self.shape != "square":
+                    raise ValueError(
+                        "data.sampling_bias.type='lattice' requires data.shape='square'"
+                    )
+                if self.side_length is None:
+                    raise ValueError(
+                        "data.sampling_bias.type='lattice' requires data.side_length"
+                    )
+                lattice_capacity = int(self.side_length) ** 2
+                if self.n_cells > lattice_capacity:
+                    raise ValueError(
+                        f"data.n_cells={self.n_cells} exceeds the {lattice_capacity} sites "
+                        f"on a data.side_length={self.side_length} square lattice"
+                    )
+        if self.covariate_whitening is not None:
+            self.covariate_whitening.validate()
         return self
 
-
-SUPPORTED_COVARIATE_TYPES = frozenset({"midline"})
-
 MIDLINE_COVARIATE = "midline"
+TOTAL_COUNTS_COVARIATE = "total_counts"
+
+SUPPORTED_COVARIATE_WHITENING_METHODS = frozenset({"freedman-lane", "loss-difference"})
+COVARIATE_WHITENING_METHOD_ALIASES = {
+    "freeman-lane": "freedman-lane",
+    "freedman_lane": "freedman-lane",
+    "loss_difference": "loss-difference",
+    "nested-covariate": "loss-difference",
+}
+
+
+@dataclass
+class CovariateWhiteningConfig:
+    """Expression whitening applied before the statistical test."""
+
+    method: str
+    obs_key: str
+
+    def validate(self) -> "CovariateWhiteningConfig":
+        method = _normalize_covariate_whitening_method(self.method)
+        if method not in SUPPORTED_COVARIATE_WHITENING_METHODS:
+            raise ValueError(
+                f"Unsupported data.covariate_whitening method '{self.method}'. "
+                f"Expected one of {sorted(SUPPORTED_COVARIATE_WHITENING_METHODS)}"
+            )
+        if not str(self.obs_key).strip():
+            raise ValueError(
+                "data.covariate_whitening requires a non-empty obs_key for the covariate column."
+            )
+        self.method = method
+        self.obs_key = str(self.obs_key).strip()
+        return self
+
+    @property
+    def is_freedman_lane(self) -> bool:
+        return self.method == "freedman-lane"
+
+    @property
+    def is_loss_difference(self) -> bool:
+        return self.method == "loss-difference"
+
+
+def _normalize_covariate_whitening_method(method: str) -> str:
+    normalized = str(method).strip().lower()
+    return COVARIATE_WHITENING_METHOD_ALIASES.get(normalized, normalized)
+
+
+def _covariate_whitening_from_raw(
+    raw: Any,
+    *,
+    obs_key_fallback: Optional[str] = None,
+) -> CovariateWhiteningConfig:
+    if isinstance(raw, CovariateWhiteningConfig):
+        return raw.validate()
+    if isinstance(raw, str):
+        method = _normalize_covariate_whitening_method(raw)
+        obs_key = obs_key_fallback
+        if not obs_key:
+            raise ValueError(
+                "data.covariate_whitening_obs_key is required when "
+                "data.covariate_whitening is a method string."
+            )
+        return CovariateWhiteningConfig(method=method, obs_key=str(obs_key)).validate()
+    if isinstance(raw, Mapping):
+        method_raw = raw.get("method", raw.get("type"))
+        if method_raw is None:
+            raise ValueError(
+                "data.covariate_whitening mapping must include 'method'."
+            )
+        obs_key = raw.get("obs_key", raw.get("column", obs_key_fallback))
+        if not obs_key:
+            raise ValueError(
+                "data.covariate_whitening mapping must include 'obs_key'."
+            )
+        return CovariateWhiteningConfig(
+            method=str(method_raw),
+            obs_key=str(obs_key),
+        ).validate()
+    raise TypeError(
+        "data.covariate_whitening must be a method string, a mapping with "
+        "'method' and 'obs_key', or omitted; got "
+        f"{type(raw).__name__}"
+    )
 
 
 @dataclass
 class CovariateConfig:
     """Optional fixed bottleneck / isodepth specification (decoder-only training).
 
-    Two modes:
+    Three modes:
     - ``type='midline'``: fixed depth ``d(x, y) = |x - median(x)|`` computed from spatial
       coordinates; no data key required.
+    - ``type='total_counts'``: per-cell ``log1p(sum_g counts)`` computed from the raw
+      expression matrix before normalization; no ``obs`` column required.
     - ``type=<obs_key>`` (any other non-empty string): reads per-cell latent values from
       ``adata.obs[obs_key]`` in the h5ad file; the key must exist in ``obs`` or a
       ``ValueError`` is raised at load time.
@@ -541,9 +747,19 @@ class CovariateConfig:
     type: Optional[str] = None
 
     @property
+    def is_builtin(self) -> bool:
+        """True for built-in covariate types (``midline``, ``total_counts``)."""
+        return self.type in (MIDLINE_COVARIATE, TOTAL_COUNTS_COVARIATE)
+
+    @property
     def is_obs_key(self) -> bool:
-        """True when the covariate is a labeled obs column (not midline and not None)."""
-        return self.type is not None and self.type != MIDLINE_COVARIATE
+        """True when the covariate is a labeled obs column (not a built-in type)."""
+        return self.type is not None and not self.is_builtin
+
+    @property
+    def is_values_covariate(self) -> bool:
+        """True when per-cell values are stored in ``dataset.meta['covariate_values']``."""
+        return self.is_obs_key or self.type == TOTAL_COUNTS_COVARIATE
 
     def validate(self) -> "CovariateConfig":
         if self.type is not None and not self.type.strip():
@@ -586,9 +802,18 @@ class TestConfig:
     recursive: bool = False
     max_gradients: int = 10
     block_radius: Optional[float] = None
+    block_shape: str = "hexagon"
+    bin_shape: str = "hexagon"
+    bin_spot_distance_um: float = 100.0
     coordinate_um_per_unit: Optional[float] = None
     block_jitter: bool = True
     save_permutation_null_comparison: bool = False
+    msr_truncate_um: Optional[float] = None
+    msr_neighbor_radius_um: Optional[float] = None
+    msr_calibration_um: Optional[float] = None
+    msr_shared_rank: bool = False
+    moran: bool = False
+    moran_neighbor_radius_um: float = 30.0
     gaussian_pretrain_epochs: int = 0
     gaussian_pretrain_freeze_encoder: bool = False
 
@@ -658,6 +883,9 @@ class TestConfig:
         if self.method in {
             "parallel_permutation",
             "block_permutation",
+            "binning",
+            "fourier_spectral_randomization",
+            *MSR_METHODS,
             "cross_validation",
             "full_retraining",
             "comparison_perturbation_test",
@@ -676,12 +904,49 @@ class TestConfig:
                 raise ValueError("test.block_radius must be > 0")
         if self.block_radius is not None and float(self.block_radius) <= 0:
             raise ValueError("test.block_radius must be > 0 when provided")
+        if self.block_shape not in SUPPORTED_BLOCK_SHAPES:
+            raise ValueError(
+                f"Unsupported test.block_shape '{self.block_shape}'. "
+                f"Expected one of {sorted(SUPPORTED_BLOCK_SHAPES)}"
+            )
+        self.bin_shape = "hexagon" if str(self.bin_shape) == "hexagonal" else str(self.bin_shape)
+        if self.bin_shape not in SUPPORTED_BLOCK_SHAPES:
+            raise ValueError(
+                f"Unsupported test.bin_shape '{self.bin_shape}'. "
+                f"Expected one of {sorted(SUPPORTED_BLOCK_SHAPES)}"
+            )
+        if float(self.bin_spot_distance_um) <= 0:
+            raise ValueError("test.bin_spot_distance_um must be > 0")
         if self.save_permutation_null_comparison and self.method != "block_permutation":
             raise ValueError(
                 "test.save_permutation_null_comparison requires test.method='block_permutation'"
             )
         if self.coordinate_um_per_unit is not None and float(self.coordinate_um_per_unit) <= 0:
             raise ValueError("test.coordinate_um_per_unit must be > 0 when provided")
+
+        if self.method in MSR_METHODS:
+            if self.msr_neighbor_radius_um is None:
+                raise ValueError(
+                    "test.msr_neighbor_radius_um (in µm) is required when "
+                    f"test.method='{self.method}'"
+                )
+            if float(self.msr_neighbor_radius_um) <= 0:
+                raise ValueError("test.msr_neighbor_radius_um must be > 0")
+            if self.coordinate_um_per_unit is None:
+                raise ValueError(
+                    "test.coordinate_um_per_unit is required when "
+                    f"test.method='{self.method}' to convert coordinates to µm"
+                )
+        if self.msr_truncate_um is not None and float(self.msr_truncate_um) < 0:
+            raise ValueError("test.msr_truncate_um must be >= 0 when provided")
+        if self.msr_neighbor_radius_um is not None and float(self.msr_neighbor_radius_um) <= 0:
+            raise ValueError("test.msr_neighbor_radius_um must be > 0 when provided")
+        if self.msr_calibration_um is not None and float(self.msr_calibration_um) <= 0:
+            raise ValueError("test.msr_calibration_um must be > 0 when provided")
+
+        if self.moran:
+            if float(self.moran_neighbor_radius_um) <= 0:
+                raise ValueError("test.moran_neighbor_radius_um must be > 0 when test.moran is true")
 
         if self.method == "cross_validation":
             if self.n_folds < 2:
@@ -856,9 +1121,9 @@ def _covariate_config_from_raw(raw: Any) -> CovariateConfig:
     """Build ``CovariateConfig`` from JSON/YAML.
 
     Accepts:
-    - ``"midline"`` (string shorthand)
-    - ``{"type": "midline"}`` (mapping)
-    - any non-empty string to use as an ``adata.obs`` key
+    - ``"midline"`` or ``"total_counts"`` (string shorthand)
+    - ``{"type": "midline"}`` or ``{"type": "total_counts"}`` (mapping)
+    - any other non-empty string to use as an ``adata.obs`` key
     - ``{"type": "<obs_key>"}`` mapping for the same
     """
     if isinstance(raw, CovariateConfig):
@@ -876,13 +1141,37 @@ def _covariate_config_from_raw(raw: Any) -> CovariateConfig:
 
 def run_config_from_mapping(mapping: Optional[Mapping[str, Any]]) -> RunConfig:
     mapping = dict(mapping or {})
+    data_mapping = dict(mapping.get("data", {}))
+    whitening_obs_key = data_mapping.pop("covariate_whitening_obs_key", None)
+    whitening_raw = data_mapping.pop("covariate_whitening", None)
+    if whitening_raw is None and whitening_obs_key is not None:
+        raise ValueError(
+            "data.covariate_whitening_obs_key requires data.covariate_whitening to be set."
+        )
+    data_config = DataConfig(**data_mapping)
+    if whitening_raw is not None:
+        data_config.covariate_whitening = _covariate_whitening_from_raw(
+            whitening_raw,
+            obs_key_fallback=whitening_obs_key,
+        )
+
     test_mapping = dict(mapping.get("test", {}))
+    # Legacy: migrate test.freedman_lane / test.freedman-lane into data.covariate_whitening.
+    legacy_lane = test_mapping.pop("freedman_lane", None)
+    if "freedman-lane" in test_mapping:
+        legacy_lane = test_mapping.pop("freedman-lane")
+    if legacy_lane is not None and data_config.covariate_whitening is None:
+        data_config.covariate_whitening = _covariate_whitening_from_raw(
+            "freedman-lane",
+            obs_key_fallback=str(legacy_lane),
+        )
+
     covariate_raw = test_mapping.pop("covariate", None)
     test_config = TestConfig(**test_mapping)
     if covariate_raw is not None:
         test_config.covariate = _covariate_config_from_raw(covariate_raw)
     return RunConfig(
-        data=DataConfig(**dict(mapping.get("data", {}))),
+        data=data_config.validate(),
         test=test_config.validate(),
         output=OutputConfig(**dict(mapping.get("output", {}))),
     ).validate()
@@ -891,10 +1180,12 @@ def run_config_from_mapping(mapping: Optional[Mapping[str, Any]]) -> RunConfig:
 __all__ = [
     "CANONICAL_METRICS",
     "CovariateConfig",
+    "CovariateWhiteningConfig",
     "SUPPORTED_ENCODER_TYPES",
     "DataConfig",
     "DatasetBundle",
     "MIDLINE_COVARIATE",
+    "TOTAL_COUNTS_COVARIATE",
     "OutputConfig",
     "RunConfig",
     "SUPPORTED_COVARIATE_TYPES",

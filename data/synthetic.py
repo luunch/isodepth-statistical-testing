@@ -194,6 +194,27 @@ def _fit_shaped_lattice(
     return s_arr, gh, gw, K
 
 
+def _lattice_axis_coords(count: int, *, cell_centers: bool) -> np.ndarray:
+    """1D lattice coordinates on [0, 1].  Cell-centre nodes avoid sitting on block edges."""
+    n = int(count)
+    if n <= 0:
+        raise ValueError("lattice axis count must be positive")
+    if cell_centers:
+        return ((np.arange(n, dtype=np.float64) + 0.5) / float(n)).astype(np.float64)
+    return np.linspace(0.0, 1.0, n, dtype=np.float64)
+
+
+def _square_lattice_coords(side_length: int, *, cell_centers: bool) -> np.ndarray:
+    """Full ``side_length`` × ``side_length`` lattice on ``[0, 1]^2``."""
+    side = int(side_length)
+    if side <= 0:
+        raise ValueError("side_length must be positive")
+    x_coords = _lattice_axis_coords(side, cell_centers=cell_centers)
+    y_coords = _lattice_axis_coords(side, cell_centers=cell_centers)
+    x, y = np.meshgrid(x_coords, y_coords)
+    return np.stack([x.ravel(), y.ravel()], axis=1).astype(np.float32)
+
+
 class SpatialDataSimulator:
     def __init__(
         self,
@@ -203,6 +224,7 @@ class SpatialDataSimulator:
         device: str = "cpu",
         poly_degree: int = 3,
         side_length: Optional[int] = None,
+        lattice_cell_centers: bool = False,
         shape: str = "square",
         lattice_seed: int = 0,
         sampling_bias: Optional[SamplingBiasConfig] = None,
@@ -214,6 +236,7 @@ class SpatialDataSimulator:
     ):
         self.N_requested = int(N)
         self.side_length = side_length
+        self.lattice_cell_centers = bool(lattice_cell_centers)
         self.G = int(G)
         self.sigma = sigma
         self.device = device
@@ -237,6 +260,29 @@ class SpatialDataSimulator:
 
         if sampling_bias is not None:
             rng = np.random.RandomState(int(lattice_seed))
+            if sampling_bias.type == "lattice":
+                if side_length is None:
+                    raise ValueError("sampling_bias type 'lattice' requires data.side_length")
+                if shape != "square":
+                    raise ValueError("sampling_bias type 'lattice' requires data.shape='square'")
+                full_s = _square_lattice_coords(
+                    int(side_length), cell_centers=self.lattice_cell_centers
+                )
+                n_lattice = int(full_s.shape[0])
+                if self.N_requested > n_lattice:
+                    raise ValueError(
+                        f"n_cells={self.N_requested} exceeds {n_lattice} lattice sites "
+                        f"for side_length={side_length}"
+                    )
+                if self.N_requested == n_lattice:
+                    self.S = full_s
+                else:
+                    idx = rng.choice(n_lattice, size=self.N_requested, replace=False)
+                    self.S = full_s[idx]
+                self.grid_width = int(side_length)
+                self.grid_height = int(side_length)
+                self.N = int(self.S.shape[0])
+                return
             if sampling_bias.type == "uniform":
                 self.S = _sample_uniform_on_shape(self.N_requested, shape, rng)
             elif sampling_bias.type == "normal":
@@ -272,7 +318,7 @@ class SpatialDataSimulator:
             self.N = self.gridsize**2
             self.grid_height = self.gridsize
             self.grid_width = self.gridsize
-            coords = np.linspace(0, 1, self.gridsize)
+            coords = _lattice_axis_coords(self.gridsize, cell_centers=self.lattice_cell_centers)
             x, y = np.meshgrid(coords, coords)
             self.S = np.stack([x.ravel(), y.ravel()], axis=1).astype(np.float32)
         else:
@@ -283,8 +329,8 @@ class SpatialDataSimulator:
                 raise ValueError("When data.side_length is set, data.n_cells must be divisible by data.side_length")
             self.grid_height = self.N_requested // self.grid_width
             self.N = self.N_requested
-            x_coords = np.linspace(0, 1, self.grid_width)
-            y_coords = np.linspace(0, 1, self.grid_height)
+            x_coords = _lattice_axis_coords(self.grid_width, cell_centers=self.lattice_cell_centers)
+            y_coords = _lattice_axis_coords(self.grid_height, cell_centers=self.lattice_cell_centers)
             x, y = np.meshgrid(x_coords, y_coords)
             self.S = np.stack([x.ravel(), y.ravel()], axis=1).astype(np.float32)
 
@@ -374,11 +420,21 @@ class SpatialDataSimulator:
             return np.zeros(self.N, dtype=np.float64)
         return (d_raw - d_min) / (d_max - d_min)
 
+    @staticmethod
+    def _kernel_values(d_vals: np.ndarray, *, kernel_type: str, distance: float) -> np.ndarray:
+        """Unit diagonal-free kernel entries K_ij for pairwise distances d_ij."""
+        p = float(distance)
+        if kernel_type == "exp":
+            return np.exp(-d_vals / p)
+        if kernel_type == "trunc":
+            return np.ones_like(d_vals, dtype=np.float64)
+        raise ValueError(f"unsupported kernel type {kernel_type!r}")
+
     def _build_cholesky(self) -> np.ndarray:
         """Compute and cache Cholesky of C = I + δ·K.
 
-        K is the exponential kernel at pairwise micron distances, truncated
-        beyond ``kernel.effective_cutoff`` (KDTree avoids the full N×N matrix).
+        K is evaluated at pairwise micron distances and truncated beyond
+        ``kernel.effective_cutoff`` (KDTree avoids the full N×N matrix).
         Returns L with L @ L.T = C; draw correlated noise as ``σ·L @ z``.
         """
         if self._L is not None:
@@ -386,6 +442,7 @@ class SpatialDataSimulator:
         assert self.kernel is not None and self.scale is not None
         S_um = self.S * float(self.scale)
         r_max = self.kernel.effective_cutoff
+        kernel_type = str(self.kernel.type)
         p = float(self.kernel.distance)
         tree = KDTree(S_um)
         pairs = tree.query_pairs(r_max, output_type="ndarray")
@@ -393,14 +450,68 @@ class SpatialDataSimulator:
         np.fill_diagonal(C, 1.0 + self.delta)
         if pairs.shape[0] > 0:
             d_vals = np.linalg.norm(S_um[pairs[:, 0]] - S_um[pairs[:, 1]], axis=1)
-            k_vals = self.delta * np.exp(-d_vals / p)
+            if kernel_type == "trunc":
+                r_cut = float(r_max)
+                keep = d_vals <= r_cut + 1e-9
+                pairs = pairs[keep]
+                d_vals = d_vals[keep]
+            k_core = self._kernel_values(d_vals, kernel_type=kernel_type, distance=p)
+            k_vals = self.delta * k_core
             C[pairs[:, 0], pairs[:, 1]] += k_vals
             C[pairs[:, 1], pairs[:, 0]] += k_vals
         self._L = np.linalg.cholesky(C)
         return self._L
 
+    def _draw_smoothed_noise(self, N: int, G: int) -> np.ndarray:
+        """Gaussian-smoothed white noise (local weighted average over micron coords).
+
+        Draws ``Z ~ N(0, I)`` then
+        ``Z'_i = Σ_j w_ij Z_j`` with
+        ``w_ij ∝ exp(-‖S_i-S_j‖² / (2 p²))`` for neighbors within
+        ``kernel.effective_cutoff``, row-normalized.  Returns ``σ · Z'``.
+        """
+        assert self.kernel is not None and self.scale is not None
+        S_um = np.asarray(self.S, dtype=np.float64) * float(self.scale)
+        bandwidth = float(self.kernel.distance)
+        r_max = float(self.kernel.effective_cutoff)
+        Z = np.random.randn(N, G)
+
+        # Neighbor budget from expected disk occupancy (+ cushion), capped at N.
+        area_frac = min(1.0, np.pi * (r_max / float(self.scale)) ** 2)
+        k_est = int(min(N, max(8, int(np.ceil(area_frac * N * 2.0)) + 1)))
+        tree = KDTree(S_um)
+        dists, idx = tree.query(S_um, k=k_est)
+        if k_est == 1:
+            dists = np.asarray(dists, dtype=np.float64).reshape(N, 1)
+            idx = np.asarray(idx, dtype=np.intp).reshape(N, 1)
+        else:
+            dists = np.asarray(dists, dtype=np.float64)
+            idx = np.asarray(idx, dtype=np.intp)
+
+        valid = dists <= r_max + 1e-9
+        weights = np.exp(-0.5 * (dists / bandwidth) ** 2)
+        weights = np.where(valid, weights, 0.0)
+        row_sums = weights.sum(axis=1, keepdims=True)
+        # Degenerate rows (should not happen: self is always nearest) fall back to IID.
+        empty = row_sums[:, 0] <= 0.0
+        if np.any(empty):
+            weights[empty, 0] = 1.0
+            row_sums = weights.sum(axis=1, keepdims=True)
+        weights = weights / np.maximum(row_sums, 1e-12)
+
+        Z_smooth = np.zeros((N, G), dtype=np.float64)
+        for j in range(weights.shape[1]):
+            Z_smooth += Z[idx[:, j], :] * weights[:, j : j + 1]
+        return self.sigma * Z_smooth
+
     def _draw_correlated_noise(self, N: int, G: int) -> np.ndarray:
-        """Draw noise from N(0, σ²·C) — correlated when kernel active, IID otherwise."""
+        """Draw noise — smooth / Cholesky-correlated when kernel active, else IID."""
+        if (
+            self.kernel is not None
+            and self.scale is not None
+            and str(self.kernel.type) == "smooth"
+        ):
+            return self._draw_smoothed_noise(N, G)
         Z = np.random.randn(N, G)
         if self.kernel is not None and self.delta > 0.0 and self.scale is not None:
             L = self._build_cholesky()
@@ -492,6 +603,7 @@ def generate_synthetic_dataset(config: DataConfig) -> DatasetBundle:
         device="cpu",
         poly_degree=config.poly_degree,
         side_length=config.side_length,
+        lattice_cell_centers=config.lattice_cell_centers,
         shape=config.shape,
         lattice_seed=config.seed,
         sampling_bias=config.sampling_bias,
@@ -535,19 +647,42 @@ def generate_synthetic_dataset(config: DataConfig) -> DatasetBundle:
         meta["k_max"] = int(config.k_max)
         meta["dependent_xy"] = bool(config.dependent_xy)
         meta["fourier_basis"] = "interaction_xy" if config.dependent_xy else "independent_xy"
-    if config.side_length is not None and config.shape == "square" and config.sampling_bias is None:
+    if (
+        config.side_length is not None
+        and config.shape == "square"
+        and (
+            config.sampling_bias is None
+            or config.sampling_bias.type == "lattice"
+        )
+    ):
         meta["side_length"] = int(config.side_length)
-        meta["other_side_length"] = int(s.shape[0] // config.side_length)
-    if config.kernel is not None and config.delta > 0.0:
+        meta["other_side_length"] = int(config.side_length)
+        if config.lattice_cell_centers:
+            meta["lattice_cell_centers"] = True
+    if config.kernel is not None and (
+        config.kernel.type == "smooth" or config.delta > 0.0
+    ):
         meta["kernel"] = config.kernel.to_meta()
-        meta["delta"] = float(config.delta)
         meta["scale_um"] = float(config.scale)
-        meta["local_fraction"] = config.delta / (1.0 + config.delta)
-        # Store one example noise draw for the kernel diagnostic plot
-        if simulator._L is not None:
+        if config.kernel.type == "smooth":
+            meta["noise_model"] = "gaussian_smooth"
+            meta["smooth_bandwidth_um"] = float(config.kernel.distance)
+            meta["smooth_cutoff_um"] = float(config.kernel.effective_cutoff)
+            # One example smoothed field for diagnostics (gene-independent draw).
             rng_state = np.random.get_state()
             np.random.seed(int(config.seed) + 9999)
-            noise_sample = float(config.sigma) * (simulator._L @ np.random.randn(simulator.N))
+            noise_sample = simulator._draw_smoothed_noise(simulator.N, 1)[:, 0]
             np.random.set_state(rng_state)
             meta["kernel_noise_sample"] = noise_sample.astype(np.float32)
+        else:
+            meta["noise_model"] = "cholesky_delta"
+            meta["delta"] = float(config.delta)
+            meta["local_fraction"] = config.delta / (1.0 + config.delta)
+            # Store one example noise draw for the kernel diagnostic plot
+            if simulator._L is not None:
+                rng_state = np.random.get_state()
+                np.random.seed(int(config.seed) + 9999)
+                noise_sample = float(config.sigma) * (simulator._L @ np.random.randn(simulator.N))
+                np.random.set_state(rng_state)
+                meta["kernel_noise_sample"] = noise_sample.astype(np.float32)
     return DatasetBundle(S=s, A=a, meta=meta).validate()

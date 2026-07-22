@@ -8,8 +8,13 @@
     "poly_degree": 1,
     "seed": 42,
     "scale": 1000,
-    "sampling_bias": {"type": "uniform"},
-    "kernel": {"type": "exp", "distance": 15},
+    "sampling_bias": {
+      "type": "uniform"
+    },
+    "kernel": {
+      "type": "exp",
+      "distance": 15
+    },
     "delta": 0.05
   },
   "test": {
@@ -26,7 +31,8 @@
     "verbose": true,
     "block_radius": 30,
     "coordinate_um_per_unit": 1000.0,
-    "block_jitter": true
+    "block_jitter": true,
+    "block_shape": "hexagon"
   },
   "output": {
     "out_dir": "results/synthetic_kernel",

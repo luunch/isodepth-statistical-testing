@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 
 from data import load_dataset
 from experiments.configuration import build_run_config, save_standardized_outputs
 from experiments.recursive_svg import run_recursive_svg
+from methods.freedman_lane import apply_freedman_lane_whitening
 from methods.permutation import run_permutation_method
 
 
@@ -117,6 +119,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--patience", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--device", default=argparse.SUPPRESS)
     parser.add_argument("--decoder", default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--bin-shape",
+        dest="bin_shape",
+        choices=("hexagon", "hexagonal", "square"),
+        default=argparse.SUPPRESS,
+        help="Pseudospot grid shape for test.method='binning'.",
+    )
+    parser.add_argument(
+        "--bin-spot-distance-um",
+        dest="bin_spot_distance_um",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Center-to-center pseudospot spacing in microns for test.method='binning'.",
+    )
     parser.add_argument("--batch-size", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--sgd-batch-size", type=int, default=argparse.SUPPRESS)
     parser.add_argument(
@@ -186,6 +202,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--covariate-whitening",
+        dest="covariate_whitening",
+        default=argparse.SUPPRESS,
+        help=(
+            "Covariate whitening method in data config (e.g. freedman-lane). "
+            "Pair with --covariate-whitening-obs-key for the obs column."
+        ),
+    )
+    parser.add_argument(
+        "--covariate-whitening-obs-key",
+        dest="covariate_whitening_obs_key",
+        default=argparse.SUPPRESS,
+        help="adata.obs column for data.covariate_whitening (required for method strings).",
+    )
+    parser.add_argument(
         "--gaussian-pretrain-epochs",
         dest="gaussian_pretrain_epochs",
         type=int,
@@ -207,6 +238,26 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         dest="gaussian_pretrain_freeze_encoder",
         action="store_false",
         default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--moran",
+        dest="moran",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Compute global Moran's I per permutation slot (30 µm neighbor radius by default).",
+    )
+    parser.add_argument(
+        "--no-moran",
+        dest="moran",
+        action="store_false",
+        default=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--moran-neighbor-radius-um",
+        dest="moran_neighbor_radius_um",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Neighbor radius in µm for Moran's I weight matrix (default: 30).",
     )
     return parser
 
@@ -241,6 +292,8 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict:
         "k": "k",
         "k_min": "k_min",
         "k_max": "k_max",
+        "covariate_whitening": "covariate_whitening",
+        "covariate_whitening_obs_key": "covariate_whitening_obs_key",
     }.items():
         if hasattr(args, arg_name):
             data_overrides[config_key] = getattr(args, arg_name)
@@ -258,6 +311,8 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict:
         "patience": "patience",
         "device": "device",
         "decoder": "decoder",
+        "bin_shape": "bin_shape",
+        "bin_spot_distance_um": "bin_spot_distance_um",
         "batch_size": "batch_size",
         "sgd_batch_size": "sgd_batch_size",
         "sgd_cosine_lr_decay": "sgd_cosine_lr_decay",
@@ -271,6 +326,8 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict:
         "max_gradients": "max_gradients",
         "gaussian_pretrain_epochs": "gaussian_pretrain_epochs",
         "gaussian_pretrain_freeze_encoder": "gaussian_pretrain_freeze_encoder",
+        "moran": "moran",
+        "moran_neighbor_radius_um": "moran_neighbor_radius_um",
     }.items():
         if hasattr(args, arg_name):
             test_overrides[config_key] = getattr(args, arg_name)
@@ -308,13 +365,49 @@ def main() -> None:
     cli_overrides = _build_cli_overrides(args)
     run_config = build_run_config(args.config, cli_overrides)
 
-    dataset = load_dataset(run_config.data, covariate=run_config.test.covariate)
+    data_config_for_load = run_config.data
+    if run_config.test.method == "binning" and run_config.data.source == "h5ad":
+        data_config_for_load = replace(
+            run_config.data,
+            normalize_total=False,
+            log1p=False,
+            standardize_expression=False,
+            q=None,
+        )
+
+    dataset = load_dataset(
+        data_config_for_load,
+        covariate=run_config.test.covariate,
+    )
+    if run_config.test.method == "binning":
+        dataset.meta["binning_preprocessing"] = {
+            "min_cells_per_gene": int(run_config.data.min_cells_per_gene),
+            "top_var_genes": int(run_config.data.top_var_genes),
+            "normalize_total": bool(run_config.data.normalize_total),
+            "log1p": bool(run_config.data.log1p),
+            "standardize_expression": bool(run_config.data.standardize_expression),
+            "q": run_config.data.q,
+            "seed": int(run_config.data.seed),
+        }
+
+    freedman_lane_artifacts: dict[str, object] = {}
+    if (
+        run_config.data.covariate_whitening is not None
+        and run_config.data.covariate_whitening.is_freedman_lane
+        and dataset.meta.get("cell_type_mode") != "separate"
+    ):
+        dataset, freedman_lane_artifacts = apply_freedman_lane_whitening(
+            dataset,
+            run_config.test,
+        )
 
     if run_config.test.recursive:
         payload, result_path = run_recursive_svg(dataset, run_config)
         print(f"Saved recursive outputs to: {result_path.parent}")
     else:
         result = run_permutation_method(dataset, run_config.test)
+        if freedman_lane_artifacts:
+            result.artifacts.update(freedman_lane_artifacts)
         payload, result_path = save_standardized_outputs(dataset, result, run_config)
         print(f"Saved outputs to: {result_path.parent}")
 

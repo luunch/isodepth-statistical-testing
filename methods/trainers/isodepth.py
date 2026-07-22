@@ -24,8 +24,10 @@ from methods.architectures import (
     IsoDepthNet,
     MidlineEncoderNet,
     ParallelCellTypeIsoDepthNet,
+    ParallelCellTypeIsoDepthWithFixedCovariateNet,
     ParallelDecoderOnlyNetFixed,
     ParallelIsoDepthNet,
+    ParallelIsoDepthWithFixedCovariateNet,
     ParallelLinear,
     ParallelMidlineEncoderNet,
     ParallelParameterizedMidlineEncoder,
@@ -62,10 +64,10 @@ def _is_midline_covariate(config: TestConfig) -> bool:
     return cov is not None and getattr(cov, "type", None) == "midline"
 
 
-def _is_obs_key_covariate(config: TestConfig) -> bool:
-    """True when the covariate is a labeled obs-column (not midline, not None)."""
+def _is_values_covariate(config: TestConfig) -> bool:
+    """True when the covariate uses per-cell values from ``dataset.meta['covariate_values']``."""
     cov = getattr(config, "covariate", None)
-    return cov is not None and getattr(cov, "is_obs_key", False)
+    return cov is not None and getattr(cov, "is_values_covariate", False)
 
 
 def _parallel_slot_count(model: nn.Module) -> int:
@@ -453,7 +455,14 @@ def _parallel_model_slot_count(model: nn.Module) -> int:
 def _encoder_expects_batched_spatial_input(model: nn.Module) -> bool:
     if isinstance(
         model,
-        (ParallelIsoDepthNet, ParallelCellTypeIsoDepthNet, HybridMidlineParallelNet, ParallelMidlineEncoderNet),
+        (
+            ParallelIsoDepthNet,
+            ParallelIsoDepthWithFixedCovariateNet,
+            ParallelCellTypeIsoDepthNet,
+            ParallelCellTypeIsoDepthWithFixedCovariateNet,
+            HybridMidlineParallelNet,
+            ParallelMidlineEncoderNet,
+        ),
     ):
         return True
     return getattr(model, "M", None) is not None
@@ -1051,11 +1060,15 @@ def _encode_parallel_model_slice(
 
 
 def _forward_parallel_model_slice(
-    model: ParallelIsoDepthNet | HybridMidlineParallelNet,
+    model: ParallelIsoDepthNet | HybridMidlineParallelNet | ParallelIsoDepthWithFixedCovariateNet,
     x: torch.Tensor,
     start: int,
     stop: int,
 ) -> torch.Tensor:
+    if isinstance(model, ParallelIsoDepthWithFixedCovariateNet):
+        spatial = _parallel_module_stack_slice_forward(model.encoder, x, start, stop)
+        latent = model._concat_covariate(spatial)
+        return _parallel_module_stack_slice_forward(model.decoder, latent, start, stop)
     latent = _encode_parallel_model_slice(model, x, start, stop)
     return _parallel_module_stack_slice_forward(model.decoder, latent, start, stop)
 
@@ -1073,7 +1086,7 @@ def _encode_parallel_celltype_slice(
 
 
 def _forward_parallel_celltype_slice(
-    model: ParallelCellTypeIsoDepthNet,
+    model: ParallelCellTypeIsoDepthNet | ParallelCellTypeIsoDepthWithFixedCovariateNet,
     x: torch.Tensor,
     cell_type_indices: torch.Tensor,
     start: int,
@@ -1081,7 +1094,11 @@ def _forward_parallel_celltype_slice(
 ) -> torch.Tensor:
     model._ensure_routing_cache(cell_type_indices, x.device)
 
-    latent = _encode_parallel_celltype_slice(model, x, start, stop)
+    spatial = _encode_parallel_celltype_slice(model, x, start, stop)
+    if isinstance(model, ParallelCellTypeIsoDepthWithFixedCovariateNet):
+        latent = model._concat_covariate(spatial)
+    else:
+        latent = spatial
     m, n, _ = x.shape
     sorted_latent = latent[:, model._sort_idx, :]
     sorted_output = torch.empty(m, n, model.G, device=x.device, dtype=x.dtype)
@@ -1120,15 +1137,24 @@ def _finalize_batched_parallel_training(
     metric_name = canonicalize_metric_name(config.metric)
     chunk_size = max(1, min(int(chunk_size), total_models))
     a_np = np.asarray(A, dtype=np.float32)
+    # When a_t is (M, N, G) each parallel slot has its own expression targets;
+    # metrics must use the slot's A, not the global A passed for training API compat.
+    use_per_slot_a = a_t.ndim == 3
+
+    def _slot_a_np(slot: int) -> np.ndarray:
+        if use_per_slot_a:
+            return a_t[slot].detach().cpu().numpy().astype(np.float32)
+        return a_np
 
     slot_train_losses = np.empty(total_models, dtype=np.float64)
     for start in range(0, total_models, chunk_size):
         stop = min(start + chunk_size, total_models)
         mask_chunk = None if loss_mask_t is None else loss_mask_t[start:stop]
+        targets_chunk = a_t if a_t.ndim == 2 else a_t[start:stop]
         with torch.no_grad():
             output = _forward_parallel_model_slice(model, s_batched_t[start:stop], start, stop)
             losses = _compute_reconstruction_loss_per_model(
-                output, a_t, mask_chunk, poisson_size_factors=poisson_size_factors
+                output, targets_chunk, mask_chunk, poisson_size_factors=poisson_size_factors
             )
         slot_train_losses[start:stop] = losses.detach().cpu().numpy().astype(np.float64)
 
@@ -1165,7 +1191,7 @@ def _finalize_batched_parallel_training(
             model=model,
             s_batched_t=s_batched_t,
             slot=slot,
-            a_np=a_np,
+            a_np=_slot_a_np(slot),
             config=config,
             metric_name=metric_name,
             decoder_type=decoder_type,
@@ -1192,7 +1218,7 @@ def _finalize_batched_parallel_training(
             model=model,
             s_batched_t=s_batched_t,
             slot=slot,
-            a_np=a_np,
+            a_np=_slot_a_np(slot),
             config=config,
             metric_name=metric_name,
             decoder_type=decoder_type,
@@ -1400,6 +1426,8 @@ def _forward_batched_parallel_output(
     if batch_indices is None:
         return model(s_batched_t)
     batch_s = s_batched_t.index_select(1, batch_indices)
+    if isinstance(model, ParallelIsoDepthWithFixedCovariateNet):
+        return model.forward_with_cell_indices(batch_s, batch_indices)
     return model(batch_s)
 
 
@@ -1575,6 +1603,29 @@ def _compact_parallel_model(
             device=device,
         )
 
+    if isinstance(expanded_model, ParallelIsoDepthWithFixedCovariateNet):
+        n_expanded = _parallel_slot_count(expanded_model)
+        covariate_np = expanded_model.covariate_values.detach().cpu().numpy().reshape(-1)
+        compact_model = ParallelIsoDepthWithFixedCovariateNet(
+            n_models,
+            n_genes,
+            covariate_np,
+            latent_dim=expanded_model.spatial_latent_dim,
+            decoder_type=decoder_type,
+        ).to(device)
+        expanded_state = expanded_model.state_dict()
+        compact_state = compact_model.state_dict()
+        slot_indices = [int(index) for index in np.asarray(selected_indices, dtype=np.int64).tolist()]
+        restored_state: dict[str, torch.Tensor] = {}
+        for name, tensor in compact_state.items():
+            source = expanded_state[name].detach().cpu()
+            if source.ndim > 0 and source.shape[0] == n_expanded:
+                restored_state[name] = source[slot_indices].clone().to(device=device)
+            else:
+                restored_state[name] = source.clone().to(device=device)
+        compact_model.load_state_dict(restored_state)
+        return compact_model
+
     n_expanded = _parallel_slot_count(expanded_model)
     compact_model = ParallelIsoDepthNet(
         n_models,
@@ -1698,6 +1749,7 @@ def train_batched_isodepth_model(
     initial_state: Mapping[str, torch.Tensor] | None = None,
     gradient_scale_divisor: float | None = None,
     poisson_size_factors_override: np.ndarray | None = None,
+    fixed_covariate_values: np.ndarray | None = None,
 ) -> tuple[nn.Module, BatchedTrainingOutputs]:
     device = device or resolve_device(config.device)
     _set_torch_seed(config.seed)
@@ -1803,6 +1855,19 @@ def train_batched_isodepth_model(
             n_genes,
             slot_split=n_reruns,
             latent_dim=1,
+            decoder_type=decoder_type,
+        ).to(device)
+    elif fixed_covariate_values is not None:
+        if _is_midline_covariate(config) or _is_values_covariate(config):
+            raise ValueError(
+                "fixed_covariate_values cannot be combined with test.covariate; "
+                "use data.covariate_whitening='loss-difference' instead."
+            )
+        model = ParallelIsoDepthWithFixedCovariateNet(
+            total_models,
+            n_genes,
+            fixed_covariate_values,
+            latent_dim=latent_dim,
             decoder_type=decoder_type,
         ).to(device)
     else:
@@ -2154,6 +2219,15 @@ def _merge_chunked_training_results(
             n_perm_models, n_genes,
             latent_dim=latent_dim, decoder_type=decoder_type,
         )
+    elif isinstance(chunk_models[0], ParallelIsoDepthWithFixedCovariateNet):
+        covariate_np = chunk_models[0].covariate_values.detach().cpu().numpy().reshape(-1)
+        merged_model = ParallelIsoDepthWithFixedCovariateNet(
+            n_perm_models,
+            n_genes,
+            covariate_np,
+            latent_dim=chunk_models[0].spatial_latent_dim,
+            decoder_type=decoder_type,
+        )
     else:
         merged_model = ParallelIsoDepthNet(
             n_perm_models, n_genes,
@@ -2208,6 +2282,7 @@ def train_parallel_isodepth_model(
     model_label: Optional[str] = None,
     initial_state: Mapping[str, torch.Tensor] | None = None,
     gradient_scale_divisor: float | None = None,
+    fixed_covariate_values: np.ndarray | None = None,
 ) -> tuple[nn.Module, BatchedTrainingOutputs, np.ndarray]:
     """Returns (compact_model, training_outputs, s_batched_np).
 
@@ -2250,6 +2325,7 @@ def train_parallel_isodepth_model(
             latent_dim=latent_dim, model_label=label,
             initial_state=None,
             gradient_scale_divisor=gradient_scale_divisor,
+            fixed_covariate_values=fixed_covariate_values,
         )
 
     # -- try full batch first; on OOM, halve until a chunk size works --------
@@ -2263,6 +2339,7 @@ def train_parallel_isodepth_model(
             latent_dim=latent_dim, model_label=model_label,
             initial_state=initial_state,
             gradient_scale_divisor=gradient_scale_divisor,
+            fixed_covariate_values=fixed_covariate_values,
         )
         return model, outputs, s_batched_np
     except torch.cuda.OutOfMemoryError:
@@ -2408,6 +2485,7 @@ def train_celltype_parallel_isodepth_model(
     metric_loss_mask_batched: Optional[np.ndarray] = None,
     latent_dim: int = 1,
     model_label: Optional[str] = None,
+    fixed_covariate_values: np.ndarray | None = None,
 ) -> tuple[nn.Module, BatchedTrainingOutputs, np.ndarray]:
     """Train a shared-encoder + per-cell-type-decoder model in parallel across permutations.
 
@@ -2508,7 +2586,15 @@ def train_celltype_parallel_isodepth_model(
     # Keep a_residual_t as an alias so the rest of the function body is unchanged.
     a_residual_t = a_targets_t
 
-    model = ParallelCellTypeIsoDepthNet(
+    model = ParallelCellTypeIsoDepthWithFixedCovariateNet(
+        total_models,
+        n_cell_types,
+        n_genes,
+        fixed_covariate_values,
+        latent_dim=latent_dim,
+        decoder_type=decoder_type,
+        encoder_type=encoder_type,
+    ).to(device) if fixed_covariate_values is not None else ParallelCellTypeIsoDepthNet(
         total_models,
         n_cell_types,
         n_genes,
@@ -2590,7 +2676,11 @@ def train_celltype_parallel_isodepth_model(
                 batch_mask = None if loss_mask_t is None else loss_mask_t.index_select(1, batch_indices)
 
                 optimizer.zero_grad()
-                batch_output = model.forward_masked(batch_s, batch_cell_type)
+                batch_output = model.forward_masked(
+                    batch_s,
+                    batch_cell_type,
+                    cell_indices=batch_indices if isinstance(model, ParallelCellTypeIsoDepthWithFixedCovariateNet) else None,
+                )
                 batch_loss_per_model = _compute_reconstruction_loss_per_model(
                     batch_output, batch_a, batch_mask, poisson_size_factors=batch_sf_ct
                 )
@@ -2647,13 +2737,25 @@ def train_celltype_parallel_isodepth_model(
         )
     )
 
-    compact_model = ParallelCellTypeIsoDepthNet(
-        n_models,
-        n_cell_types,
-        n_genes,
-        latent_dim=latent_dim,
-        decoder_type=decoder_type,
-        encoder_type=encoder_type,
+    compact_model = (
+        ParallelCellTypeIsoDepthWithFixedCovariateNet(
+            n_models,
+            n_cell_types,
+            n_genes,
+            model.covariate_values.detach().cpu().numpy().reshape(-1),
+            latent_dim=latent_dim,
+            decoder_type=decoder_type,
+            encoder_type=encoder_type,
+        )
+        if isinstance(model, ParallelCellTypeIsoDepthWithFixedCovariateNet)
+        else ParallelCellTypeIsoDepthNet(
+            n_models,
+            n_cell_types,
+            n_genes,
+            latent_dim=latent_dim,
+            decoder_type=decoder_type,
+            encoder_type=encoder_type,
+        )
     ).to(device)
     expanded_state = model.state_dict()
     compact_state = compact_model.state_dict()

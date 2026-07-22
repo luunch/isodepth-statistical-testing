@@ -1,0 +1,60 @@
+{
+  "data": {
+    "source": "h5ad",
+    "h5ad": "data/h5ad/calicost/HT112C1-U2_ST_Bn1.h5ad",
+    "spatial_key": "spatial",
+    "layer": "counts",
+    "use_raw": false,
+    "cell_type": "separate",
+    "cell_type_key": "calicost_clone_label",
+    "obs_drop_na": [
+      "calicost_clone_label",
+      "calicost_tumor_proportion"
+    ],
+    "covariate_whitening": "loss-difference",
+    "covariate_whitening_obs_key": "calicost_tumor_proportion",
+    "min_cells_per_gene": 3,
+    "min_cells_per_celltype": 30,
+    "top_var_genes": 3000,
+    "normalize_total": true,
+    "log1p": true,
+    "standardize_expression": true,
+    "standardize_coordinates": true,
+    "max_cells": null,
+    "seed": 42,
+    "obs_numeric_filters": {
+      "calicost_tumor_proportion": {
+        "gt": 0.7
+      }
+    },
+    "spatial_crop": {
+      "x": {
+        "gt": -3
+      }
+    },
+    "spatial_denoise_radius_um": 300
+  },
+  "test": {
+    "method": "parallel_permutation",
+    "metric": "nll_gaussian_mse",
+    "covariate": null,
+    "n_perms": 999,
+    "epochs": 500,
+    "n_reruns": 10,
+    "sgd_batch_size": 128,
+    "lr": 0.001,
+    "patience": 0,
+    "seed": 42,
+    "device": "cuda",
+    "decoder": "nn",
+    "batch_size": null,
+    "verbose": true,
+    "coordinate_um_per_unit": 59.79244843830744
+  },
+  "output": {
+    "out_dir": "results/calicost/HT112C1_U2_loss_difference_gt0p7",
+    "run_name": "loss_diff_gt0p7_cropx",
+    "save_preds": false,
+    "save_perm_stats": true
+  }
+}

@@ -9,6 +9,7 @@ import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 from matplotlib import colors as mcolors
 from matplotlib.collections import PolyCollection
+from matplotlib.lines import Line2D
 import numpy as np
 from scipy.ndimage import uniform_filter1d
 from scipy.stats import f as _f_dist
@@ -59,6 +60,106 @@ def _point_size(S: np.ndarray) -> float:
     return float(max(2, min(16, 500 / np.sqrt(n))))
 
 
+def _clone_overview_point_size(S: np.ndarray) -> float:
+    """Larger markers for CalicoST clone / tumor-proportion overview scatter plots."""
+    return float(max(28.0, _point_size(S) * 3.0))
+
+
+_CLONE_OVERVIEW_LOW_COLOR = np.asarray((0.851, 0.851, 0.851, 1.0), dtype=np.float32)  # paper Normal grey
+_CLONE_OVERVIEW_LEGEND_MARKERSIZE = 5.0
+
+# CalicoST Nature Fig. 4 clone palette (HT112C1 panel a; HT268B1 panel c uses clones 1–2).
+_CALICOST_PAPER_CLONE_HEX: dict[int, str] = {
+    1: "#66c2a5",  # teal
+    2: "#fc8d62",  # coral
+    3: "#8da0cb",  # slate blue
+}
+
+
+def _hex_rgba(hex_color: str, *, alpha: float = 1.0) -> np.ndarray:
+    rgb = mcolors.to_rgb(hex_color)
+    return np.asarray([rgb[0], rgb[1], rgb[2], alpha], dtype=np.float32)
+
+
+def _parse_calicost_clone_id(label_name: str) -> int | None:
+    text = str(label_name).strip()
+    if not text:
+        return None
+    try:
+        value = float(text)
+        if value == int(value):
+            return int(value)
+    except ValueError:
+        return None
+    return None
+
+
+def _calicost_clone_base_color(
+    label_name: str,
+    *,
+    fallback_index: int,
+    n_types: int,
+) -> np.ndarray:
+    clone_id = _parse_calicost_clone_id(label_name)
+    if clone_id is not None and clone_id in _CALICOST_PAPER_CLONE_HEX:
+        return _hex_rgba(_CALICOST_PAPER_CLONE_HEX[clone_id])
+    cmap = plt.cm.get_cmap("tab20" if n_types > 10 else "tab10")
+    return np.asarray(cmap(fallback_index / max(n_types - 1, 1)), dtype=np.float32)
+
+
+def _clone_overview_max_color(base_color: np.ndarray) -> np.ndarray:
+    """Vivid, fully opaque clone color at tumor proportion = 1."""
+    out = np.asarray(base_color, dtype=np.float32).copy()
+    out[:3] = np.clip(out[:3], 0.0, 1.0)
+    out[3] = 1.0
+    return out
+
+
+def _clone_tumor_proportion_blend_weights(weights: np.ndarray) -> np.ndarray:
+    """Map tumor proportion to blend weight; high values reach full color before tp=1."""
+    w = np.clip(np.asarray(weights, dtype=np.float32).reshape(-1), 0.0, 1.0)
+    return np.power(w, 0.7).reshape(-1, 1)
+
+
+def _clone_tumor_proportion_colors(
+    base_color: np.ndarray,
+    weights: np.ndarray,
+    *,
+    alpha: float = 1.0,
+) -> np.ndarray:
+    blend = _clone_tumor_proportion_blend_weights(weights)
+    max_color = _clone_overview_max_color(base_color)
+    colors = _CLONE_OVERVIEW_LOW_COLOR * (1.0 - blend) + max_color * blend
+    colors[:, 3] = alpha
+    return colors
+
+
+def _clone_legend_handles(
+    names: list[str],
+    base_colors: list[np.ndarray],
+    *,
+    markersize: float = _CLONE_OVERVIEW_LEGEND_MARKERSIZE,
+) -> list[Line2D]:
+    """Legend swatches at full clone color (tumor proportion = 1), not point-averaged."""
+    handles: list[Line2D] = []
+    for name, base_color in zip(names, base_colors):
+        face = _clone_overview_max_color(np.asarray(base_color, dtype=np.float32))
+        handles.append(
+            Line2D(
+                [0],
+                [0],
+                marker="o",
+                linestyle="None",
+                markerfacecolor=face,
+                markeredgecolor=face,
+                markeredgewidth=0.0,
+                markersize=markersize,
+                label=name,
+            )
+        )
+    return handles
+
+
 def _spatial_axis_limits(
     S: np.ndarray,
     *,
@@ -73,6 +174,24 @@ def _spatial_axis_limits(
     return (
         (float(mins[0] - pad[0]), float(maxs[0] + pad[0])),
         (float(mins[1] - pad[1]), float(maxs[1] + pad[1])),
+    )
+
+
+def _square_spatial_axis_limits(
+    S: np.ndarray,
+    *,
+    padding_frac: float = 0.02,
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Square axis limits with the same numeric span for x and y."""
+    coords = np.asarray(S, dtype=np.float64)
+    mins = coords.min(axis=0)
+    maxs = coords.max(axis=0)
+    center = (mins + maxs) / 2.0
+    span = float(max(np.max(maxs - mins), 1e-8))
+    half_span = span * (0.5 + float(padding_frac))
+    return (
+        (float(center[0] - half_span), float(center[0] + half_span)),
+        (float(center[1] - half_span), float(center[1] + half_span)),
     )
 
 
@@ -656,23 +775,477 @@ def save_celltype_dataset_plot(
     labels = np.asarray(cell_type_labels, dtype=np.int64)
     S = np.asarray(dataset.S, dtype=np.float32)
     n_types = len(cell_type_names)
+    tumor_prop = dataset.meta.get("calicost_tumor_proportion")
+    tumor_prop_arr = None
+    if tumor_prop is not None:
+        tumor_prop_arr = np.asarray(tumor_prop, dtype=np.float32).reshape(-1)
+        if tumor_prop_arr.shape[0] != S.shape[0]:
+            tumor_prop_arr = None
 
-    cmap = plt.cm.get_cmap("tab20" if n_types > 10 else "tab10")
     fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+    legend_names: list[str] = []
+    legend_base_colors: list[np.ndarray] = []
     for c in range(n_types):
         mask = labels == c
+        if not np.any(mask):
+            continue
+        base_color = _calicost_clone_base_color(
+            cell_type_names[c],
+            fallback_index=c,
+            n_types=n_types,
+        )
+        colors = [base_color]
+        alpha = 0.7
+        if tumor_prop_arr is not None:
+            colors = _clone_tumor_proportion_colors(base_color, tumor_prop_arr[mask])
+            alpha = None
+        ax.scatter(
+            S[mask, 0],
+            S[mask, 1],
+            c=colors,
+            s=_clone_overview_point_size(S),
+            alpha=alpha,
+            linewidths=0,
+        )
+        legend_names.append(cell_type_names[c])
+        legend_base_colors.append(base_color)
+    if tumor_prop_arr is not None:
+        ax.set_title("CalicoST Clones (Color Intensity = Tumor Proportion)")
+    else:
+        ax.set_title("Dataset Colored by Cell Type")
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_aspect("equal")
+    ax.legend(
+        handles=_clone_legend_handles(legend_names, legend_base_colors),
+        loc="center left",
+        bbox_to_anchor=(1.0, 0.5),
+        fontsize="x-small",
+        frameon=False,
+    )
+    fig.tight_layout()
+    out_path = Path(out_path)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def _covariate_scatter_panel(
+    ax,
+    S: np.ndarray,
+    values: np.ndarray,
+    title: str,
+    *,
+    colorbar_label: str,
+    vmin: float | None = None,
+    vmax: float | None = None,
+):
+    """Plain continuous-colormap scatter of raw (unnormalized) covariate values (white to dark red)."""
+    scatter = ax.scatter(
+        S[:, 0],
+        S[:, 1],
+        c=values,
+        cmap="Reds",
+        vmin=vmin,
+        vmax=vmax,
+        s=_clone_overview_point_size(S),
+        linewidths=0,
+    )
+    ax.set_title(title)
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_aspect("equal")
+    plt.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04, label=colorbar_label)
+    return scatter
+
+
+def save_covariate_whitening_spatial_plot(
+    dataset: DatasetBundle,
+    out_path: str | Path,
+) -> Path | None:
+    """Spatial map of the raw ``data.covariate_whitening`` obs column (e.g. tumor proportion).
+
+    Shows the untransformed obs values on a real (non-normalized) colorbar, independent
+    of any clone/cell-type color coding, so the covariate can be inspected on its own scale.
+    One panel per cell type (shared color scale) when the dataset used
+    ``cell_type='separate'``; otherwise a single panel over all cells. Returns ``None``
+    when the run does not use ``data.covariate_whitening``.
+    """
+    cov_values = dataset.meta.get("covariate_whitening_values")
+    obs_key = dataset.meta.get("covariate_whitening_obs_key")
+    if cov_values is None or not obs_key:
+        return None
+
+    S = np.asarray(dataset.S, dtype=np.float32)
+    cov = np.asarray(cov_values, dtype=np.float64).reshape(-1)
+    if cov.shape[0] != S.shape[0]:
+        return None
+    finite = np.isfinite(cov)
+    if not finite.any():
+        return None
+    vmin = float(cov[finite].min())
+    vmax = float(cov[finite].max())
+
+    cell_type_labels = dataset.meta.get("cell_type_labels")
+    cell_type_names = dataset.meta.get("cell_type_names")
+    use_grid = (
+        dataset.meta.get("cell_type_mode") == "separate"
+        and cell_type_labels is not None
+        and cell_type_names
+    )
+
+    if use_grid:
+        labels = np.asarray(cell_type_labels, dtype=np.int64)
+        n_types = len(cell_type_names)
+        fig, axes = plt.subplots(1, n_types, figsize=(4.6 * n_types, 4.6), squeeze=False)
+        for c in range(n_types):
+            ax = axes[0, c]
+            mask = labels == c
+            if not np.any(mask):
+                ax.axis("off")
+                continue
+            _covariate_scatter_panel(
+                ax,
+                S[mask],
+                cov[mask],
+                str(cell_type_names[c]),
+                colorbar_label=obs_key,
+                vmin=vmin,
+                vmax=vmax,
+            )
+        fig.suptitle(f"Covariate: {obs_key}")
+    else:
+        fig, ax = plt.subplots(1, 1, figsize=(6.8, 5.4))
+        _covariate_scatter_panel(
+            ax, S, cov, f"Covariate: {obs_key}", colorbar_label=obs_key,
+            vmin=vmin, vmax=vmax,
+        )
+
+    fig.tight_layout()
+    out_path = Path(out_path)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_single_type_covariate_plot(
+    S: np.ndarray,
+    values: np.ndarray,
+    out_path: str | Path,
+    *,
+    covariate_label: str,
+    type_name: str,
+) -> Path | None:
+    """Single-panel raw-covariate scatter for one cell type's spots (own color scale)."""
+    S = np.asarray(S, dtype=np.float32)
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    if S.shape[0] == 0 or values.shape[0] != S.shape[0]:
+        return None
+    finite = np.isfinite(values)
+    if not finite.any():
+        return None
+
+    fig, ax = plt.subplots(1, 1, figsize=(6.2, 5.0))
+    _covariate_scatter_panel(
+        ax,
+        S,
+        values,
+        f"{type_name}: {covariate_label}",
+        colorbar_label=covariate_label,
+        vmin=float(values[finite].min()),
+        vmax=float(values[finite].max()),
+    )
+    fig.tight_layout()
+    out_path = Path(out_path)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def _numeric_filter_label(obs_key: str, filter_spec: dict) -> str:
+    op_labels = {
+        "gt": ">",
+        "ge": ">=",
+        "gte": ">=",
+        "lt": "<",
+        "le": "<=",
+        "lte": "<=",
+        "eq": "=",
+        "ne": "!=",
+    }
+    parts = []
+    for op, threshold in filter_spec.items():
+        parts.append(f"{obs_key} {op_labels.get(str(op), str(op))} {threshold:g}")
+    return " and ".join(parts)
+
+
+def save_obs_numeric_filter_histogram(
+    values: np.ndarray,
+    keep_mask: np.ndarray,
+    obs_key: str,
+    filter_spec: dict,
+    out_path: str | Path,
+    *,
+    subset_label: str | None = None,
+) -> Path | None:
+    """Histogram of an obs numeric filter variable for all pre-threshold cells."""
+    del keep_mask, filter_spec  # retained for call-site compatibility
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    if values.shape[0] == 0:
+        return None
+
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return None
+
+    fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    bins = max(10, min(50, int(np.sqrt(values.size)) + 1))
+    ax.hist(values, bins=bins, color="#4C72B0", edgecolor="white", linewidth=0.6)
+
+    title = obs_key if subset_label is None else f"{obs_key} ({subset_label})"
+    ax.set_title(title)
+    ax.set_xlabel(obs_key)
+    ax.set_ylabel("Number of cells")
+    fig.tight_layout()
+    out_path = Path(out_path)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_obs_numeric_filter_diagnostic_plot(
+    S: np.ndarray,
+    *,
+    labels: np.ndarray | None,
+    label_names: list[str] | None,
+    values: np.ndarray,
+    keep_mask: np.ndarray,
+    obs_key: str,
+    filter_spec: dict,
+    out_path: str | Path,
+    label_title: str = "CNV clone",
+) -> Path | None:
+    """Two-panel pre/post view for an obs numeric threshold.
+
+    Left panel shows all pre-threshold spots colored by label, with color intensity
+    scaled by the numeric obs value. Right panel shows kept spots (solid clone color)
+    vs removed spots (faint grey).
+    """
+    S = np.asarray(S, dtype=np.float32)
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    keep_mask = np.asarray(keep_mask, dtype=bool).reshape(-1)
+    if S.ndim != 2 or S.shape[1] != 2 or S.shape[0] == 0:
+        return None
+    if values.shape[0] != S.shape[0] or keep_mask.shape[0] != S.shape[0]:
+        return None
+
+    if labels is not None:
+        labels_arr = np.asarray(labels, dtype=np.int64).reshape(-1)
+        if labels_arr.shape[0] != S.shape[0]:
+            labels_arr = None
+    else:
+        labels_arr = None
+
+    finite_values = values[np.isfinite(values)]
+    if finite_values.size:
+        weights = np.clip(values, 0.0, 1.0)
+    else:
+        weights = np.ones(S.shape[0], dtype=np.float32)
+
+    threshold_text = _numeric_filter_label(obs_key, filter_spec)
+    point_size = _clone_overview_point_size(S)
+    limits = _square_spatial_axis_limits(S)
+
+    # Dynamic figsize: make each panel roughly square based on the data aspect.
+    # _square_spatial_axis_limits already equalises x/y span, so each panel IS square
+    # in data space. We size the figure so the rendered panels are square in inches.
+    span = limits[0][1] - limits[0][0]          # same for x and y (already equal)
+    x_span = (limits[0][1] - limits[0][0])
+    y_span = (limits[1][1] - limits[1][0])
+    # Per-panel height in inches; width follows the data aspect ratio
+    panel_h = 5.5
+    panel_w = panel_h * (x_span / y_span)
+    fig_w = panel_w * 2 + 2.0   # 2 panels + inner gap + outer margins
+    fig_h = panel_h + 1.2       # panel + title / xlabel headroom
+
+    fig, axes = plt.subplots(1, 2, figsize=(fig_w, fig_h), sharex=True, sharey=True)
+
+    # --- Left panel: all spots, clone colour × tumor-proportion intensity ---
+    ax = axes[0]
+    legend_names: list[str] = []
+    legend_base_colors: list[np.ndarray] = []
+    if labels_arr is not None:
+        unique_labels = np.unique(labels_arr)
+        n_types = len(unique_labels)
+        resolved_names = list(label_names or [])
+        for i, label in enumerate(unique_labels):
+            mask = labels_arr == label
+            label_name = (
+                str(resolved_names[int(label)])
+                if 0 <= int(label) < len(resolved_names)
+                else str(label)
+            )
+            base_color = _calicost_clone_base_color(
+                label_name, fallback_index=i, n_types=n_types
+            )
+            colors = _clone_tumor_proportion_colors(base_color, weights[mask])
+            ax.scatter(S[mask, 0], S[mask, 1], c=colors, s=point_size, linewidths=0)
+            legend_names.append(label_name)
+            legend_base_colors.append(base_color)
+        ax.legend(
+            handles=_clone_legend_handles(legend_names, legend_base_colors),
+            title=label_title,
+            loc="lower right",
+            fontsize="x-small",
+            title_fontsize="x-small",
+            frameon=True,
+            framealpha=0.75,
+        )
+    else:
+        scatter = ax.scatter(
+            S[:, 0], S[:, 1], c=values, cmap="viridis",
+            s=point_size, alpha=0.9, linewidths=0,
+        )
+        fig.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04, label=obs_key)
+    ax.set_title(f"All Spots by {label_title}\nColor intensity = {obs_key}")
+
+    # --- Right panel: kept (solid clone colour) vs removed (faint grey) ---
+    ax = axes[1]
+    dropped_mask = ~keep_mask
+    dropped_size = max(point_size * 0.55, 8.0)
+
+    # Removed spots: uniform faint grey, plotted first (background)
+    if np.any(dropped_mask):
+        ax.scatter(
+            S[dropped_mask, 0], S[dropped_mask, 1],
+            c="#c8c8c8", s=dropped_size, linewidths=0,
+            alpha=0.45, zorder=1,
+        )
+
+    # Kept spots: solid clone colour, foreground
+    if labels_arr is not None:
+        unique_labels = np.unique(labels_arr)
+        n_types = len(unique_labels)
+        resolved_names = list(label_names or [])
+        for i, label in enumerate(unique_labels):
+            label_mask = labels_arr == label
+            kept_label_mask = label_mask & keep_mask
+            if not np.any(kept_label_mask):
+                continue
+            label_name = (
+                str(resolved_names[int(label)])
+                if 0 <= int(label) < len(resolved_names)
+                else str(label)
+            )
+            base_color = _calicost_clone_base_color(
+                label_name, fallback_index=i, n_types=n_types
+            )
+            clone_colors = _clone_tumor_proportion_colors(base_color, weights[kept_label_mask], alpha=1.0)
+            ax.scatter(
+                S[kept_label_mask, 0], S[kept_label_mask, 1],
+                c=clone_colors, s=point_size, linewidths=0,
+                zorder=2,
+            )
+    else:
+        if np.any(keep_mask):
+            scatter = ax.scatter(
+                S[keep_mask, 0], S[keep_mask, 1],
+                c=values[keep_mask], cmap="viridis",
+                s=point_size, alpha=0.95, linewidths=0, zorder=2,
+            )
+
+    # Legend: grey swatch = left out, dark dot = kept
+    ax.scatter([], [], c="#c8c8c8", s=14, linewidths=0,
+               label=f"left out (n={int(dropped_mask.sum())})")
+    ax.scatter([], [], c="#555555", s=14, linewidths=0,
+               label=f"kept (n={int(keep_mask.sum())})")
+    ax.legend(
+        loc="lower right",
+        fontsize="x-small",
+        frameon=True,
+        framealpha=0.75,
+    )
+    ax.set_title(f"Threshold Selection\n{threshold_text}")
+
+    for ax in axes:
+        ax.set_xlabel("x")
+        ax.set_ylabel("y")
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlim(*limits[0])
+        ax.set_ylim(*limits[1])
+
+    fig.tight_layout()
+    out_path = Path(out_path)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_spatial_region_split_plot(
+    dataset: DatasetBundle,
+    out_path: str | Path,
+) -> Path | None:
+    """Overview of spatial region splitting: grey kept spots, red removed, colored regions."""
+    diag = dataset.meta.get("spatial_region_split_diag")
+    if not diag:
+        return None
+
+    S = np.asarray(diag["S"], dtype=np.float32)
+    removed = np.asarray(diag["removed"], dtype=bool)
+    region_color_ids = np.asarray(diag["region_color_ids"], dtype=np.int64)
+    region_color_names = list(diag.get("region_color_names") or [])
+    algorithm = str(diag.get("algorithm", "spatial region split"))
+    point_size = _point_size(S)
+
+    kept = ~removed
+    grey_mask = kept & (region_color_ids < 0)
+    removed_mask = removed
+
+    n_colors = len(region_color_names)
+    cmap = plt.cm.get_cmap("tab20" if n_colors > 10 else "tab10")
+
+    fig, ax = plt.subplots(1, 1, figsize=(8, 6))
+
+    if np.any(grey_mask):
+        ax.scatter(
+            S[grey_mask, 0],
+            S[grey_mask, 1],
+            c="#b0b0b0",
+            s=point_size,
+            label="kept",
+            alpha=0.85,
+            linewidths=0,
+            zorder=1,
+        )
+
+    for color_id, region_name in enumerate(region_color_names):
+        mask = kept & (region_color_ids == color_id)
         if not np.any(mask):
             continue
         ax.scatter(
             S[mask, 0],
             S[mask, 1],
-            c=[cmap(c / max(n_types - 1, 1))],
-            s=_point_size(S),
-            label=cell_type_names[c],
-            alpha=0.7,
+            c=[cmap(color_id / max(n_colors - 1, 1))],
+            s=point_size,
+            label=region_name,
+            alpha=0.85,
             linewidths=0,
+            zorder=2,
         )
-    ax.set_title("Dataset Colored by Cell Type")
+
+    if np.any(removed_mask):
+        ax.scatter(
+            S[removed_mask, 0],
+            S[removed_mask, 1],
+            c="#d62728",
+            s=point_size,
+            label="removed (noise / below min_cells)",
+            alpha=0.95,
+            linewidths=0,
+            zorder=3,
+        )
+
+    ax.set_title(f"Spatial Region Split ({algorithm})")
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_aspect("equal")
@@ -688,6 +1261,16 @@ def save_celltype_dataset_plot(
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return out_path
+
+
+def save_celltype_or_spatial_split_plot(
+    dataset: DatasetBundle,
+    out_path: str | Path,
+) -> Path | None:
+    """Save spatial split overview when available, otherwise cell-type scatter."""
+    if dataset.meta.get("spatial_region_split_diag"):
+        return save_spatial_region_split_plot(dataset, out_path)
+    return save_celltype_dataset_plot(dataset, out_path)
 
 
 def save_synthetic_true_curve_plot(
@@ -739,13 +1322,17 @@ def save_synthetic_true_curve_plot(
 def save_synthetic_kernel_plot(
     dataset: DatasetBundle,
     out_path: "str | Path",
-) -> "Path | None":
-    """Two-panel diagnostic for the spatial autocorrelation kernel.
+) -> "dict[str, Path] | None":
+    """Kernel diagnostics as two separate, normally-sized figures.
 
-    Panel 1 — Correlation curve: ``corr(r) = δ·exp(-r/p) / (1+δ)`` vs. r (µm).
-    Panel 2 — Spatial noise draw: one gene's draw from N(0, σ²·C) on the tissue grid.
+    Writes ``{run}_kernel_correlation.png`` (decay curve) and
+    ``{run}_kernel_noise_sample.png`` (square spatial noise draw).
 
-    Returns the saved path or None if the dataset has no kernel metadata.
+    *out_path* may be the legacy ``*_kernel_diagnostics.png`` path (used only to
+    derive the output directory and run-name prefix); the combined file is no
+    longer written.
+
+    Returns a dict of saved paths or None if the dataset has no kernel metadata.
     """
     if dataset.meta.get("source") != "synthetic":
         return None
@@ -755,20 +1342,37 @@ def save_synthetic_kernel_plot(
     delta = float(dataset.meta.get("delta", 0.0))
     scale_um = float(dataset.meta.get("scale_um", 1.0))
     p = float(kernel_meta["distance"])
+    kernel_type = str(kernel_meta.get("type", "exp"))
     r_max_explicit = kernel_meta.get("max_interaction_distance")
-    r_max = float(r_max_explicit) if r_max_explicit is not None else 4.0 * p
+    if kernel_type == "trunc":
+        r_max = float(r_max_explicit) if r_max_explicit is not None else p
+    else:
+        r_max = float(r_max_explicit) if r_max_explicit is not None else 4.0 * p
     local_fraction = delta / (1.0 + delta)
 
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    out_path = Path(out_path)
+    prefix = out_path.name.replace("_kernel_diagnostics.png", "").replace(".png", "")
+    corr_path = out_path.parent / f"{prefix}_kernel_correlation.png"
+    noise_path = out_path.parent / f"{prefix}_kernel_noise_sample.png"
 
-    # ── Panel 1: correlation curve ────────────────────────────────────────
-    ax = axes[0]
+    # ── Correlation curve ─────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(5.5, 3.8))
     r = np.linspace(0.0, r_max * 1.05, 400)
-    corr = delta * np.exp(-r / p) / (1.0 + delta)
-    ax.plot(r, corr, color="steelblue", lw=2, label=r"$\delta \cdot e^{-r/p}\,/\,(1+\delta)$")
-    ax.axvline(p, color="gray", lw=1.2, ls="--", label=f"$p$ = {p:g} µm")
-    if r_max_explicit is not None:
+    if kernel_type == "trunc":
+        k_shape = np.where(r <= r_max, 1.0, 0.0)
+        corr = delta * k_shape / (1.0 + delta)
+        ax.plot(r, corr, color="steelblue", lw=2, label=r"$\delta / (1+\delta)$ for $d \leq r_{\max}$")
         ax.axvline(r_max, color="tomato", lw=1.2, ls="--", label=f"cutoff = {r_max:g} µm")
+        if r_max_explicit is not None and abs(r_max - p) > 1e-9:
+            ax.axvline(p, color="gray", lw=1.2, ls="--", label=f"$p$ = {p:g} µm")
+        title = f"Kernel: trunc, p={p:g} µm, cutoff={r_max:g} µm, δ={delta:g}"
+    else:
+        corr = delta * np.exp(-r / p) / (1.0 + delta)
+        ax.plot(r, corr, color="steelblue", lw=2, label=r"$\delta \cdot e^{-r/p}\,/\,(1+\delta)$")
+        ax.axvline(p, color="gray", lw=1.2, ls="--", label=f"$p$ = {p:g} µm")
+        if r_max_explicit is not None:
+            ax.axvline(r_max, color="tomato", lw=1.2, ls="--", label=f"cutoff = {r_max:g} µm")
+        title = f"Kernel: exp, p={p:g} µm, δ={delta:g}"
     ax.axhline(local_fraction, color="steelblue", lw=0.8, ls=":", alpha=0.6)
     ax.annotate(
         f"local fraction\n$\\delta/(1+\\delta)$ = {local_fraction:.2f}",
@@ -779,64 +1383,68 @@ def save_synthetic_kernel_plot(
     )
     ax.set_xlabel("Distance (µm)")
     ax.set_ylabel("Spatial correlation")
-    ax.set_title(f"Kernel: exp, p={p:g} µm, δ={delta:g}")
+    ax.set_title(title)
     ax.set_ylim(bottom=0)
     ax.legend(fontsize=8)
+    fig.tight_layout()
+    fig.savefig(corr_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
-    # ── Panel 2: single noise draw on tissue grid ─────────────────────────
-    ax2 = axes[1]
+    # ── Spatial noise sample (square axes, scatter at cell coords) ────────
+    # Noise is one value per cell (same ordering as ``dataset.S``). Plot with
+    # scatter like the dataset/isodepth panels — not imshow reshape, which
+    # falsely renders a filled pixel grid even when cells are irregular.
+    fig, ax = plt.subplots(figsize=(5.0, 5.0))
     noise_sample = dataset.meta.get("kernel_noise_sample")
     S = np.asarray(dataset.S, dtype=np.float32)
+    spatial_extent = (0.0, scale_um, 0.0, scale_um)
+    sigma = dataset.meta.get("sigma")
+    sigma_label = f"{float(sigma):g}" if sigma is not None else "?"
     if noise_sample is not None:
         noise = np.asarray(noise_sample, dtype=np.float32)
-        gh = int(dataset.meta.get("grid_height", 0) or 0)
-        gw = int(dataset.meta.get("grid_width", 0) or 0)
-        if gh > 0 and gw > 0 and gh * gw == len(noise):
-            grid = noise.reshape(gh, gw)
-            vmax = float(np.abs(grid).max()) or 1.0
-            im = ax2.imshow(
-                grid,
-                cmap="RdBu_r",
-                vmin=-vmax,
-                vmax=vmax,
-                origin="lower",
-                extent=[0, scale_um, 0, scale_um * gh / gw],
+        if noise.shape[0] != S.shape[0]:
+            ax.text(
+                0.5, 0.5,
+                f"noise length {noise.shape[0]} != n_cells {S.shape[0]}",
+                ha="center", va="center", transform=ax.transAxes, color="gray",
             )
-            plt.colorbar(im, ax=ax2, shrink=0.8)
-            # circle of radius p at tissue centre
-            cx = scale_um * 0.5
-            cy = scale_um * gh / gw * 0.5
-            circle = plt.Circle((cx, cy), p, fill=False, color="white", lw=1.5, ls="--")
-            ax2.add_patch(circle)
-            ax2.set_xlabel("x (µm)")
-            ax2.set_ylabel("y (µm)")
         else:
-            sc = ax2.scatter(
+            vmax = float(np.abs(noise).max()) or 1.0
+            sc = ax.scatter(
                 S[:, 0] * scale_um,
                 S[:, 1] * scale_um,
                 c=noise,
                 cmap="RdBu_r",
-                s=6,
-                vmin=-float(np.abs(noise).max()),
-                vmax=float(np.abs(noise).max()),
+                s=_point_size(S),
+                vmin=-vmax,
+                vmax=vmax,
+                linewidths=0,
+                alpha=0.9,
             )
-            plt.colorbar(sc, ax=ax2, shrink=0.8)
-            ax2.set_xlabel("x (µm)")
-            ax2.set_ylabel("y (µm)")
+            plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+            cx = scale_um * 0.5
+            cy = scale_um * 0.5
+            circle = plt.Circle((cx, cy), p, fill=False, color="black", lw=1.2, ls="--")
+            ax.add_patch(circle)
+        ax.set_xlim(spatial_extent[0], spatial_extent[1])
+        ax.set_ylim(spatial_extent[2], spatial_extent[3])
+        ax.set_xlabel("x (µm)")
+        ax.set_ylabel("y (µm)")
     else:
-        ax2.text(0.5, 0.5, "noise sample not available", ha="center", va="center",
-                 transform=ax2.transAxes, color="gray")
-    ax2.set_title(f"Sample correlated noise (1 gene, σ={dataset.meta.get('sigma', '?'):g})")
-
-    fig.suptitle(
-        f"Spatial kernel diagnostics — δ={delta:g}, local fraction={local_fraction:.2f}",
-        fontsize=11,
-    )
+        ax.text(
+            0.5, 0.5, "noise sample not available",
+            ha="center", va="center", transform=ax.transAxes, color="gray",
+        )
+    ax.set_title(f"Correlated noise (1 gene, σ={sigma_label}, δ={delta:g})")
+    ax.set_aspect("equal", adjustable="box")
     fig.tight_layout()
-    out_path = Path(out_path)
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    fig.savefig(noise_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
-    return out_path
+
+    return {
+        "kernel_correlation_plot": corr_path,
+        "kernel_noise_sample_plot": noise_path,
+    }
 
 
 def _format_stat_suffix(label: str, value: Any) -> str:
@@ -1090,6 +1698,44 @@ def save_true_rerun_isodepth_grid(
     for axis in axes.flat[n_panels:]:
         axis.axis("off")
 
+    fig.tight_layout()
+    out_path = Path(out_path)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_freedman_lane_covariate_plot(
+    dataset: DatasetBundle,
+    result: TestResult,
+    out_path: str | Path,
+) -> Path | None:
+    """Spatial maps of the Freedman–Lane covariate and decoder expression predictions."""
+    cov_values = result.artifacts.get("freedman_lane_covariate_values")
+    pred = result.artifacts.get("freedman_lane_pred")
+    if cov_values is None or pred is None:
+        return None
+
+    spatial = np.asarray(dataset.S, dtype=np.float32)
+    cov = np.asarray(cov_values, dtype=np.float64).reshape(-1)
+    pred_mean = np.asarray(pred, dtype=np.float64).mean(axis=1)
+    obs_key = str(result.artifacts.get("freedman_lane_obs_key", "covariate"))
+
+    fig, axes = plt.subplots(1, 2, figsize=(11.0, 4.8), squeeze=False)
+    _plot_spatial_isodepth(
+        axes[0, 0],
+        spatial,
+        cov,
+        f"Covariate: {obs_key}",
+        colorbar_label=obs_key,
+    )
+    _plot_spatial_isodepth(
+        axes[0, 1],
+        spatial,
+        pred_mean,
+        "Decoder predictions (gene mean)",
+        colorbar_label="Mean predicted expression",
+    )
     fig.tight_layout()
     out_path = Path(out_path)
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
@@ -2224,19 +2870,36 @@ def _gene_display_name(meta: dict[str, Any], gene_idx: int) -> str:
     return f"gene_{gene_idx}"
 
 
+def _expression_preprocessing_kind(meta: dict[str, Any] | None) -> str:
+    """Semantic preprocessing tag for expression axis / colorbar labels."""
+    if meta is None:
+        return "unknown"
+    if meta.get("q") is not None or meta.get("feature_space") == "poisson_low_rank_latent":
+        return "poisson_latent"
+    if meta.get("source") == "synthetic" and meta.get("expression_distribution") == "gaussian":
+        return "z_scored"
+    log1p = bool(meta.get("log1p", False))
+    standardized = bool(meta.get("standardize_expression", False))
+    if log1p and standardized:
+        return "log_z_scored"
+    if log1p:
+        return "log"
+    if standardized:
+        return "z_scored"
+    return "raw_counts"
+
+
 def _expression_y_axis_label(meta: dict[str, Any]) -> str:
     """Describe ``dataset.A`` columns (model input / observed expression space)."""
-    if meta.get("q") is not None:
+    kind = _expression_preprocessing_kind(meta)
+    if kind == "poisson_latent":
         return "Feature value (Poisson low-rank latent)"
-    if meta.get("feature_space") == "poisson_low_rank_latent":
-        return "Feature value (Poisson low-rank latent)"
-    parts: list[str] = []
-    if meta.get("log1p"):
-        parts.append("log₁p")
-    if meta.get("standardize_expression"):
-        parts.append("z-scored")
-    if parts:
-        return "Expression (" + ", ".join(parts) + ")"
+    if kind == "log_z_scored":
+        return "Expression (log₁p, z-scored)"
+    if kind == "log":
+        return "Expression (log₁p)"
+    if kind == "z_scored":
+        return "Expression (z-scored)"
     return "Expression"
 
 
@@ -3211,15 +3874,16 @@ def save_gene_expression_vs_coordinates_comparison(
 
 def _expression_label(meta: dict | None) -> str:
     """Human-readable colorbar label describing the expression normalisation."""
-    if meta is None:
+    kind = _expression_preprocessing_kind(meta)
+    if kind == "unknown":
         return "Expression"
-    log1p = bool(meta.get("log1p", False))
-    standardized = bool(meta.get("standardize_expression", False))
-    if log1p and standardized:
+    if kind == "poisson_latent":
+        return "Feature value (Poisson low-rank latent)"
+    if kind == "log_z_scored":
         return "Log-norm. standardized expression"
-    if log1p:
+    if kind == "log":
         return "Log-norm. expression"
-    if standardized:
+    if kind == "z_scored":
         return "Standardized expression"
     return "Expression (raw counts)"
 
@@ -3394,14 +4058,20 @@ def save_block_permutation_overlay(
     *,
     run_name: str = "",
     radius_units: float | None = None,
+    block_shape: str = "hexagon",
 ) -> Path | None:
-    """Two-panel diagnostic: true layout with hex mesh, then a sample centroid permutation.
+    """Two-panel diagnostic: true layout with block mesh, then a sample centroid permutation.
 
-    Left panel shows cells on the tissue with the hex block mesh drawn on top.
+    Left panel shows cells on the tissue with the block mesh drawn on top.
     Right panel (when provided) colours cells by their *original* block ID at permuted
     coordinates so it is clear how blocks were scrambled.
     """
-    from methods.block_permutation import hex_polygons_for_block_ids
+    from matplotlib.collections import LineCollection
+
+    from methods.block_permutation import (
+        block_polygons_for_block_ids,
+        square_block_grid_line_segments,
+    )
 
     out_path = Path(out_path)
     S_true = np.asarray(S_true, dtype=np.float32)
@@ -3411,6 +4081,7 @@ def save_block_permutation_overlay(
     n_panels = 2 if S_permuted is not None else 1
     spatial_limits = _spatial_axis_limits(S_true)
     ps = _point_size(S_true)
+    shape_label = "square" if block_shape == "square" else "hex"
 
     block_ids_arr: np.ndarray | None = None
     block_colors: np.ndarray | None = None
@@ -3439,22 +4110,43 @@ def save_block_permutation_overlay(
         rasterized=True,
         zorder=1,
     )
-    if block_ids_arr is not None and radius_units is not None and float(radius_units) > 0:
-        hex_polys = hex_polygons_for_block_ids(block_ids_arr, float(radius_units))
-        if hex_polys:
-            mesh = PolyCollection(
-                hex_polys,
-                facecolors="none",
-                edgecolors="#404040",
-                linewidths=0.45,
-                alpha=0.85,
-                zorder=2,
+    if radius_units is not None and float(radius_units) > 0:
+        radius = float(radius_units)
+        if block_shape == "square":
+            grid_lines = square_block_grid_line_segments(
+                radius,
+                x_min=float(xlim[0]),
+                x_max=float(xlim[1]),
+                y_min=float(ylim[0]),
+                y_max=float(ylim[1]),
             )
-            ax_true.add_collection(mesh)
+            if grid_lines:
+                mesh = LineCollection(
+                    grid_lines,
+                    colors="#404040",
+                    linewidths=0.45,
+                    alpha=0.85,
+                    zorder=2,
+                )
+                ax_true.add_collection(mesh)
+        elif block_ids_arr is not None:
+            block_polys = block_polygons_for_block_ids(
+                block_ids_arr, radius, block_shape=block_shape,
+            )
+            if block_polys:
+                mesh = PolyCollection(
+                    block_polys,
+                    facecolors="none",
+                    edgecolors="#404040",
+                    linewidths=0.45,
+                    alpha=0.85,
+                    zorder=2,
+                )
+                ax_true.add_collection(mesh)
     ax_true.set_aspect("equal")
     ax_true.set_xlabel("x")
     ax_true.set_ylabel("y")
-    ax_true.set_title(f"True layout — {n_blocks} hex blocks")
+    ax_true.set_title(f"True layout — {n_blocks} {shape_label} blocks")
     ax_true.set_xlim(float(xlim[0]), float(xlim[1]))
     ax_true.set_ylim(float(ylim[0]), float(ylim[1]))
 
@@ -3498,6 +4190,7 @@ def save_block_permutation_overlay(
         title_parts = [f"Block permutation overlay — {run_name}"]
     if radius_units is not None:
         title_parts.append(f"radius = {radius_units:.1f} coord units")
+    title_parts.append(f"shape = {block_shape}")
     fig.suptitle("  ".join(title_parts), fontsize=11)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3567,3 +4260,261 @@ def save_permutation_null_comparison(
     plt.close(fig)
     return out_path
 
+
+def save_msr_surrogate_example_plot(
+    dataset: "DatasetBundle",
+    result: "TestResult",
+    out_path: "str | Path",
+    *,
+    n_genes: int = 5,
+) -> "Path | None":
+    """Two-row spatial scatter: real expression (row 1) vs MSR surrogate (row 2).
+
+    Genes are selected by descending absolute Spearman correlation with the
+    true isodepth, giving the most spatially structured genes.
+
+    Parameters
+    ----------
+    dataset : DatasetBundle with the real expression matrix (``dataset.A``).
+    result : TestResult with ``artifacts["msr_surrogate_example"]`` and
+             ``artifacts["true_isodepth"]``.
+    out_path : destination path for the PNG.
+    n_genes : number of top genes to display (default 5).
+    """
+    A_surr = result.artifacts.get("msr_surrogate_example")
+    true_isodepth = result.artifacts.get("true_isodepth")
+    if A_surr is None or true_isodepth is None:
+        return None
+
+    out_path = Path(out_path)
+    A_real = np.asarray(dataset.A, dtype=np.float32)
+    A_surr = np.asarray(A_surr, dtype=np.float32)
+    isodepth = np.asarray(true_isodepth, dtype=np.float32).reshape(-1)
+    S = np.asarray(dataset.S, dtype=np.float32)
+    G = A_real.shape[1]
+    n_genes = min(int(n_genes), G)
+
+    # rank genes by |Spearman r| with isodepth
+    rhos = np.array(
+        [float(abs(spearmanr(isodepth, A_real[:, g]).statistic)) for g in range(G)],
+        dtype=np.float32,
+    )
+    top_indices = np.argsort(rhos)[::-1][:n_genes]
+
+    gene_names = dataset.meta.get("var_names") or dataset.meta.get("gene_names", [])
+    ps = _point_size(S)
+    color_limits = []
+    for g_idx in top_indices:
+        combined = np.concatenate(
+            [A_real[:, int(g_idx)], A_surr[:, int(g_idx)]]
+        )
+        vmin, vmax = float(combined.min()), float(combined.max())
+        if vmax <= vmin:
+            vmax = vmin + 1e-8
+        color_limits.append((vmin, vmax))
+
+    fig, axes = plt.subplots(2, n_genes, figsize=(4.5 * n_genes, 8.0))
+    if n_genes == 1:
+        axes = axes.reshape(2, 1)
+
+    row_labels = ["Real expression", "MSR surrogate"]
+    row_data = [A_real, A_surr]
+
+    for row, (label, A_row) in enumerate(zip(row_labels, row_data)):
+        for col, g_idx in enumerate(top_indices):
+            ax = axes[row, col]
+            expr = A_row[:, int(g_idx)]
+            vmin, vmax = color_limits[col]
+            sc = ax.scatter(
+                S[:, 0], S[:, 1],
+                c=expr,
+                cmap="Reds",
+                vmin=vmin, vmax=vmax,
+                s=ps,
+                linewidths=0,
+                alpha=0.9,
+                rasterized=True,
+            )
+            ax.set_aspect("equal")
+            ax.set_xlabel("x", fontsize=7)
+            ax.tick_params(labelsize=6)
+            plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+            if row == 0:
+                gname = (
+                    gene_names[int(g_idx)]
+                    if int(g_idx) < len(gene_names)
+                    else f"gene_{g_idx}"
+                )
+                ax.set_title(f"{gname}\n|r|={rhos[int(g_idx)]:.3f}", fontsize=8)
+            if col == 0:
+                ax.set_ylabel(f"{label}\n\ny", fontsize=7)
+            else:
+                ax.set_ylabel("y", fontsize=7)
+
+    fig.suptitle(
+        "MSR surrogate example — real vs surrogate expression (top genes by Spearman |r|)",
+        fontsize=10,
+    )
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_fourier_surrogate_example_plot(
+    dataset: "DatasetBundle",
+    result: "TestResult",
+    out_path: "str | Path",
+    *,
+    n_genes: int = 5,
+) -> "Path | None":
+    """Two-row spatial scatter: real expression vs Fourier phase-randomized surrogate."""
+    A_surr = result.artifacts.get("fourier_surrogate_example")
+    true_isodepth = result.artifacts.get("true_isodepth")
+    if A_surr is None or true_isodepth is None:
+        return None
+
+    out_path = Path(out_path)
+    A_real = np.asarray(dataset.A, dtype=np.float32)
+    A_surr = np.asarray(A_surr, dtype=np.float32)
+    isodepth = np.asarray(true_isodepth, dtype=np.float32).reshape(-1)
+    S = np.asarray(dataset.S, dtype=np.float32)
+    G = A_real.shape[1]
+    n_genes = min(int(n_genes), G)
+
+    rhos = np.array(
+        [float(abs(spearmanr(isodepth, A_real[:, g]).statistic)) for g in range(G)],
+        dtype=np.float32,
+    )
+    top_indices = np.argsort(rhos)[::-1][:n_genes]
+    gene_names = dataset.meta.get("var_names") or dataset.meta.get("gene_names", [])
+    ps = _point_size(S)
+    color_limits = []
+    for g_idx in top_indices:
+        combined = np.concatenate([A_real[:, int(g_idx)], A_surr[:, int(g_idx)]])
+        vmin, vmax = float(combined.min()), float(combined.max())
+        if vmax <= vmin:
+            vmax = vmin + 1e-8
+        color_limits.append((vmin, vmax))
+
+    fig, axes = plt.subplots(2, n_genes, figsize=(4.5 * n_genes, 8.0))
+    if n_genes == 1:
+        axes = axes.reshape(2, 1)
+
+    row_labels = ["Real expression", "Fourier surrogate"]
+    row_data = [A_real, A_surr]
+    for row, (label, A_row) in enumerate(zip(row_labels, row_data)):
+        for col, g_idx in enumerate(top_indices):
+            ax = axes[row, col]
+            expr = A_row[:, int(g_idx)]
+            vmin, vmax = color_limits[col]
+            sc = ax.scatter(
+                S[:, 0],
+                S[:, 1],
+                c=expr,
+                cmap="Reds",
+                vmin=vmin,
+                vmax=vmax,
+                s=ps,
+                linewidths=0,
+                alpha=0.9,
+                rasterized=True,
+            )
+            ax.set_aspect("equal")
+            ax.set_xlabel("x", fontsize=7)
+            ax.tick_params(labelsize=6)
+            plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+            if row == 0:
+                gname = (
+                    gene_names[int(g_idx)]
+                    if int(g_idx) < len(gene_names)
+                    else f"gene_{g_idx}"
+                )
+                ax.set_title(f"{gname}\n|r|={rhos[int(g_idx)]:.3f}", fontsize=8)
+            if col == 0:
+                ax.set_ylabel(f"{label}\n\ny", fontsize=7)
+            else:
+                ax.set_ylabel("y", fontsize=7)
+
+    fig.suptitle(
+        "Fourier spectral randomization — real vs phase-randomized expression",
+        fontsize=10,
+    )
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_moran_distribution_plot(result: "TestResult", out_path: "str | Path") -> "Path | None":
+    """Histogram of null mean Moran's I across genes with true value marked."""
+    true_mean = result.artifacts.get("moran_true_mean")
+    null_means = result.artifacts.get("moran_null_mean_per_perm")
+    if true_mean is None or null_means is None:
+        return None
+
+    out_path = Path(out_path)
+    true_mean_f = float(true_mean)
+    null_means_arr = np.asarray(null_means, dtype=np.float64)
+    n_perms = int(null_means_arr.shape[0])
+    radius_um = result.artifacts.get("moran_neighbor_radius_um")
+    p_value = result.artifacts.get("moran_p_value")
+    rank = result.artifacts.get("moran_rank")
+
+    null_mean_of_means = float(null_means_arr.mean()) if n_perms else float("nan")
+    null_std_of_means = float(null_means_arr.std()) if n_perms else float("nan")
+
+    fig, ax = plt.subplots(figsize=(6.4, 4.8))
+    radius_label = f"{float(radius_um):.0f}" if radius_um is not None else "?"
+    fig.suptitle(
+        f"Global Moran's I — null vs true (neighbor r={radius_label} µm)",
+        fontsize=10,
+        fontweight="bold",
+    )
+
+    if n_perms > 0:
+        bins = max(15, min(40, n_perms // 3))
+        ax.hist(
+            null_means_arr,
+            bins=bins,
+            color="#27ae60",
+            alpha=0.72,
+            edgecolor="k",
+            linewidth=0.4,
+            label=f"null mean I (n={n_perms})",
+        )
+    ax.axvline(
+        true_mean_f,
+        color="crimson",
+        lw=2.2,
+        ls="--",
+        label=f"true mean = {true_mean_f:.4f}",
+    )
+    if n_perms > 0:
+        ax.axvline(
+            null_mean_of_means,
+            color="k",
+            lw=1.2,
+            ls=":",
+            alpha=0.8,
+            label=f"null avg = {null_mean_of_means:.4f} ± {null_std_of_means:.4f}",
+        )
+    ax.set_xlabel("Mean Moran's I across genes")
+    ax.set_ylabel("Count")
+    if p_value is not None and rank is not None and n_perms > 0:
+        pct = 100.0 * float(rank) / (n_perms + 1)
+        ax.set_title(
+            f"true rank {int(rank)}/{n_perms + 1} ({pct:.1f} percentile), "
+            f"p = {float(p_value):.4g}",
+            fontsize=9,
+        )
+    ax.legend(fontsize=8, loc="best")
+    ax.tick_params(labelsize=8)
+
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path

@@ -4,6 +4,7 @@ import numpy as np
 
 from analysis.plots import (
     _bin_mean_series,
+    _expression_label,
     _expression_y_axis_label,
     _quantile_bin_assignments,
 )
@@ -22,6 +23,18 @@ class GeneExpressionPlotHelpersTests(unittest.TestCase):
             {"log1p": True, "standardize_expression": True}
         )
         self.assertEqual(label, "Expression (log₁p, z-scored)")
+
+    def test_expression_y_axis_label_synthetic_gaussian(self):
+        meta = {"source": "synthetic", "expression_distribution": "gaussian"}
+        self.assertEqual(_expression_y_axis_label(meta), "Expression (z-scored)")
+
+    def test_expression_label_synthetic_gaussian(self):
+        meta = {"source": "synthetic", "expression_distribution": "gaussian"}
+        self.assertEqual(_expression_label(meta), "Standardized expression")
+
+    def test_expression_label_poisson_raw_counts(self):
+        label = _expression_label({"log1p": False, "standardize_expression": False})
+        self.assertEqual(label, "Expression (raw counts)")
 
     def test_decoder_df_from_config_skips_nn(self):
         self.assertIsNone(_decoder_df_from_config("nn"))

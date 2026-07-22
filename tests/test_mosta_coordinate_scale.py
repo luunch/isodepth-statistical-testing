@@ -9,7 +9,7 @@ from pathlib import Path
 import anndata as ad
 import numpy as np
 
-from data.h5ad_loader import MOSTA_BIN50_UM_PER_UNIT, _detect_coordinate_um_per_unit
+from data.h5ad_loader import COSMX_UM_PER_UNIT, MOSTA_BIN50_UM_PER_UNIT, _detect_coordinate_um_per_unit
 
 
 class TestMostaCoordinateScale(unittest.TestCase):
@@ -23,6 +23,17 @@ class TestMostaCoordinateScale(unittest.TestCase):
             h5ad_path="data/h5ad/mouse-organogenesis/E10.5_E1S1.MOSTA.h5ad",
         )
         self.assertEqual(scale, MOSTA_BIN50_UM_PER_UNIT)
+
+    def test_detects_from_cosmx_filename(self) -> None:
+        adata = ad.AnnData(
+            X=np.zeros((3, 2), dtype=np.float32),
+            obsm={"spatial": np.zeros((3, 2), dtype=np.float64)},
+        )
+        scale = _detect_coordinate_um_per_unit(
+            adata,
+            h5ad_path="data/h5ad/cosmx_human_nsclc_annotated.h5ad",
+        )
+        self.assertEqual(scale, COSMX_UM_PER_UNIT)
 
     def test_detects_from_stereo_seq_uns(self) -> None:
         adata = ad.AnnData(

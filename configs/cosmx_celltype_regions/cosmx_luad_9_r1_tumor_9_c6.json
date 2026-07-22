@@ -11,16 +11,16 @@
     "cell_type_key": "cell_type",
     "cell_type": false,
     "min_cells_per_gene": 1,
-    "normalize_total": false,
-    "standardize_expression": false,
+    "normalize_total": true,
+    "standardize_expression": true,
     "standardize_coordinates": true,
-    "log1p": false,
+    "log1p": true,
     "max_cells": null,
     "seed": 42
   },
   "test": {
     "method": "parallel_permutation",
-    "metric": "nll_poisson_mse",
+    "metric": "nll_gaussian_mse",
     "n_perms": 99,
     "epochs": 500,
     "n_reruns": 10,
@@ -34,7 +34,7 @@
   },
   "output": {
     "out_dir": "results/cosmx_celltype_regions",
-    "run_name": "cosmx_luad_9_r1_tumor_9_c6_poisson",
+    "run_name": "cosmx_luad_9_r1_tumor_9_c6_gaussian",
     "save_preds": false,
     "save_perm_stats": true
   }

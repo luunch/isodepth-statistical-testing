@@ -34,6 +34,22 @@ def _zscore_expression(a: np.ndarray) -> np.ndarray:
     return np.asarray((a - mu) / (sigma + 1e-8), dtype=np.float32)
 
 
+def total_counts_covariate_values(A: np.ndarray) -> np.ndarray:
+    """Per-cell ``log1p`` library size from a raw count matrix.
+
+    Used by ``test.covariate.type='total_counts'``.  Values are computed before
+    ``normalize_total`` / ``log1p`` expression transforms so the covariate reflects
+    raw sequencing depth rather than normalized expression.
+    """
+    counts = np.asarray(A, dtype=np.float64)
+    if counts.ndim != 2:
+        raise ValueError(
+            f"total_counts_covariate_values expects a 2-D matrix, got shape {counts.shape}"
+        )
+    totals = counts.sum(axis=1)
+    return np.log1p(np.maximum(totals, 0.0)).astype(np.float32)
+
+
 def zscore_covariate(values: np.ndarray) -> np.ndarray:
     """Per-cell z-score of a 1D covariate on the supplied cell subset."""
     v = np.asarray(values, dtype=np.float32).reshape(-1)

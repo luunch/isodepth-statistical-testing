@@ -1,0 +1,32 @@
+{
+  "data": {
+    "source": "synthetic",
+    "mode": "radial",
+    "n_cells": 900,
+    "n_genes": 20,
+    "sigma": 0.1,
+    "poly_degree": 3,
+    "seed": 11,
+    "shape": "square"
+  },
+  "test": {
+    "method": "fourier_spectral_randomization",
+    "metric": "nll_gaussian_mse",
+    "n_perms": 19,
+    "epochs": 200,
+    "n_reruns": 5,
+    "lr": 0.001,
+    "patience": 0,
+    "seed": 11,
+    "device": "cuda",
+    "decoder": "nn",
+    "batch_size": null,
+    "verbose": true
+  },
+  "output": {
+    "out_dir": "results/synthetic_fourier_spectral_randomization",
+    "run_name": "radial_fsr_null_smoke",
+    "save_preds": false,
+    "save_perm_stats": true
+  }
+}

@@ -1,6 +1,6 @@
 """Block-permutation null for spatial transcriptomics permutation tests.
 
-Tiles the tissue with a pointy-top hexagonal grid then randomly permutes entire
+Tiles the tissue with a hexagonal or square grid then randomly permutes entire
 block clusters via centroid translation.  This breaks large-scale spatial
 gradients while preserving within-block expression–coordinate coupling (local
 niche / signalling structure).
@@ -25,6 +25,18 @@ _TWO_THIRDS = 2.0 / 3.0
 # 1 000 000 covers tissues up to ~100 mm across at 0.1 µm resolution.
 _HASH_OFFSET = np.int64(1_000_000)
 _HASH_MODULUS = np.int64(2_000_001)
+
+SUPPORTED_BLOCK_SHAPES = frozenset({"hexagon", "square"})
+
+
+def _validate_block_shape(block_shape: str) -> str:
+    shape = str(block_shape)
+    if shape not in SUPPORTED_BLOCK_SHAPES:
+        raise ValueError(
+            f"Unsupported block_shape '{block_shape}'. "
+            f"Expected one of {sorted(SUPPORTED_BLOCK_SHAPES)}"
+        )
+    return shape
 
 
 def hex_bin_ids(
@@ -76,12 +88,55 @@ def hex_bin_ids(
     return ((q_out + _HASH_OFFSET) * _HASH_MODULUS + (r_out + _HASH_OFFSET)).astype(np.int64)
 
 
+def square_bin_ids(
+    coords_um: np.ndarray,
+    radius_um: float,
+    jitter_xy_um: tuple[float, float] = (0.0, 0.0),
+) -> np.ndarray:
+    """Assign each cell to a square bin aligned with the coordinate axes.
+
+    ``radius_um`` is half the square side length (centre to nearest edge), so the
+    full side length is ``2 * radius_um``.
+    """
+    x = coords_um[:, 0].astype(np.float64) - float(jitter_xy_um[0])
+    y = coords_um[:, 1].astype(np.float64) - float(jitter_xy_um[1])
+    side_um = 2.0 * float(radius_um)
+    if side_um <= 0.0:
+        raise ValueError("square block side length must be > 0")
+
+    ix = np.floor(x / side_um).astype(np.int64)
+    iy = np.floor(y / side_um).astype(np.int64)
+    return ((ix + _HASH_OFFSET) * _HASH_MODULUS + (iy + _HASH_OFFSET)).astype(np.int64)
+
+
+def assign_block_ids(
+    coords_um: np.ndarray,
+    radius_um: float,
+    jitter_xy_um: tuple[float, float] = (0.0, 0.0),
+    *,
+    block_shape: str = "hexagon",
+) -> np.ndarray:
+    """Assign each cell to a block ID for the requested tiling shape."""
+    shape = _validate_block_shape(block_shape)
+    if shape == "hexagon":
+        return hex_bin_ids(coords_um, radius_um, jitter_xy_um)
+    return square_bin_ids(coords_um, radius_um, jitter_xy_um)
+
+
 def block_ids_to_axial_qr(block_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Decode packed hex ``block_ids`` back to axial cube coordinates ``(q, r)``."""
     bids = np.asarray(block_ids, dtype=np.int64)
     q = bids // _HASH_MODULUS - _HASH_OFFSET
     r = bids % _HASH_MODULUS - _HASH_OFFSET
     return q, r
+
+
+def block_ids_to_square_ij(block_ids: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Decode packed square ``block_ids`` back to grid indices ``(ix, iy)``."""
+    bids = np.asarray(block_ids, dtype=np.int64)
+    ix = bids // _HASH_MODULUS - _HASH_OFFSET
+    iy = bids % _HASH_MODULUS - _HASH_OFFSET
+    return ix, iy
 
 
 def hex_center_coord(
@@ -95,6 +150,20 @@ def hex_center_coord(
     radius = float(radius_units)
     cx = radius * math.sqrt(3.0) * (q_arr + r_arr / 2.0)
     cy = radius * 1.5 * r_arr
+    return cx, cy
+
+
+def square_center_coord(
+    ix: np.ndarray,
+    iy: np.ndarray,
+    radius_units: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Square block centre positions in native coordinate units."""
+    ix_arr = np.asarray(ix, dtype=np.float64)
+    iy_arr = np.asarray(iy, dtype=np.float64)
+    side = 2.0 * float(radius_units)
+    cx = (ix_arr + 0.5) * side
+    cy = (iy_arr + 0.5) * side
     return cx, cy
 
 
@@ -132,6 +201,87 @@ def hex_polygons_for_block_ids(
         for i in range(unique_ids.size)
     ]
 
+
+def square_polygons_for_block_ids(
+    block_ids: np.ndarray,
+    radius_units: float,
+) -> list[np.ndarray]:
+    """One closed square polygon per occupied block, in native coordinate units."""
+    unique_ids = np.unique(np.asarray(block_ids, dtype=np.int64))
+    if unique_ids.size == 0:
+        return []
+    ix, iy = block_ids_to_square_ij(unique_ids)
+    side = 2.0 * float(radius_units)
+    return [
+        np.array(
+            [
+                [ix[i] * side, iy[i] * side],
+                [(ix[i] + 1) * side, iy[i] * side],
+                [(ix[i] + 1) * side, (iy[i] + 1) * side],
+                [ix[i] * side, (iy[i] + 1) * side],
+                [ix[i] * side, iy[i] * side],
+            ],
+            dtype=np.float64,
+        )
+        for i in range(unique_ids.size)
+    ]
+
+
+def block_polygons_for_block_ids(
+    block_ids: np.ndarray,
+    radius_units: float,
+    *,
+    block_shape: str = "hexagon",
+) -> list[np.ndarray]:
+    """Return overlay polygons for occupied blocks under the requested tiling."""
+    shape = _validate_block_shape(block_shape)
+    if shape == "hexagon":
+        return hex_polygons_for_block_ids(block_ids, radius_units)
+    return square_polygons_for_block_ids(block_ids, radius_units)
+
+
+def square_block_grid_line_segments(
+    radius_units: float,
+    *,
+    x_min: float,
+    x_max: float,
+    y_min: float,
+    y_max: float,
+    origin_x: float = 0.0,
+    origin_y: float = 0.0,
+) -> list[np.ndarray]:
+    """Full axis-aligned square block grid lines over a plotting window.
+
+    Unlike :func:`square_polygons_for_block_ids`, this draws every grid line in the
+    tiling (aligned to ``origin_*`` and ``2 * radius_units`` spacing), not just
+    outlines around occupied blocks.  Use this for overlay plots when cell locations
+    are sparse or irregular so partial block polygons do not create spurious internal
+    edges.
+    """
+    side = 2.0 * float(radius_units)
+    if side <= 0.0:
+        return []
+
+    x_lo = float(min(x_min, x_max))
+    x_hi = float(max(x_min, x_max))
+    y_lo = float(min(y_min, y_max))
+    y_hi = float(max(y_min, y_max))
+
+    lines: list[np.ndarray] = []
+    k_x_min = int(math.floor((x_lo - origin_x) / side))
+    k_x_max = int(math.ceil((x_hi - origin_x) / side))
+    for k in range(k_x_min, k_x_max + 1):
+        x = origin_x + k * side
+        lines.append(np.array([[x, y_lo], [x, y_hi]], dtype=np.float64))
+
+    k_y_min = int(math.floor((y_lo - origin_y) / side))
+    k_y_max = int(math.ceil((y_hi - origin_y) / side))
+    for k in range(k_y_min, k_y_max + 1):
+        y = origin_y + k * side
+        lines.append(np.array([[x_lo, y], [x_hi, y]], dtype=np.float64))
+    return lines
+
+
 def block_centroid_permute(
     coords_um: np.ndarray,
     block_ids: np.ndarray,
@@ -168,6 +318,7 @@ def build_block_permuted_coordinate_batch(
     cell_type_labels: np.ndarray | None = None,
     n_cell_types: int | None = None,
     block_jitter: bool = True,
+    block_shape: str = "hexagon",
 ) -> np.ndarray:
     """Build an ``(n_perms+1, N, 2)`` block-permuted coordinate batch.
 
@@ -175,7 +326,7 @@ def build_block_permuted_coordinate_batch(
     Slots 1 … n_perms each carry an independent block-centroid permutation with
     an optional random mesh jitter.
 
-    When *cell_type_labels* is given each cell type gets its own hex grid and
+    When *cell_type_labels* is given each cell type gets its own block grid and
     independent jitter seed per slot.
 
     Parameters
@@ -183,7 +334,8 @@ def build_block_permuted_coordinate_batch(
     S:
         ``(N, 2)`` true coordinates in native units.
     radius_um:
-        Hex radius in **microns**.
+        Block radius in **microns**.  For hexagons this is centre-to-vertex;
+        for squares it is centre-to-nearest-edge (half the side length).
     coordinate_um_per_unit:
         Microns per one native coordinate unit.
     n_perms:
@@ -195,8 +347,10 @@ def build_block_permuted_coordinate_batch(
     n_cell_types:
         Number of distinct cell types (required when *cell_type_labels* is set).
     block_jitter:
-        When True, shift the hex mesh by a uniform random offset in
+        When True, shift the block mesh by a uniform random offset in
         ``(-radius_um, radius_um)^2`` independently per slot (and per type).
+    block_shape:
+        ``"hexagon"`` (default) or ``"square"``.
 
     Returns
     -------
@@ -207,6 +361,7 @@ def build_block_permuted_coordinate_batch(
     n_cells = S.shape[0]
     n_models = n_perms + 1
     um_scale = float(coordinate_um_per_unit)
+    shape = _validate_block_shape(block_shape)
 
     S_um = S.astype(np.float64) * um_scale
 
@@ -225,7 +380,9 @@ def build_block_permuted_coordinate_batch(
                 jy = float(rng_slot.uniform(-radius_um, radius_um))
             else:
                 jx, jy = 0.0, 0.0
-            bids = hex_bin_ids(S_um, radius_um, (jx, jy))
+            bids = assign_block_ids(
+                S_um, radius_um, (jx, jy), block_shape=shape,
+            )
             new_um = block_centroid_permute(S_um, bids, rng_slot).astype(np.float64)
         else:
             assert n_cell_types is not None
@@ -243,7 +400,9 @@ def build_block_permuted_coordinate_batch(
                     jy = float(rng_ct.uniform(-radius_um, radius_um))
                 else:
                     jx, jy = 0.0, 0.0
-                bids_ct = hex_bin_ids(S_ct, radius_um, (jx, jy))
+                bids_ct = assign_block_ids(
+                    S_ct, radius_um, (jx, jy), block_shape=shape,
+                )
                 new_um[ct_mask] = block_centroid_permute(
                     S_ct, bids_ct, rng_ct
                 ).astype(np.float64)
@@ -257,13 +416,17 @@ def block_stats(
     S: np.ndarray,
     radius_um: float,
     coordinate_um_per_unit: float,
+    *,
+    block_shape: str = "hexagon",
 ) -> dict:
-    """Diagnostic statistics for the hex tiling of true coordinates.
+    """Diagnostic statistics for the block tiling of true coordinates.
 
     Returns a dict with keys:
     ``n_blocks``, ``mean_cells``, ``median_cells``, ``min_cells``, ``max_cells``.
     """
-    counts = block_occupancy_counts(S, radius_um, coordinate_um_per_unit)
+    counts = block_occupancy_counts(
+        S, radius_um, coordinate_um_per_unit, block_shape=block_shape,
+    )
     return {
         "n_blocks": int(len(counts)),
         "mean_cells": float(counts.mean()) if len(counts) else 0.0,
@@ -277,10 +440,12 @@ def block_occupancy_counts(
     S: np.ndarray,
     radius_um: float,
     coordinate_um_per_unit: float,
+    *,
+    block_shape: str = "hexagon",
 ) -> np.ndarray:
-    """Return per-occupied-block cell counts for a hex tiling of true coordinates."""
+    """Return per-occupied-block cell counts for a tiling of true coordinates."""
     S_um = np.asarray(S, dtype=np.float64) * float(coordinate_um_per_unit)
-    bids = hex_bin_ids(S_um, radius_um, (0.0, 0.0))
+    bids = assign_block_ids(S_um, radius_um, (0.0, 0.0), block_shape=block_shape)
     _unique, counts = np.unique(bids, return_counts=True)
     return np.asarray(counts, dtype=np.int64)
 

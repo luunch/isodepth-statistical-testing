@@ -7,7 +7,9 @@
     "obs_y_col": null,
     "layer": null,
     "use_raw": false,
-    "obs_drop_na": ["manual_layer_label"],
+    "obs_drop_na": [
+      "manual_layer_label"
+    ],
     "cell_type_key": "manual_layer_label",
     "cell_type": "separate",
     "top_var_genes": 0,
@@ -38,7 +40,8 @@
     "device": "cuda",
     "decoder": "nn",
     "batch_size": null,
-    "verbose": true
+    "verbose": true,
+    "block_shape": "hexagon"
   },
   "output": {
     "out_dir": "results/dlpfc_new",

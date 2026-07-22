@@ -1,0 +1,46 @@
+{
+  "data": {
+    "source": "synthetic",
+    "mode": "noise",
+    "n_cells": 5000,
+    "n_genes": 20,
+    "sigma": 0.5,
+    "poly_degree": 1,
+    "seed": 42,
+    "shape": "square",
+    "scale": 1000,
+    "sampling_bias": {
+      "type": "uniform"
+    },
+    "kernel": {
+      "type": "exp",
+      "distance": 15
+    },
+    "delta": 0.01
+  },
+  "test": {
+    "method": "block_permutation",
+    "metric": "nll_gaussian_mse",
+    "n_perms": 999,
+    "epochs": 500,
+    "n_reruns": 10,
+    "lr": 0.001,
+    "seed": 42,
+    "device": "cuda",
+    "decoder": "nn",
+    "batch_size": null,
+    "verbose": true,
+    "block_radius": 30,
+    "coordinate_um_per_unit": 1000.0,
+    "block_jitter": false,
+    "block_shape": "square",
+    "moran": true,
+    "moran_neighbor_radius_um": 30
+  },
+  "output": {
+    "out_dir": "results/moran_null_square",
+    "run_name": "square_uniform_exp_p15_delta0p01",
+    "save_preds": false,
+    "save_perm_stats": true
+  }
+}

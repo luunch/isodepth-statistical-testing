@@ -1,0 +1,23 @@
+{
+  "experiment_name": "moran_null_square",
+  "config_dir": "configs/synthetic/moran_null_square",
+  "output_root": "results/moran_null_square",
+  "run": {
+    "skip_finished": true,
+    "sort_by": "run_name"
+  },
+  "configs": [
+    "configs/synthetic/moran_null_square/square_lattice_exp_p15_delta0p01.json",
+    "configs/synthetic/moran_null_square/square_lattice_exp_p15_delta0p1.json",
+    "configs/synthetic/moran_null_square/square_lattice_exp_p15_delta0p25.json",
+    "configs/synthetic/moran_null_square/square_uniform_exp_p15_delta0p01.json",
+    "configs/synthetic/moran_null_square/square_uniform_exp_p15_delta0p1.json",
+    "configs/synthetic/moran_null_square/square_uniform_exp_p15_delta0p25.json",
+    "configs/synthetic/moran_null_square/square_lattice_trunc30_p15_delta0p01.json",
+    "configs/synthetic/moran_null_square/square_lattice_trunc30_p15_delta0p1.json",
+    "configs/synthetic/moran_null_square/square_lattice_trunc30_p15_delta0p25.json",
+    "configs/synthetic/moran_null_square/square_uniform_trunc30_p15_delta0p01.json",
+    "configs/synthetic/moran_null_square/square_uniform_trunc30_p15_delta0p1.json",
+    "configs/synthetic/moran_null_square/square_uniform_trunc30_p15_delta0p25.json"
+  ]
+}

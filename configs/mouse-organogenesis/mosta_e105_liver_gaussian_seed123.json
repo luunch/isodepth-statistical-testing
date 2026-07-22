@@ -1,0 +1,46 @@
+{
+  "data": {
+    "source": "h5ad",
+    "h5ad": "data/h5ad/mouse-organogenesis/E10.5_E1S1.MOSTA.h5ad",
+    "spatial_key": "spatial",
+    "obs_x_col": null,
+    "obs_y_col": null,
+    "layer": "count",
+    "use_raw": false,
+    "obs_filters": {"annotation": "Liver"},
+    "obs_drop_na": [
+      "annotation"
+    ],
+    "cell_type_key": "annotation",
+    "cell_type": "separate",
+    "top_var_genes": 1000,
+    "min_cells_per_gene": 3,
+    "min_cells_per_celltype": 10,
+    "max_cells": null,
+    "seed": 123,
+    "normalize_total": true,
+    "standardize_expression": true,
+    "standardize_coordinates": true,
+    "log1p": true
+  },
+  "test": {
+    "method": "parallel_permutation",
+    "metric": "nll_gaussian_mse",
+    "n_perms": 999,
+    "epochs": 500,
+    "n_reruns": 10,
+    "sgd_batch_size": 128,
+    "lr": 0.001,
+    "seed": 123,
+    "device": "cuda",
+    "decoder": "nn",
+    "batch_size": null,
+    "verbose": true
+  },
+  "output": {
+    "out_dir": "results/mouse-organogenesis",
+    "run_name": "gaussian_E10.5_liver_seed123",
+    "save_preds": false,
+    "save_perm_stats": true
+  }
+}

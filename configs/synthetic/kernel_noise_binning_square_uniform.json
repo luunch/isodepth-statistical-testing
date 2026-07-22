@@ -1,0 +1,46 @@
+{
+  "data": {
+    "source": "synthetic",
+    "mode": "noise",
+    "n_cells": 4096,
+    "n_genes": 20,
+    "sigma": 0.5,
+    "expression_distribution": "poisson",
+    "mean_count": 5.0,
+    "poly_degree": 1,
+    "seed": 42,
+    "shape": "square",
+    "scale": 960,
+    "sampling_bias": {
+      "type": "uniform"
+    },
+    "kernel": {
+      "type": "exp",
+      "distance": 15
+    },
+    "delta": 0.05
+  },
+  "test": {
+    "method": "binning",
+    "metric": "nll_gaussian_mse",
+    "n_perms": 99,
+    "epochs": 500,
+    "n_reruns": 3,
+    "lr": 0.001,
+    "seed": 42,
+    "device": "cuda",
+    "decoder": "nn",
+    "batch_size": null,
+    "verbose": true,
+    "coordinate_um_per_unit": 960.0,
+    "bin_shape": "square",
+    "bin_spot_distance_um": 96.0,
+    "block_jitter": false
+  },
+  "output": {
+    "out_dir": "results/synthetic_kernel",
+    "run_name": "kernel_noise_square_uniform_delta0.05_d15_binning_square96_aligned",
+    "save_preds": false,
+    "save_perm_stats": true
+  }
+}

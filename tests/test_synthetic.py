@@ -14,7 +14,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data.schemas import DataConfig, OutputConfig, RunConfig, TestConfig, TestResult
+from data.schemas import (
+    DataConfig,
+    KernelConfig,
+    OutputConfig,
+    RunConfig,
+    SamplingBiasConfig,
+    TestConfig,
+    TestResult,
+)
 from data.synthetic import SpatialDataSimulator, generate_synthetic_dataset
 from experiments.configuration import save_standardized_outputs
 
@@ -256,6 +264,46 @@ class TestSyntheticGeneration(unittest.TestCase):
         self.assertNotIn("side_length", dataset.meta)
         self.assertEqual(dataset.n_cells, 100)
 
+    def test_lattice_sampling_bias_subsamples_square_lattice(self) -> None:
+        dataset = generate_synthetic_dataset(
+            DataConfig(
+                source="synthetic",
+                mode="noise",
+                n_cells=100,
+                n_genes=2,
+                shape="square",
+                side_length=10,
+                lattice_cell_centers=True,
+                sampling_bias={"type": "lattice"},
+                seed=0,
+            )
+        )
+        self.assertEqual(dataset.n_cells, 100)
+        self.assertEqual(dataset.meta["side_length"], 10)
+        self.assertEqual(dataset.meta["other_side_length"], 10)
+        self.assertTrue(dataset.meta["lattice_cell_centers"])
+        self.assertEqual(dataset.meta["sampling_bias"], {"type": "lattice"})
+        S = np.asarray(dataset.S, dtype=np.float64)
+        expected = ((np.arange(10, dtype=np.float64) + 0.5) / 10.0)
+        for axis in (0, 1):
+            for value in S[:, axis]:
+                self.assertLess(float(np.min(np.abs(expected - value))), 1e-6)
+
+    def test_lattice_sampling_bias_is_reproducible(self) -> None:
+        cfg = DataConfig(
+            source="synthetic",
+            mode="noise",
+            n_cells=120,
+            n_genes=2,
+            side_length=12,
+            lattice_cell_centers=True,
+            sampling_bias={"type": "lattice"},
+            seed=5,
+        )
+        dataset_a = generate_synthetic_dataset(cfg)
+        dataset_b = generate_synthetic_dataset(cfg)
+        np.testing.assert_allclose(dataset_a.S, dataset_b.S, atol=1e-7)
+
     def test_normal_sampling_bias_is_centered_and_in_shape(self) -> None:
         dataset = generate_synthetic_dataset(
             DataConfig(
@@ -484,6 +532,124 @@ class TestSyntheticGeneration(unittest.TestCase):
             expected_path = result_path.parent / "rerun_isodepth_test_true_rerun_isodepths.png"
             self.assertTrue(expected_path.exists())
             self.assertEqual(payload["artifacts"]["true_rerun_isodepth_grid_plot"], str(expected_path))
+
+    def test_smooth_kernel_config_is_accepted_with_delta_zero(self) -> None:
+        config = DataConfig(
+            source="synthetic",
+            mode="noise",
+            n_cells=64,
+            n_genes=4,
+            sigma=0.5,
+            seed=3,
+            scale=1000.0,
+            kernel={"type": "smooth", "distance": 15.0},
+            delta=0.0,
+        ).validate()
+        self.assertEqual(config.kernel.type, "smooth")
+        self.assertEqual(float(config.kernel.distance), 15.0)
+
+    def test_smooth_kernel_rejects_nonzero_delta(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="synthetic",
+                mode="noise",
+                n_cells=64,
+                n_genes=4,
+                sigma=0.5,
+                seed=3,
+                scale=1000.0,
+                kernel={"type": "smooth", "distance": 15.0},
+                delta=0.05,
+            ).validate()
+
+    def test_smooth_kernel_is_reproducible_and_records_meta(self) -> None:
+        config = DataConfig(
+            source="synthetic",
+            mode="noise",
+            n_cells=100,
+            n_genes=5,
+            sigma=0.5,
+            seed=11,
+            scale=1000.0,
+            sampling_bias={"type": "uniform"},
+            kernel={"type": "smooth", "distance": 20.0},
+            delta=0.0,
+        )
+        dataset_a = generate_synthetic_dataset(config)
+        dataset_b = generate_synthetic_dataset(config)
+        np.testing.assert_allclose(dataset_a.A, dataset_b.A)
+        self.assertEqual(dataset_a.meta["noise_model"], "gaussian_smooth")
+        self.assertEqual(dataset_a.meta["kernel"]["type"], "smooth")
+        self.assertEqual(float(dataset_a.meta["smooth_bandwidth_um"]), 20.0)
+        self.assertIn("kernel_noise_sample", dataset_a.meta)
+        self.assertNotIn("delta", dataset_a.meta)
+
+    def test_smooth_kernel_has_higher_neighbor_correlation_than_iid(self) -> None:
+        """Gaussian-smoothed noise should correlate nearest neighbors more than IID."""
+        n_cells = 400
+        n_genes = 8
+        scale = 1000.0
+        seed = 21
+
+        smooth = generate_synthetic_dataset(
+            DataConfig(
+                source="synthetic",
+                mode="noise",
+                n_cells=n_cells,
+                n_genes=n_genes,
+                sigma=0.5,
+                seed=seed,
+                scale=scale,
+                sampling_bias={"type": "uniform"},
+                kernel={"type": "smooth", "distance": 30.0},
+                delta=0.0,
+            )
+        )
+        iid = generate_synthetic_dataset(
+            DataConfig(
+                source="synthetic",
+                mode="noise",
+                n_cells=n_cells,
+                n_genes=n_genes,
+                sigma=0.5,
+                seed=seed,
+                scale=scale,
+                sampling_bias={"type": "uniform"},
+            )
+        )
+
+        def mean_nn_corr(S: np.ndarray, A: np.ndarray) -> float:
+            from scipy.spatial import KDTree
+
+            S_um = np.asarray(S, dtype=np.float64) * scale
+            _, idx = KDTree(S_um).query(S_um, k=2)
+            nn = idx[:, 1]
+            corrs = []
+            for g in range(A.shape[1]):
+                x = A[:, g]
+                y = A[nn, g]
+                if float(np.std(x)) < 1e-8 or float(np.std(y)) < 1e-8:
+                    continue
+                corrs.append(float(np.corrcoef(x, y)[0, 1]))
+            return float(np.mean(corrs)) if corrs else float("nan")
+
+        corr_smooth = mean_nn_corr(smooth.S, smooth.A)
+        corr_iid = mean_nn_corr(iid.S, iid.A)
+        self.assertGreater(corr_smooth, corr_iid + 0.05)
+
+    def test_smooth_kernel_does_not_build_cholesky(self) -> None:
+        simulator = SpatialDataSimulator(
+            N=64,
+            G=3,
+            sigma=0.5,
+            scale=1000.0,
+            kernel=KernelConfig(type="smooth", distance=15.0),
+            delta=0.0,
+            sampling_bias=SamplingBiasConfig(type="uniform"),
+            lattice_seed=5,
+        )
+        _S, _A, _d = simulator.generate(mode="noise", seed=5)
+        self.assertIsNone(simulator._L)
 
 
 if __name__ == "__main__":

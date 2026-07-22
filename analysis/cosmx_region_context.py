@@ -23,7 +23,10 @@ from data.schemas import DataConfig
 COSMX_ANNOTATED_NAME = "cosmx_human_nsclc_annotated.h5ad"
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _FULL_COSMX_H5AD = _REPO_ROOT / "data" / "h5ad" / COSMX_ANNOTATED_NAME
-# CosMx stitched coordinates are in microns (µm).
+# CosMx ``obsm['spatial']`` is global pixel coords; 0.12028 µm/px (AtoMx ReadMe).
+from data.h5ad_loader import COSMX_UM_PER_UNIT
+
+_COORD_UM_PER_UNIT = COSMX_UM_PER_UNIT
 _SCALE_BAR_UM = 500.0
 
 # Stable colors for common NSCLC cell types (CellCharter-style discrete map).
@@ -93,11 +96,12 @@ def _add_scale_bar(ax, length_um: float = _SCALE_BAR_UM) -> None:
     ylim = ax.get_ylim()
     x0 = xlim[0] + 0.04 * (xlim[1] - xlim[0])
     y0 = ylim[0] + 0.04 * (ylim[1] - ylim[0])
-    ax.plot([x0, x0 + length_um], [y0, y0], color="black", lw=2, solid_capstyle="butt")
+    length_coord = float(length_um) / _COORD_UM_PER_UNIT
+    ax.plot([x0, x0 + length_coord], [y0, y0], color="black", lw=2, solid_capstyle="butt")
     label = f"{length_um / 1000:.1f} mm" if length_um >= 1000 else f"{int(length_um)} µm"
     if length_um == 500:
         label = "0.5 mm"
-    ax.text(x0 + length_um / 2, y0 + 0.02 * (ylim[1] - ylim[0]), label,
+    ax.text(x0 + length_coord / 2, y0 + 0.02 * (ylim[1] - ylim[0]), label,
             ha="center", va="bottom", fontsize=8, color="black")
 
 

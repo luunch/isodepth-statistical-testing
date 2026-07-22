@@ -6,6 +6,7 @@ from typing import Optional
 
 import anndata as ad
 import numpy as np
+import pandas as pd
 import scipy.sparse as sp
 
 from data.schemas import DataConfig, DatasetBundle
@@ -167,6 +168,8 @@ def _extract_expression(
 
 
 MOSTA_BIN50_UM_PER_UNIT = 25.0  # Stereo-seq bin50: 50 DNBs × 0.5 µm/DNB pitch
+# CosMx SMI global pixel coords (AtoMx ReadMe / NanoString): 120 nm/px edge → 0.12028 µm/px
+COSMX_UM_PER_UNIT = 0.12028
 
 
 def _detect_coordinate_um_per_unit(
@@ -178,8 +181,10 @@ def _detect_coordinate_um_per_unit(
 
     Priority:
     - ``uns['stereo_seq']['coordinate_um_per_unit']`` (or legacy ``uns['mosta']``)
+    - ``uns['spatial'][library]['metadata']['coordinate_um_per_unit']``
     - Visium ``uns['spatial']`` scalefactors
     - MOSTA processed ``*.MOSTA.h5ad`` filenames (bin50 grid → 25 µm/unit)
+    - CosMx NSCLC ``*cosmx*`` / ``*nsclc*`` h5ad paths (global px → 0.12028 µm/unit)
 
     Returns ``None`` when no recognisable scale entry is found.
     """
@@ -196,12 +201,25 @@ def _detect_coordinate_um_per_unit(
     if h5ad_path is not None and str(h5ad_path).endswith(".MOSTA.h5ad"):
         return MOSTA_BIN50_UM_PER_UNIT
 
+    if h5ad_path is not None:
+        path_lower = str(h5ad_path).lower()
+        if "cosmx" in path_lower or "nsclc" in path_lower:
+            return COSMX_UM_PER_UNIT
+
     sp = adata.uns.get("spatial") if "spatial" in adata.uns else None
     if not isinstance(sp, dict):
         return None
     for lib_val in sp.values():
         if not isinstance(lib_val, dict):
             continue
+        metadata = lib_val.get("metadata")
+        if isinstance(metadata, dict) and "coordinate_um_per_unit" in metadata:
+            try:
+                val = float(metadata["coordinate_um_per_unit"])
+                if val > 0:
+                    return val
+            except (TypeError, ValueError):
+                pass
         sf = lib_val.get("scalefactors")
         if not isinstance(sf, dict):
             continue
@@ -291,10 +309,11 @@ def _apply_obs_subset(
     adata: ad.AnnData,
     *,
     obs_filters: Optional[dict] = None,
+    obs_numeric_filters: Optional[dict] = None,
     obs_indices: Optional[str] = None,
     obs_drop_na: Optional[list[str]] = None,
 ) -> ad.AnnData:
-    """Subset ``adata`` by global cell indices, equality filters, and/or non-null obs columns."""
+    """Subset ``adata`` by global indices, obs equality/numeric filters, and non-null columns."""
     mask = np.ones(adata.n_obs, dtype=bool)
 
     if obs_indices is not None:
@@ -312,8 +331,45 @@ def _apply_obs_subset(
                 raise ValueError(
                     f"obs_filters key '{col}' not in adata.obs; "
                     f"available: {list(adata.obs.columns)}"
-                )
+            )
             mask &= adata.obs[col].astype(str).to_numpy() == str(val)
+
+    if obs_numeric_filters:
+        allowed_ops = {"gt", "ge", "gte", "lt", "le", "lte", "eq", "ne"}
+        for col, spec in obs_numeric_filters.items():
+            if col not in adata.obs.columns:
+                raise ValueError(
+                    f"obs_numeric_filters key '{col}' not in adata.obs; "
+                    f"available: {list(adata.obs.columns)}"
+                )
+            if not isinstance(spec, dict) or not spec:
+                raise ValueError(
+                    f"obs_numeric_filters['{col}'] must be a non-empty mapping "
+                    "such as {'gt': 0.8}"
+                )
+            unknown_ops = set(spec.keys()) - allowed_ops
+            if unknown_ops:
+                raise ValueError(
+                    f"obs_numeric_filters['{col}'] has unsupported operators "
+                    f"{sorted(unknown_ops)}; allowed: {sorted(allowed_ops)}"
+                )
+            values = pd.to_numeric(adata.obs[col], errors="coerce").to_numpy(dtype=np.float64)
+            col_mask = np.isfinite(values)
+            for op, threshold_raw in spec.items():
+                threshold = float(threshold_raw)
+                if op == "gt":
+                    col_mask &= values > threshold
+                elif op in {"ge", "gte"}:
+                    col_mask &= values >= threshold
+                elif op == "lt":
+                    col_mask &= values < threshold
+                elif op in {"le", "lte"}:
+                    col_mask &= values <= threshold
+                elif op == "eq":
+                    col_mask &= values == threshold
+                elif op == "ne":
+                    col_mask &= values != threshold
+            mask &= col_mask
 
     if obs_drop_na:
         for col in obs_drop_na:
@@ -329,7 +385,8 @@ def _apply_obs_subset(
     if not mask.any():
         raise ValueError(
             "Obs subset matched no cells "
-            f"(obs_filters={obs_filters}, obs_indices={obs_indices}, obs_drop_na={obs_drop_na})"
+            f"(obs_filters={obs_filters}, obs_numeric_filters={obs_numeric_filters}, "
+            f"obs_indices={obs_indices}, obs_drop_na={obs_drop_na})"
         )
 
     sub = adata[mask]
@@ -358,16 +415,20 @@ def load_h5ad_dataset(
     cell_type_key: str = "cell_type",
     min_cells_per_celltype: int = 1,
     covariate_obs_key: Optional[str] = None,
+    compute_total_counts_covariate: bool = False,
+    covariate_whitening_obs_key: Optional[str] = None,
     obs_filters: Optional[dict] = None,
+    obs_numeric_filters: Optional[dict] = None,
     obs_indices: Optional[str] = None,
     obs_drop_na: Optional[list[str]] = None,
 ) -> DatasetBundle:
-    needs_subset = bool(obs_filters or obs_indices or obs_drop_na)
+    needs_subset = bool(obs_filters or obs_numeric_filters or obs_indices or obs_drop_na)
     if needs_subset:
         adata = ad.read_h5ad(h5ad_path, backed="r")
         adata = _apply_obs_subset(
             adata,
             obs_filters=obs_filters,
+            obs_numeric_filters=obs_numeric_filters,
             obs_indices=obs_indices,
             obs_drop_na=obs_drop_na,
         )
@@ -405,13 +466,36 @@ def load_h5ad_dataset(
         )
 
     covariate_values: Optional[np.ndarray] = None
-    if covariate_obs_key is not None:
+    if compute_total_counts_covariate:
+        from data.transforms import total_counts_covariate_values
+
+        covariate_values = total_counts_covariate_values(a)
+        covariate_obs_key = "total_counts"
+    elif covariate_obs_key is not None:
         if covariate_obs_key not in adata.obs.columns:
             raise ValueError(
                 f"test.covariate key '{covariate_obs_key}' not found in adata.obs columns. "
                 f"Available obs columns: {list(adata.obs.columns)}"
             )
         covariate_values = np.asarray(adata.obs[covariate_obs_key].values, dtype=np.float32)
+
+    covariate_whitening_values: Optional[np.ndarray] = None
+    if covariate_whitening_obs_key is not None:
+        if covariate_whitening_obs_key not in adata.obs.columns:
+            raise ValueError(
+                f"data.covariate_whitening obs key '{covariate_whitening_obs_key}' "
+                f"not found in adata.obs columns. "
+                f"Available obs columns: {list(adata.obs.columns)}"
+            )
+        covariate_whitening_values = np.asarray(
+            adata.obs[covariate_whitening_obs_key].values, dtype=np.float32
+        )
+
+    calicost_tumor_proportion_values: Optional[np.ndarray] = None
+    if "calicost_tumor_proportion" in adata.obs.columns:
+        calicost_tumor_proportion_values = np.asarray(
+            adata.obs["calicost_tumor_proportion"].values, dtype=np.float32
+        )
 
     cell_type_labels: Optional[np.ndarray] = None
     cell_type_names: Optional[list] = None
@@ -441,6 +525,10 @@ def load_h5ad_dataset(
             a = a[keep_mask]
             if covariate_values is not None:
                 covariate_values = covariate_values[keep_mask]
+            if covariate_whitening_values is not None:
+                covariate_whitening_values = covariate_whitening_values[keep_mask]
+            if calicost_tumor_proportion_values is not None:
+                calicost_tumor_proportion_values = calicost_tumor_proportion_values[keep_mask]
             old_to_new = {old: new for new, old in enumerate(keep_types)}
             cell_type_labels = np.array(
                 [old_to_new[v] for v in cell_type_labels[keep_mask]], dtype=np.int64
@@ -470,6 +558,10 @@ def load_h5ad_dataset(
             plot_cell_type_labels = plot_cell_type_labels[idx]
         if covariate_values is not None:
             covariate_values = covariate_values[idx]
+        if covariate_whitening_values is not None:
+            covariate_whitening_values = covariate_whitening_values[idx]
+        if calicost_tumor_proportion_values is not None:
+            calicost_tumor_proportion_values = calicost_tumor_proportion_values[idx]
 
     if defer_preprocessing:
         # Keep raw counts; per-cell-type preprocessing happens downstream.  Mark
@@ -516,12 +608,14 @@ def load_h5ad_dataset(
         "h5ad": h5ad_path,
         "spatial_key": spatial_key,
         "obs_filters": obs_filters,
+        "obs_numeric_filters": obs_numeric_filters,
         "obs_indices": obs_indices,
         "obs_drop_na": obs_drop_na,
         "obs_x_col": obs_x_col,
         "obs_y_col": obs_y_col,
         "layer": layer,
         "use_raw": use_raw,
+        "cell_type_key": str(cell_type_key),
         "min_cells_per_gene": int(min_cells_per_gene),
         "top_var_genes": int(top_var_genes),
         "normalize_total": bool(normalize_total),
@@ -557,6 +651,15 @@ def load_h5ad_dataset(
     if covariate_values is not None:
         meta["covariate_values"] = np.asarray(covariate_values, dtype=np.float32)
         meta["covariate_obs_key"] = covariate_obs_key
+    if covariate_whitening_values is not None:
+        meta["covariate_whitening_values"] = np.asarray(
+            covariate_whitening_values, dtype=np.float32
+        )
+        meta["covariate_whitening_obs_key"] = covariate_whitening_obs_key
+    if calicost_tumor_proportion_values is not None:
+        meta["calicost_tumor_proportion"] = np.asarray(
+            calicost_tumor_proportion_values, dtype=np.float32
+        )
     if plot_cell_type_labels is not None and plot_cell_type_names is not None:
         meta["plot_cell_type_labels"] = plot_cell_type_labels
         meta["plot_cell_type_names"] = plot_cell_type_names
@@ -572,6 +675,8 @@ def load_dataset_from_config(
     config: DataConfig,
     *,
     covariate_obs_key: Optional[str] = None,
+    compute_total_counts_covariate: bool = False,
+    covariate_whitening_obs_key: Optional[str] = None,
 ) -> DatasetBundle:
     config.validate()
     if config.source != "h5ad":
@@ -595,7 +700,10 @@ def load_dataset_from_config(
         cell_type_key=config.cell_type_key,
         min_cells_per_celltype=config.min_cells_per_celltype,
         covariate_obs_key=covariate_obs_key,
+        compute_total_counts_covariate=compute_total_counts_covariate,
+        covariate_whitening_obs_key=covariate_whitening_obs_key,
         obs_filters=config.obs_filters,
+        obs_numeric_filters=config.obs_numeric_filters,
         obs_indices=config.obs_indices,
         obs_drop_na=config.obs_drop_na,
     )

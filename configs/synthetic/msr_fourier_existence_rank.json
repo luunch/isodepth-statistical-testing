@@ -1,0 +1,41 @@
+{
+  "data": {
+    "source": "synthetic",
+    "mode": "fourier",
+    "n_cells": 5000,
+    "n_genes": 20,
+    "shape": "square",
+    "sampling_bias": {"type": "uniform"},
+    "sigma": 0.0,
+    "k_min": 1,
+    "k_max": 10,
+    "dependent_xy": true,
+    "poly_degree": 1,
+    "seed": 42
+  },
+  "test": {
+    "method": "joint_truncated_rank_msr",
+    "metric": "nll_gaussian_mse",
+    "n_perms": 99,
+    "epochs": 500,
+    "n_reruns": 10,
+    "sgd_batch_size": 128,
+    "lr": 0.001,
+    "seed": 43,
+    "device": "cuda",
+    "decoder": "nn",
+    "batch_size": null,
+    "verbose": true,
+    "msr_neighbor_radius_um": 30,
+    "msr_truncate_um": 20,
+    "msr_calibration_um": null,
+    "msr_shared_rank": false,
+    "coordinate_um_per_unit": 1000.0
+  },
+  "output": {
+    "out_dir": "results/synthetic",
+    "run_name": "msr_fourier_existence_rank",
+    "save_preds": false,
+    "save_perm_stats": true
+  }
+}

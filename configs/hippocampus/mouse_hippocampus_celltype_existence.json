@@ -13,7 +13,7 @@
     "log1p": true,
     "max_cells": null,
     "seed": 42,
-    "top_var_genes": 1000
+    "top_var_genes": 3000
   },
   "test": {
     "method": "parallel_permutation",

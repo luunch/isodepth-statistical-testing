@@ -8,6 +8,20 @@ import torch
 from scipy.stats import spearmanr
 
 from data.h5ad_loader import preprocess_celltype_subset
+from methods.covariate_loss_difference import (
+    assemble_separate_loss_difference_artifacts,
+    covariate_whitening_obs_key as _loss_diff_covariate_whitening_obs_key,
+    covariate_whitening_values as _loss_diff_covariate_whitening_values,
+    dataset_uses_loss_difference_whitening,
+    run_loss_difference_parallel_training,
+)
+from methods.freedman_lane import (
+    assemble_separate_freedman_lane_artifacts,
+    dataset_uses_freedman_lane_whitening,
+    whiten_expression_freedman_lane,
+    _covariate_whitening_obs_key,
+)
+from methods.fourier import build_fourier_spectral_randomization_surrogates_from_meta
 from data.schemas import DatasetBundle, TestConfig, TestResult
 from data.transforms import celltype_expression_residuals, midline_latent, zscore_covariate
 from data import raw_coordinates_from_standardized, standardize_coordinate_batch
@@ -18,10 +32,16 @@ from methods.metrics import (
     permutation_p_value,
 )
 from methods.block_permutation import (
+    assign_block_ids,
     block_stats,
     build_block_permuted_coordinate_batch,
-    hex_bin_ids,
     resolve_um_per_unit,
+)
+from methods.binning import bin_dataset_to_pseudospots, parallel_config_for_binned_run
+from methods.moran import maybe_compute_moran_artifacts
+from methods.msr import (
+    build_joint_truncated_msr_surrogates,
+    build_joint_truncated_rank_msr_surrogates,
 )
 from methods.perturbation import run_comparison_perturbation_test, run_perturbation_test
 from methods.subsampling import (
@@ -52,10 +72,10 @@ def _covariate_type_midline(config: TestConfig) -> bool:
     return cov is not None and getattr(cov, "type", None) == "midline"
 
 
-def _covariate_type_obs_key(config: TestConfig) -> bool:
-    """True when the covariate is a labeled obs-column key (not midline, not None)."""
+def _covariate_type_values(config: TestConfig) -> bool:
+    """True when the covariate uses per-cell values from ``dataset.meta['covariate_values']``."""
     cov = getattr(config, "covariate", None)
-    return cov is not None and getattr(cov, "is_obs_key", False)
+    return cov is not None and getattr(cov, "is_values_covariate", False)
 
 
 def _has_covariate(config: TestConfig) -> bool:
@@ -63,15 +83,46 @@ def _has_covariate(config: TestConfig) -> bool:
     return cov is not None and getattr(cov, "type", None) is not None
 
 
-def _obs_covariate_values(dataset: DatasetBundle, config: TestConfig) -> np.ndarray:
+def _run_parallel_isodepth_training(
+    dataset: DatasetBundle,
+    *,
+    train_fn,
+    train_kwargs: dict,
+    model_label: str,
+    covariate_values: np.ndarray | None = None,
+) -> tuple[object, object, np.ndarray, dict[str, object]]:
+    """Train the parallel isodepth model, using h(d,n) when loss-difference is enabled."""
+    if dataset_uses_loss_difference_whitening(dataset):
+        values = (
+            np.asarray(covariate_values, dtype=np.float32).reshape(-1)
+            if covariate_values is not None
+            else _loss_diff_covariate_whitening_values(dataset)
+        )
+        obs_key = _loss_diff_covariate_whitening_obs_key(dataset)
+        model, outputs, s_batched_np, artifacts = run_loss_difference_parallel_training(
+            train_fn,
+            covariate_values=values,
+            model_label=model_label,
+            train_kwargs={**train_kwargs, "obs_key": obs_key},
+        )
+        return model, outputs, s_batched_np, artifacts
+
+    model, outputs, s_batched_np = train_fn(
+        **train_kwargs,
+        model_label=model_label,
+    )
+    return model, outputs, s_batched_np, {}
+
+
+def _values_covariate_from_dataset(dataset: DatasetBundle, config: TestConfig) -> np.ndarray:
     cov_values = dataset.meta.get("covariate_values")
     if cov_values is None:
-        obs_key = config.covariate.type
+        cov_type = config.covariate.type
         raise ValueError(
-            f"test.covariate obs key '{obs_key}' was specified but "
+            f"test.covariate type '{cov_type}' was specified but "
             "dataset.meta['covariate_values'] is missing.  "
             "Ensure load_dataset is called with covariate=config.covariate so the "
-            "obs column is extracted during data loading."
+            "covariate values are extracted during data loading."
         )
     return np.asarray(cov_values, dtype=np.float32)
 
@@ -150,11 +201,11 @@ def _train_covariate_artifacts(
             "pred_true_covariate": np.asarray(pred_covariate, dtype=np.float32),
             "true_isodepth_covariate": np.asarray(isodepth_covariate, dtype=np.float32),
         }
-    if _covariate_type_obs_key(config):
+    if _covariate_type_values(config):
         if covariate_values is None:
-            obs_key = config.covariate.type
+            cov_type = config.covariate.type
             raise ValueError(
-                f"test.covariate obs key '{obs_key}' was specified but covariate_values is missing."
+                f"test.covariate type '{cov_type}' was specified but covariate_values is missing."
             )
         latent_covariate = zscore_covariate(covariate_values)
         if closed_form:
@@ -457,6 +508,24 @@ def _process_single_celltype_separate(
     )
     n_c = int(mask.sum())
 
+    freedman_lane_type_artifacts: dict[str, object] = {}
+    if dataset_uses_freedman_lane_whitening(dataset):
+        fl_values = dataset.meta.get("covariate_whitening_values")
+        if fl_values is None:
+            obs_key = _covariate_whitening_obs_key(dataset)
+            raise ValueError(
+                f"data.covariate_whitening obs_key='{obs_key}' was specified but "
+                "dataset.meta['covariate_whitening_values'] is missing."
+            )
+        A_c, freedman_lane_type_artifacts = whiten_expression_freedman_lane(
+            A_c,
+            np.asarray(fl_values[mask], dtype=np.float32),
+            config,
+            device,
+            obs_key=_covariate_whitening_obs_key(dataset),
+            model_label=f"Freedman–Lane covariate decoder ({type_name})",
+        )
+
     mean_c = S_original_c.mean(axis=0)
     std_c = S_original_c.std(axis=0)
     safe_std_c = np.where(std_c > 1e-8, std_c, 1.0)
@@ -464,12 +533,24 @@ def _process_single_celltype_separate(
 
     type_config = replace(config, seed=config.seed + type_index)
     parallel_config = replace(type_config, covariate=None) if _has_covariate(config) else type_config
-    model_c, training_outputs_c, s_batched_np_c = train_parallel_isodepth_model(
-        S_c,
-        A_c,
-        parallel_config,
-        device=device,
-        model_label=f"separate {type_name} ({n_c} cells)",
+    loss_diff_artifacts: dict[str, object] = {}
+    fl_values = dataset.meta.get("covariate_whitening_values")
+    cov_values_c = (
+        np.asarray(fl_values[mask], dtype=np.float32)
+        if fl_values is not None and dataset_uses_loss_difference_whitening(dataset)
+        else None
+    )
+    model_c, training_outputs_c, s_batched_np_c, loss_diff_artifacts = _run_parallel_isodepth_training(
+        dataset,
+        train_fn=train_parallel_isodepth_model,
+        train_kwargs={
+            "S": S_c,
+            "A": A_c,
+            "config": parallel_config,
+            "device": device,
+        },
+        model_label=f"separate {type_name} h(d, n) ({n_c} cells)",
+        covariate_values=cov_values_c,
     )
     stat_true_c = float(training_outputs_c.stat_true)
     stat_perm_c = training_outputs_c.stat_perm
@@ -545,6 +626,16 @@ def _process_single_celltype_separate(
         "feature_space": feature_space_c,
         "n_genes": int(np.asarray(A_c).shape[1]),
         **covariate_artifacts,
+        **freedman_lane_type_artifacts,
+        **loss_diff_artifacts,
+        **maybe_compute_moran_artifacts(
+            type_config,
+            dataset.meta,
+            s_batched_np_c,
+            A_c,
+            coord_mean=mean_c,
+            coord_std=safe_std_c,
+        ),
     }
     del s_batched_np_c
     type_result["model"] = offload_module_to_cpu(model_c)
@@ -561,10 +652,10 @@ def _run_celltype_separate_parallel_permutation(
     n_cell_types = int(dataset.meta["n_cell_types"])
     type_order = _celltype_indices_by_descending_cell_count(cell_type_labels, n_cell_types)
     covariate_values = dataset.meta.get("covariate_values")
-    if _covariate_type_obs_key(config) and covariate_values is None:
-        obs_key = config.covariate.type
+    if _covariate_type_values(config) and covariate_values is None:
+        cov_type = config.covariate.type
         raise ValueError(
-            f"test.covariate obs key '{obs_key}' was specified but "
+            f"test.covariate type '{cov_type}' was specified but "
             "dataset.meta['covariate_values'] is missing.  "
             "Ensure load_dataset is called with covariate=config.covariate."
         )
@@ -635,6 +726,25 @@ def _run_celltype_separate_parallel_permutation(
     combined_stat_true = float(np.mean(all_stat_true))
     combined_p = float(np.mean([per_type_results[n]["p_value"] for n in cell_type_names]))
 
+    separate_artifacts: dict[str, object] = {
+        "per_type_results": per_type_results,
+        "cell_type_names": cell_type_names,
+        "cell_type_labels": cell_type_labels,
+        "n_cell_types": n_cell_types,
+        "cell_type_mode": "separate",
+        "spearman_matrix": spearman_matrix,
+        "spearman_labels": spearman_labels,
+    }
+    separate_artifacts.update(
+        assemble_separate_freedman_lane_artifacts(
+            dataset,
+            per_type_results,
+            cell_type_names,
+            cell_type_labels,
+        )
+    )
+    separate_artifacts.update(assemble_separate_loss_difference_artifacts(dataset, per_type_results))
+
     return TestResult(
         method_name="parallel_permutation",
         metric=metric,
@@ -645,15 +755,7 @@ def _run_celltype_separate_parallel_permutation(
         n_cells=dataset.n_cells,
         n_genes=dataset.n_genes,
         config={"test": config.__dict__.copy()},
-        artifacts={
-            "per_type_results": per_type_results,
-            "cell_type_names": cell_type_names,
-            "cell_type_labels": cell_type_labels,
-            "n_cell_types": n_cell_types,
-            "cell_type_mode": "separate",
-            "spearman_matrix": spearman_matrix,
-            "spearman_labels": spearman_labels,
-        },
+        artifacts=separate_artifacts,
     ).validate()
 
 
@@ -667,15 +769,21 @@ def _run_celltype_parallel_permutation(
 
     start = time.time()
     has_midline_covariate = _covariate_type_midline(config)
-    has_obs_key_covariate = _covariate_type_obs_key(config)
-    parallel_config = replace(config, covariate=None) if (has_midline_covariate or has_obs_key_covariate) else config
-    model, training_outputs, s_batched_np = train_celltype_parallel_isodepth_model(
-        dataset.S,
-        dataset.A,
-        parallel_config,
-        cell_type_labels=cell_type_labels,
-        n_cell_types=n_cell_types,
-        device=device,
+    has_values_covariate = _covariate_type_values(config)
+    parallel_config = replace(config, covariate=None) if (has_midline_covariate or has_values_covariate) else config
+    loss_diff_artifacts: dict[str, object] = {}
+    model, training_outputs, s_batched_np, loss_diff_artifacts = _run_parallel_isodepth_training(
+        dataset,
+        train_fn=train_celltype_parallel_isodepth_model,
+        train_kwargs={
+            "S": dataset.S,
+            "A": dataset.A,
+            "config": parallel_config,
+            "cell_type_labels": cell_type_labels,
+            "n_cell_types": n_cell_types,
+            "device": device,
+        },
+        model_label="cell-type parallel isodepth h(d, n)",
     )
     stat_true = float(training_outputs.stat_true)
     stat_perm = training_outputs.stat_perm
@@ -702,7 +810,7 @@ def _run_celltype_parallel_permutation(
 
     if _has_covariate(config):
         cov_values = (
-            _obs_covariate_values(dataset, config) if has_obs_key_covariate else None
+            _values_covariate_from_dataset(dataset, config) if has_values_covariate else None
         )
         covariate_artifacts = _train_covariate_artifacts(
             dataset.S,
@@ -756,6 +864,10 @@ def _run_celltype_parallel_permutation(
                 sf_ct_np * np.exp(np.asarray(pred_cov, dtype=np.float32))
             ).astype(np.float32)
 
+    moran_artifacts = maybe_compute_moran_artifacts(
+        config, dataset.meta, s_batched_np, dataset.A,
+    )
+
     return TestResult(
         method_name="parallel_permutation",
         metric=metric,
@@ -795,6 +907,8 @@ def _run_celltype_parallel_permutation(
             "cell_type_names": dataset.meta["cell_type_names"],
             "n_cell_types": n_cell_types,
             **covariate_artifacts,
+            **loss_diff_artifacts,
+            **moran_artifacts,
         },
     ).validate()
 
@@ -814,17 +928,26 @@ def run_parallel_permutation_method(
 
     start = time.time()
     has_midline_covariate = _covariate_type_midline(config)
-    has_obs_key_covariate = _covariate_type_obs_key(config)
-    parallel_config = replace(config, covariate=None) if (has_midline_covariate or has_obs_key_covariate) else config
-    model, training_outputs, s_batched_np = train_parallel_isodepth_model(
-        dataset.S, dataset.A, parallel_config, device=device,
+    has_values_covariate = _covariate_type_values(config)
+    parallel_config = replace(config, covariate=None) if (has_midline_covariate or has_values_covariate) else config
+    loss_diff_artifacts: dict[str, object] = {}
+    model, training_outputs, s_batched_np, loss_diff_artifacts = _run_parallel_isodepth_training(
+        dataset,
+        train_fn=train_parallel_isodepth_model,
+        train_kwargs={
+            "S": dataset.S,
+            "A": dataset.A,
+            "config": parallel_config,
+            "device": device,
+        },
+        model_label="parallel isodepth h(d, n)",
     )
     stat_true = float(training_outputs.stat_true)
     stat_perm = training_outputs.stat_perm
     p_value = permutation_p_value(metric, stat_true, stat_perm)
     if _has_covariate(config):
         cov_values = (
-            _obs_covariate_values(dataset, config) if has_obs_key_covariate else None
+            _values_covariate_from_dataset(dataset, config) if has_values_covariate else None
         )
         covariate_artifacts = _train_covariate_artifacts(
             dataset.S,
@@ -835,8 +958,8 @@ def run_parallel_permutation_method(
             stat_perm,
             covariate_values=cov_values,
             model_label=(
-                f"obs-key covariate decoder ({config.covariate.type})"
-                if has_obs_key_covariate
+                f"values covariate decoder ({config.covariate.type})"
+                if has_values_covariate
                 else "true layout covariate decoder"
             ),
         )
@@ -864,6 +987,10 @@ def run_parallel_permutation_method(
             covariate_artifacts["pred_true_covariate"] = (
                 sf_row * np.exp(np.asarray(pred_cov, dtype=np.float32))
             ).astype(np.float32)
+
+    moran_artifacts = maybe_compute_moran_artifacts(
+        config, dataset.meta, s_batched_np, dataset.A,
+    )
 
     return TestResult(
         method_name="parallel_permutation",
@@ -895,6 +1022,8 @@ def run_parallel_permutation_method(
             "highest_rerun_index": int(highest_rerun_index),
             "highest_train_loss": float(highest_train_loss),
             **covariate_artifacts,
+            **loss_diff_artifacts,
+            **moran_artifacts,
         },
     ).validate()
 
@@ -1156,8 +1285,8 @@ def _run_plain_cross_validation(
     del s_batched_pre
 
     has_midline_covariate = _covariate_type_midline(config)
-    has_obs_key_covariate = _covariate_type_obs_key(config)
-    parallel_config = replace(config, covariate=None) if (has_midline_covariate or has_obs_key_covariate) else config
+    has_values_covariate = _covariate_type_values(config)
+    parallel_config = replace(config, covariate=None) if (has_midline_covariate or has_values_covariate) else config
 
     (
         stat_true,
@@ -1187,7 +1316,7 @@ def _run_plain_cross_validation(
     covariate_artifacts: dict[str, object] = {}
     if _has_covariate(config):
         cov_values = (
-            _obs_covariate_values(dataset, config) if has_obs_key_covariate else None
+            _values_covariate_from_dataset(dataset, config) if has_values_covariate else None
         )
         covariate_artifacts = _train_covariate_artifacts(
             dataset.S,
@@ -1198,8 +1327,8 @@ def _run_plain_cross_validation(
             stat_perm,
             covariate_values=cov_values,
             model_label=(
-                f"obs-key covariate decoder ({config.covariate.type})"
-                if has_obs_key_covariate
+                f"values covariate decoder ({config.covariate.type})"
+                if has_values_covariate
                 else "true layout covariate decoder"
             ),
         )
@@ -1273,8 +1402,8 @@ def _run_celltype_together_cross_validation(
     del s_batched_pre
 
     has_midline_covariate = _covariate_type_midline(config)
-    has_obs_key_covariate = _covariate_type_obs_key(config)
-    parallel_config = replace(config, covariate=None) if (has_midline_covariate or has_obs_key_covariate) else config
+    has_values_covariate = _covariate_type_values(config)
+    parallel_config = replace(config, covariate=None) if (has_midline_covariate or has_values_covariate) else config
 
     (
         stat_true,
@@ -1324,7 +1453,7 @@ def _run_celltype_together_cross_validation(
     covariate_artifacts: dict[str, object] = {}
     if _has_covariate(config):
         cov_values = (
-            _obs_covariate_values(dataset, config) if has_obs_key_covariate else None
+            _values_covariate_from_dataset(dataset, config) if has_values_covariate else None
         )
         covariate_artifacts = _train_covariate_artifacts(
             dataset.S,
@@ -1550,10 +1679,10 @@ def _run_celltype_separate_cross_validation(
     n_cell_types = int(dataset.meta["n_cell_types"])
     type_order = _celltype_indices_by_descending_cell_count(cell_type_labels, n_cell_types)
     covariate_values = dataset.meta.get("covariate_values")
-    if _covariate_type_obs_key(config) and covariate_values is None:
-        obs_key = config.covariate.type
+    if _covariate_type_values(config) and covariate_values is None:
+        cov_type = config.covariate.type
         raise ValueError(
-            f"test.covariate obs key '{obs_key}' was specified but "
+            f"test.covariate type '{cov_type}' was specified but "
             "dataset.meta['covariate_values'] is missing."
         )
     if covariate_values is not None:
@@ -1665,8 +1794,8 @@ def run_full_retraining_method(
     device = device or resolve_device(config.device)
 
     _has_midline = _covariate_type_midline(config)
-    _has_obs_key = _covariate_type_obs_key(config)
-    config_full = replace(config, covariate=None) if (_has_midline or _has_obs_key) else config
+    _has_values = _covariate_type_values(config)
+    config_full = replace(config, covariate=None) if (_has_midline or _has_values) else config
 
     start = time.time()
     true_model, pred_true = train_isodepth_model(
@@ -1722,8 +1851,8 @@ def run_full_retraining_method(
 
     runtime_sec = time.time() - start
     p_value = permutation_p_value(metric, stat_true, stat_perm)
-    if _has_midline or _has_obs_key:
-        cov_values = _obs_covariate_values(dataset, config) if _has_obs_key else None
+    if _has_midline or _has_values:
+        cov_values = _values_covariate_from_dataset(dataset, config) if _has_values else None
         covariate_artifacts = _train_covariate_artifacts(
             dataset.S,
             dataset.A,
@@ -1733,8 +1862,8 @@ def run_full_retraining_method(
             stat_perm,
             covariate_values=cov_values,
             model_label=(
-                f"obs-key covariate decoder ({config.covariate.type})"
-                if _has_obs_key
+                f"values covariate decoder ({config.covariate.type})"
+                if _has_values
                 else "true model midline covariate"
             ),
         )
@@ -1815,11 +1944,14 @@ def _process_single_celltype_separate_block_permutation(
         n_perms=config.n_perms,
         seed=type_seed,
         block_jitter=config.block_jitter,
+        block_shape=config.block_shape,
     )
     s_batched_c = ((s_batched_raw_c - mean_c) / safe_std_c).astype(np.float32)
 
     S_um_c = np.asarray(S_raw_c, dtype=np.float64) * um_per_unit
-    block_ids_c = hex_bin_ids(S_um_c, radius_um, (0.0, 0.0))
+    block_ids_c = assign_block_ids(
+        S_um_c, radius_um, (0.0, 0.0), block_shape=config.block_shape,
+    )
     s_permuted_slot1_raw_c = np.asarray(s_batched_raw_c[1], dtype=np.float32)
     block_radius_units_c = float(radius_um / um_per_unit)
 
@@ -1906,7 +2038,17 @@ def _process_single_celltype_separate_block_permutation(
         "block_ids_true": block_ids_c,
         "s_permuted_slot1_raw": s_permuted_slot1_raw_c,
         "block_radius_units": block_radius_units_c,
+        "block_shape": config.block_shape,
         **covariate_artifacts,
+        **maybe_compute_moran_artifacts(
+            type_config,
+            dataset.meta,
+            s_batched_np_c,
+            A_c,
+            s_batched_native=s_batched_raw_c,
+            coord_mean=mean_c,
+            coord_std=safe_std_c,
+        ),
     }
     del s_batched_np_c
     type_result["model"] = offload_module_to_cpu(model_c)
@@ -1932,10 +2074,10 @@ def _run_celltype_separate_block_permutation(
     n_cell_types = int(dataset.meta["n_cell_types"])
     type_order = _celltype_indices_by_descending_cell_count(cell_type_labels, n_cell_types)
     covariate_values = dataset.meta.get("covariate_values")
-    if _covariate_type_obs_key(config) and covariate_values is None:
-        obs_key = config.covariate.type
+    if _covariate_type_values(config) and covariate_values is None:
+        cov_type = config.covariate.type
         raise ValueError(
-            f"test.covariate obs key '{obs_key}' was specified but "
+            f"test.covariate type '{cov_type}' was specified but "
             "dataset.meta['covariate_values'] is missing.  "
             "Ensure load_dataset is called with covariate=config.covariate."
         )
@@ -2026,6 +2168,7 @@ def _run_celltype_separate_block_permutation(
             "block_ids_true": block_ids_true,
             "s_permuted_slot1_raw": s_permuted_slot1_raw,
             "block_radius_units": float(radius_um / um_per_unit),
+            "block_shape": config.block_shape,
             "block_stats": stats,
         },
     ).validate()
@@ -2036,13 +2179,14 @@ def run_block_permutation_method(
 ) -> TestResult:
     """Block-permutation existence test.
 
-    Breaks tissue-scale gradients by randomly permuting hex-block centroids
+    Breaks tissue-scale gradients by randomly permuting block centroids
     while preserving within-block expression–coordinate coupling.
     """
     dataset.validate()
     config.validate()
     metric = canonicalize_metric_name(config.metric)
     device = device or resolve_device(config.device)
+    block_shape = config.block_shape
 
     um_per_unit = resolve_um_per_unit(
         config.coordinate_um_per_unit,
@@ -2050,11 +2194,13 @@ def run_block_permutation_method(
     )
     radius_um = float(config.block_radius)  # type: ignore[arg-type]
 
-    # Hex tiling uses raw physical coordinates (pixels / µm), not z-scored training coords.
+    # Block tiling uses raw physical coordinates (pixels / µm), not z-scored training coords.
     S_raw = raw_coordinates_from_standardized(dataset.S, dataset.meta)
 
     # Diagnostics
-    stats = block_stats(S_raw, radius_um, um_per_unit)
+    stats = block_stats(
+        S_raw, radius_um, um_per_unit, block_shape=block_shape,
+    )
     if config.verbose:
         radius_units = radius_um / um_per_unit
         zscore_note = (
@@ -2063,7 +2209,7 @@ def run_block_permutation_method(
             else ""
         )
         print(
-            f"Block permutation: radius={radius_um:.1f} µm "
+            f"Block permutation: shape={block_shape}, radius={radius_um:.1f} µm "
             f"(={radius_units:.2f} raw coord units, scale={um_per_unit:.4f} µm/unit)"
             f"{zscore_note}"
         )
@@ -2085,7 +2231,9 @@ def run_block_permutation_method(
 
     # Overlay diagnostics: block IDs and one sample permutation slot (full tissue)
     S_um = np.asarray(S_raw, dtype=np.float64) * um_per_unit
-    block_ids_true = hex_bin_ids(S_um, radius_um, (0.0, 0.0))
+    block_ids_true = assign_block_ids(
+        S_um, radius_um, (0.0, 0.0), block_shape=block_shape,
+    )
     overlay_batch = build_block_permuted_coordinate_batch(
         S_raw,
         radius_um=radius_um,
@@ -2095,6 +2243,7 @@ def run_block_permutation_method(
         cell_type_labels=cell_type_labels,
         n_cell_types=n_cell_types,
         block_jitter=config.block_jitter,
+        block_shape=block_shape,
     )
     s_permuted_slot1_raw = np.asarray(overlay_batch[1], dtype=np.float32)
     del overlay_batch
@@ -2121,16 +2270,17 @@ def run_block_permutation_method(
         cell_type_labels=cell_type_labels,
         n_cell_types=n_cell_types,
         block_jitter=config.block_jitter,
+        block_shape=block_shape,
     )
     s_batched = standardize_coordinate_batch(s_batched_raw, dataset.meta)
 
     # --- train ---
     start = time.time()
     has_midline_covariate = _covariate_type_midline(config)
-    has_obs_key_covariate = _covariate_type_obs_key(config)
+    has_values_covariate = _covariate_type_values(config)
     parallel_config = (
         replace(config, covariate=None)
-        if (has_midline_covariate or has_obs_key_covariate)
+        if (has_midline_covariate or has_values_covariate)
         else config
     )
 
@@ -2155,7 +2305,7 @@ def run_block_permutation_method(
 
     if _has_covariate(config):
         cov_values = (
-            _obs_covariate_values(dataset, config) if has_obs_key_covariate else None
+            _values_covariate_from_dataset(dataset, config) if has_values_covariate else None
         )
         covariate_artifacts = _train_covariate_artifacts(
             dataset.S,
@@ -2191,6 +2341,14 @@ def run_block_permutation_method(
                 sf_row * np.exp(np.asarray(pred_cov, dtype=np.float32))
             ).astype(np.float32)
 
+    moran_artifacts = maybe_compute_moran_artifacts(
+        config,
+        dataset.meta,
+        s_batched_np,
+        dataset.A,
+        s_batched_native=s_batched_raw,
+    )
+
     return TestResult(
         method_name="block_permutation",
         metric=metric,
@@ -2224,10 +2382,556 @@ def run_block_permutation_method(
             "block_ids_true": block_ids_true,
             "s_permuted_slot1_raw": s_permuted_slot1_raw,
             "block_radius_units": float(radius_um / um_per_unit),
+            "block_shape": block_shape,
             "block_stats": stats,
             **covariate_artifacts,
+            **moran_artifacts,
         },
     ).validate()
+
+
+def _run_joint_msr_method(
+    dataset: DatasetBundle,
+    config: TestConfig,
+    device: torch.device | None = None,
+    *,
+    method_name: str,
+    rank_match: bool,
+) -> TestResult:
+    """Joint truncated MSR family: expression surrogates with fixed coordinates."""
+    dataset.validate()
+    config.validate()
+    metric = canonicalize_metric_name(config.metric)
+    device = device or resolve_device(config.device)
+
+    if dataset.meta.get("cell_type_mode") == "separate":
+        return _run_celltype_separate_joint_msr(
+            dataset,
+            config,
+            device,
+            method_name=method_name,
+            rank_match=rank_match,
+        )
+
+    um_per_unit = resolve_um_per_unit(
+        config.coordinate_um_per_unit,
+        dataset.meta.get("coordinate_um_per_unit"),
+    )
+    neighbor_radius_um = float(config.msr_neighbor_radius_um)  # type: ignore[arg-type]
+    truncate_um = float(config.msr_truncate_um) if config.msr_truncate_um is not None else 0.0
+    calibration_um = float(config.msr_calibration_um) if config.msr_calibration_um is not None else None
+
+    S_raw = raw_coordinates_from_standardized(dataset.S, dataset.meta)
+    S_um = np.asarray(S_raw, dtype=np.float64) * um_per_unit
+
+    label = "Joint truncated rank-MSR" if rank_match else "Joint truncated MSR"
+    if config.verbose:
+        zscore_note = (
+            " [coords z-scored for training; MSR basis on raw physical coords]"
+            if dataset.meta.get("coordinate_standardization") == "zscore"
+            else ""
+        )
+        shared_note = " shared_rank=True" if rank_match and config.msr_shared_rank else ""
+        print(
+            f"{label}: neighbor_radius={neighbor_radius_um:.1f} µm, "
+            f"truncate>{truncate_um:.1f} µm, "
+            f"calibration_um={calibration_um if calibration_um is not None else 'auto'}"
+            f"{shared_note}{zscore_note}"
+        )
+
+    start = time.time()
+    if rank_match:
+        A_surr = build_joint_truncated_rank_msr_surrogates(
+            S_um,
+            dataset.A,
+            n_surrogates=config.n_perms,
+            seed=config.seed,
+            radius=neighbor_radius_um,
+            truncate_scale_um=truncate_um,
+            calibration_um=calibration_um,
+            shared_rank=bool(config.msr_shared_rank),
+        )
+    else:
+        A_surr = build_joint_truncated_msr_surrogates(
+            S_um,
+            dataset.A,
+            n_surrogates=config.n_perms,
+            seed=config.seed,
+            radius=neighbor_radius_um,
+            truncate_scale_um=truncate_um,
+            calibration_um=calibration_um,
+        )
+    # slot 0 = true A; slots 1..n_perms = surrogates
+    a_batched = np.concatenate(
+        [dataset.A[np.newaxis, :, :], A_surr], axis=0
+    ).astype(np.float32)
+    # coordinates are identical for every slot
+    s_batched = np.tile(dataset.S[np.newaxis, :, :], (config.n_perms + 1, 1, 1))
+
+    # --- train all slots in one parallel pass --------------------------------
+    has_midline_covariate = _covariate_type_midline(config)
+    has_values_covariate = _covariate_type_values(config)
+    parallel_config = (
+        replace(config, covariate=None)
+        if (has_midline_covariate or has_values_covariate)
+        else config
+    )
+
+    model, training_outputs, s_batched_np = train_parallel_isodepth_model(
+        dataset.S,
+        dataset.A,
+        parallel_config,
+        device=device,
+        s_batched=s_batched,
+        a_batched=a_batched,
+    )
+
+    stat_true = float(training_outputs.stat_true)
+    stat_perm = training_outputs.stat_perm
+    p_value = permutation_p_value(metric, stat_true, stat_perm)
+
+    if _has_covariate(config):
+        cov_values = (
+            _values_covariate_from_dataset(dataset, config) if has_values_covariate else None
+        )
+        covariate_artifacts = _train_covariate_artifacts(
+            dataset.S,
+            dataset.A,
+            config,
+            device,
+            metric,
+            stat_perm,
+            covariate_values=cov_values,
+            model_label=(
+                f"values covariate decoder ({config.covariate.type})"
+                if has_values_covariate
+                else "true layout covariate decoder"
+            ),
+        )
+    else:
+        covariate_artifacts = {}
+
+    low_idx = int(training_outputs.best_null_index)
+    high_idx = int(training_outputs.worst_null_index)
+    # s_batched_np is all identical (same S for every slot), so lowest/highest_S == dataset.S
+    slot_iso = _extract_slot_isodepths(
+        model, s_batched_np, [0, low_idx + 1, high_idx + 1], device,
+    )
+    true_rerun_index, true_train_loss = _rerun_index_and_loss(model, 0)
+    lowest_rerun_index, lowest_train_loss = _rerun_index_and_loss(model, low_idx + 1)
+    highest_rerun_index, highest_train_loss = _rerun_index_and_loss(model, high_idx + 1)
+    runtime_sec = time.time() - start
+
+    pred_true_np = np.asarray(training_outputs.pred_true, dtype=np.float32)
+    is_poisson = canonicalize_metric_name(metric) == "nll_poisson_mse"
+    if is_poisson:
+        A_f = np.asarray(dataset.A, dtype=np.float32)
+        sf_row = A_f.sum(axis=1, keepdims=True)
+        pred_true_np = (sf_row * np.exp(pred_true_np)).astype(np.float32)
+        pred_cov = covariate_artifacts.get("pred_true_covariate")
+        if pred_cov is not None:
+            covariate_artifacts["pred_true_covariate"] = (
+                sf_row * np.exp(np.asarray(pred_cov, dtype=np.float32))
+            ).astype(np.float32)
+
+    S_raw_moran = raw_coordinates_from_standardized(dataset.S, dataset.meta)
+    s_native_moran = np.tile(
+        np.asarray(S_raw_moran, dtype=np.float32)[np.newaxis, :, :],
+        (a_batched.shape[0], 1, 1),
+    )
+    moran_artifacts = maybe_compute_moran_artifacts(
+        config,
+        dataset.meta,
+        s_batched_np,
+        dataset.A,
+        a_batched=a_batched,
+        s_batched_native=s_native_moran,
+    )
+
+    return TestResult(
+        method_name=method_name,
+        metric=metric,
+        p_value=p_value,
+        stat_true=stat_true,
+        stat_perm=stat_perm,
+        runtime_sec=runtime_sec,
+        n_cells=dataset.n_cells,
+        n_genes=dataset.n_genes,
+        config={"test": config.__dict__.copy()},
+        artifacts={
+            "model": model,
+            "pred_true": pred_true_np,
+            "true_isodepth": np.asarray(slot_iso[0], dtype=np.float32),
+            "rerun_summary": _rerun_summary(model),
+            "true_rerun_index": int(true_rerun_index),
+            "true_train_loss": float(true_train_loss),
+            "lowest_isodepth": np.asarray(slot_iso[low_idx + 1], dtype=np.float32),
+            "lowest_S": np.asarray(s_batched_np[low_idx + 1], dtype=np.float32),
+            "lowest_stat": float(stat_perm[low_idx]),
+            "lowest_perm_index": low_idx,
+            "lowest_rerun_index": int(lowest_rerun_index),
+            "lowest_train_loss": float(lowest_train_loss),
+            "highest_isodepth": np.asarray(slot_iso[high_idx + 1], dtype=np.float32),
+            "highest_S": np.asarray(s_batched_np[high_idx + 1], dtype=np.float32),
+            "highest_stat": float(stat_perm[high_idx]),
+            "highest_perm_index": high_idx,
+            "highest_rerun_index": int(highest_rerun_index),
+            "highest_train_loss": float(highest_train_loss),
+            "msr_surrogate_example": np.asarray(A_surr[0], dtype=np.float32),
+            **covariate_artifacts,
+            **moran_artifacts,
+        },
+    ).validate()
+
+
+def _process_single_celltype_separate_joint_msr(
+    dataset: DatasetBundle,
+    config: TestConfig,
+    device: torch.device,
+    *,
+    type_index: int,
+    type_name: str,
+    cell_type_labels: np.ndarray,
+    method_name: str,
+    rank_match: bool,
+    S_raw_full: np.ndarray,
+    um_per_unit: float,
+) -> tuple[dict, tuple[np.ndarray, np.ndarray]]:
+    """Run joint truncated MSR independently for one separated spatial group."""
+    mask = cell_type_labels == type_index
+    S_raw_c = np.asarray(S_raw_full[mask], dtype=np.float32)
+    S_original_c = np.asarray(dataset.S[mask], dtype=np.float32)
+    A_c, var_names_c, feature_space_c = _preprocess_separate_subset(
+        dataset, dataset.A[mask], type_index
+    )
+    n_c = int(mask.sum())
+
+    mean_c = S_raw_c.mean(axis=0)
+    std_c = S_raw_c.std(axis=0)
+    safe_std_c = np.where(std_c > 1e-8, std_c, 1.0)
+    S_c = np.asarray((S_raw_c - mean_c) / safe_std_c, dtype=np.float32)
+
+    subset = DatasetBundle(
+        S=S_c,
+        A=np.asarray(A_c, dtype=np.float32),
+        meta={
+            "coordinate_standardization": "zscore",
+            "coord_mean": np.asarray(mean_c, dtype=np.float32),
+            "coord_std": np.asarray(safe_std_c, dtype=np.float32),
+            "coordinate_um_per_unit": float(um_per_unit),
+            "var_names": var_names_c,
+            "feature_space": feature_space_c,
+            "cell_type_mode": "none",
+        },
+    ).validate()
+    type_config = replace(
+        config,
+        seed=config.seed + type_index,
+        coordinate_um_per_unit=float(um_per_unit),
+    )
+    result_c = _run_joint_msr_method(
+        subset,
+        type_config,
+        device,
+        method_name=method_name,
+        rank_match=rank_match,
+    )
+    artifacts = dict(result_c.artifacts)
+    model_c = artifacts.pop("model")
+    type_result = {
+        "p_value": float(result_c.p_value),
+        "stat_true": float(result_c.stat_true),
+        "stat_perm": np.asarray(result_c.stat_perm, dtype=np.float64),
+        "n_cells": n_c,
+        "n_genes": int(np.asarray(A_c).shape[1]),
+        "model": offload_module_to_cpu(model_c),
+        "S": S_c,
+        "S_original": S_original_c,
+        "S_raw": S_raw_c,
+        "A": np.asarray(A_c, dtype=np.float32),
+        "var_names": var_names_c,
+        "feature_space": feature_space_c,
+        **artifacts,
+    }
+    return type_result, (mean_c, safe_std_c)
+
+
+def _run_celltype_separate_joint_msr(
+    dataset: DatasetBundle,
+    config: TestConfig,
+    device: torch.device,
+    *,
+    method_name: str,
+    rank_match: bool,
+) -> TestResult:
+    """Run MSR after DBSCAN/cell-type separation, independently per retained group."""
+    metric = canonicalize_metric_name(config.metric)
+    cell_type_labels = np.asarray(dataset.meta["cell_type_labels"], dtype=np.int64)
+    cell_type_names: list[str] = list(dataset.meta["cell_type_names"])
+    n_cell_types = int(dataset.meta["n_cell_types"])
+    type_order = _celltype_indices_by_descending_cell_count(cell_type_labels, n_cell_types)
+    S_raw = raw_coordinates_from_standardized(dataset.S, dataset.meta)
+    um_per_unit = resolve_um_per_unit(
+        config.coordinate_um_per_unit,
+        dataset.meta.get("coordinate_um_per_unit"),
+    )
+
+    start = time.time()
+    per_type_results: dict[str, dict] = {}
+    per_type_standardization: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    current_device = device
+
+    for step_idx, type_index in enumerate(type_order):
+        type_name = cell_type_names[type_index]
+        n_c = int((cell_type_labels == type_index).sum())
+        print(
+            f"MSR group {step_idx + 1}/{n_cell_types}: {type_name} ({n_c} cells)",
+            flush=True,
+        )
+        used_device = current_device
+
+        def _train_current_group(
+            train_device: torch.device,
+            _ti=type_index,
+            _tn=type_name,
+        ) -> dict:
+            nonlocal used_device
+            used_device = train_device
+            type_result, standardization = _process_single_celltype_separate_joint_msr(
+                dataset,
+                config,
+                train_device,
+                type_index=_ti,
+                type_name=_tn,
+                cell_type_labels=cell_type_labels,
+                method_name=method_name,
+                rank_match=rank_match,
+                S_raw_full=S_raw,
+                um_per_unit=um_per_unit,
+            )
+            per_type_standardization[_tn] = standardization
+            return type_result
+
+        per_type_results[type_name] = run_with_cuda_oom_retry(
+            _train_current_group,
+            current_device,
+            label=f"MSR group '{type_name}'",
+        )
+        current_device = used_device
+
+    full_isodepths: list[np.ndarray] = []
+    for type_name in cell_type_names:
+        mean_c, safe_std_c = per_type_standardization[type_name]
+        S_full_standardized = np.asarray(
+            (S_raw - mean_c) / safe_std_c, dtype=np.float32
+        )
+        model_c = per_type_results[type_name]["model"]
+        full_isodepths.append(
+            _extract_isodepth_from_model(model_c, S_full_standardized, device).reshape(-1)
+        )
+    spearman_matrix, spearman_labels = _compute_spearman_matrix(
+        full_isodepths, cell_type_names
+    )
+
+    all_stat_true = [per_type_results[name]["stat_true"] for name in cell_type_names]
+    all_stat_perm = np.concatenate(
+        [per_type_results[name]["stat_perm"] for name in cell_type_names]
+    )
+    combined_p = float(
+        np.mean([per_type_results[name]["p_value"] for name in cell_type_names])
+    )
+    return TestResult(
+        method_name=method_name,
+        metric=metric,
+        p_value=combined_p,
+        stat_true=float(np.mean(all_stat_true)),
+        stat_perm=all_stat_perm,
+        runtime_sec=time.time() - start,
+        n_cells=dataset.n_cells,
+        n_genes=dataset.n_genes,
+        config={"test": config.__dict__.copy()},
+        artifacts={
+            "per_type_results": per_type_results,
+            "cell_type_names": cell_type_names,
+            "cell_type_labels": cell_type_labels,
+            "n_cell_types": n_cell_types,
+            "cell_type_mode": "separate",
+            "spearman_matrix": spearman_matrix,
+            "spearman_labels": spearman_labels,
+        },
+    ).validate()
+
+
+def run_joint_truncated_msr_method(
+    dataset: DatasetBundle, config: TestConfig, device: torch.device | None = None
+) -> TestResult:
+    return _run_joint_msr_method(
+        dataset, config, device, method_name="joint_truncated_msr", rank_match=False
+    )
+
+
+def run_joint_truncated_rank_msr_method(
+    dataset: DatasetBundle, config: TestConfig, device: torch.device | None = None
+) -> TestResult:
+    return _run_joint_msr_method(
+        dataset, config, device, method_name="joint_truncated_rank_msr", rank_match=True
+    )
+
+
+def run_fourier_spectral_randomization_method(
+    dataset: DatasetBundle, config: TestConfig, device: torch.device | None = None
+) -> TestResult:
+    """Fourier phase-randomization existence test with fixed coordinates."""
+    dataset.validate()
+    config.validate()
+    if dataset.meta.get("cell_type_mode") == "separate" or dataset.meta.get("cell_type_labels") is not None:
+        raise NotImplementedError(
+            "fourier_spectral_randomization currently supports plain single-matrix datasets only."
+        )
+
+    metric = canonicalize_metric_name(config.metric)
+    device = device or resolve_device(config.device)
+    start = time.time()
+    if config.verbose:
+        print("Fourier spectral randomization: fixed S, coherent phase-randomized A nulls")
+
+    A_surr = build_fourier_spectral_randomization_surrogates_from_meta(
+        dataset.A,
+        dataset.meta,
+        n_surrogates=config.n_perms,
+        seed=config.seed,
+    )
+    a_batched = np.concatenate([dataset.A[np.newaxis, :, :], A_surr], axis=0).astype(np.float32)
+    s_batched = np.tile(dataset.S[np.newaxis, :, :], (config.n_perms + 1, 1, 1)).astype(np.float32)
+
+    has_midline_covariate = _covariate_type_midline(config)
+    has_values_covariate = _covariate_type_values(config)
+    parallel_config = replace(config, covariate=None) if (has_midline_covariate or has_values_covariate) else config
+
+    model, training_outputs, s_batched_np = train_parallel_isodepth_model(
+        dataset.S,
+        dataset.A,
+        parallel_config,
+        device=device,
+        s_batched=s_batched,
+        a_batched=a_batched,
+        model_label="Fourier spectral randomization h(d)",
+    )
+    stat_true = float(training_outputs.stat_true)
+    stat_perm = training_outputs.stat_perm
+    p_value = permutation_p_value(metric, stat_true, stat_perm)
+
+    covariate_artifacts: dict[str, object] = {}
+    if _has_covariate(config):
+        cov_values = (
+            _values_covariate_from_dataset(dataset, config) if has_values_covariate else None
+        )
+        covariate_artifacts = _train_covariate_artifacts(
+            dataset.S,
+            dataset.A,
+            config,
+            device,
+            metric,
+            stat_perm,
+            covariate_values=cov_values,
+            model_label=(
+                f"values covariate decoder ({config.covariate.type})"
+                if has_values_covariate
+                else "true layout covariate decoder"
+            ),
+        )
+
+    low_idx = int(training_outputs.best_null_index)
+    high_idx = int(training_outputs.worst_null_index)
+    slot_iso = _extract_slot_isodepths(
+        model, s_batched_np, [0, low_idx + 1, high_idx + 1], device,
+    )
+    true_rerun_index, true_train_loss = _rerun_index_and_loss(model, 0)
+    lowest_rerun_index, lowest_train_loss = _rerun_index_and_loss(model, low_idx + 1)
+    highest_rerun_index, highest_train_loss = _rerun_index_and_loss(model, high_idx + 1)
+
+    pred_true_np = np.asarray(training_outputs.pred_true, dtype=np.float32)
+    if canonicalize_metric_name(metric) == "nll_poisson_mse":
+        sf_row = np.asarray(dataset.A, dtype=np.float32).sum(axis=1, keepdims=True)
+        pred_true_np = (sf_row * np.exp(pred_true_np)).astype(np.float32)
+        pred_cov = covariate_artifacts.get("pred_true_covariate")
+        if pred_cov is not None:
+            covariate_artifacts["pred_true_covariate"] = (
+                sf_row * np.exp(np.asarray(pred_cov, dtype=np.float32))
+            ).astype(np.float32)
+
+    S_raw_moran = raw_coordinates_from_standardized(dataset.S, dataset.meta)
+    s_native_moran = np.tile(
+        np.asarray(S_raw_moran, dtype=np.float32)[np.newaxis, :, :],
+        (a_batched.shape[0], 1, 1),
+    )
+    moran_artifacts = maybe_compute_moran_artifacts(
+        config,
+        dataset.meta,
+        s_batched_np,
+        dataset.A,
+        a_batched=a_batched,
+        s_batched_native=s_native_moran,
+    )
+
+    return TestResult(
+        method_name="fourier_spectral_randomization",
+        metric=metric,
+        p_value=p_value,
+        stat_true=stat_true,
+        stat_perm=stat_perm,
+        runtime_sec=time.time() - start,
+        n_cells=dataset.n_cells,
+        n_genes=dataset.n_genes,
+        config={"test": config.__dict__.copy()},
+        artifacts={
+            "model": model,
+            "pred_true": pred_true_np,
+            "true_isodepth": np.asarray(slot_iso[0], dtype=np.float32),
+            "rerun_summary": _rerun_summary(model),
+            "true_rerun_index": int(true_rerun_index),
+            "true_train_loss": float(true_train_loss),
+            "lowest_isodepth": np.asarray(slot_iso[low_idx + 1], dtype=np.float32),
+            "lowest_S": np.asarray(s_batched_np[low_idx + 1], dtype=np.float32),
+            "lowest_stat": float(stat_perm[low_idx]),
+            "lowest_perm_index": low_idx,
+            "lowest_rerun_index": int(lowest_rerun_index),
+            "lowest_train_loss": float(lowest_train_loss),
+            "highest_isodepth": np.asarray(slot_iso[high_idx + 1], dtype=np.float32),
+            "highest_S": np.asarray(s_batched_np[high_idx + 1], dtype=np.float32),
+            "highest_stat": float(stat_perm[high_idx]),
+            "highest_perm_index": high_idx,
+            "highest_rerun_index": int(highest_rerun_index),
+            "highest_train_loss": float(highest_train_loss),
+            "fourier_surrogate_example": np.asarray(A_surr[0], dtype=np.float32),
+            **covariate_artifacts,
+            **moran_artifacts,
+        },
+    ).validate()
+
+
+def run_binning_method(
+    dataset: DatasetBundle, config: TestConfig, device: torch.device | None = None
+) -> TestResult:
+    """Bin cells/spots into pseudospots, then run the standard permutation test."""
+    binned_dataset, binning_artifacts = bin_dataset_to_pseudospots(dataset, config)
+    if config.verbose:
+        summary = binning_artifacts["binning_summary"]
+        print(
+            "Binning permutation: "
+            f"shape={summary['shape']}, "
+            f"spot_distance={summary['spot_distance_um']:.1f} µm, "
+            f"original cells={summary['original_n_cells']}, "
+            f"pseudospots={summary['n_pseudospots']}, "
+            f"cells/pseudospot median={summary['median_cells_per_pseudospot']:.1f}",
+            flush=True,
+        )
+    inner_config = parallel_config_for_binned_run(config)
+    result = run_parallel_permutation_method(binned_dataset, inner_config, device=device)
+    result.method_name = "binning"
+    result.config = {"test": config.__dict__.copy()}
+    result.artifacts.update(binning_artifacts)
+    return result.validate()
 
 
 def _run_permutation_method_on_device(
@@ -2245,6 +2949,14 @@ def _run_permutation_method_on_device(
         return run_parallel_permutation_method(dataset, config, device=device)
     if config.method == "block_permutation":
         return run_block_permutation_method(dataset, config, device=device)
+    if config.method == "binning":
+        return run_binning_method(dataset, config, device=device)
+    if config.method == "fourier_spectral_randomization":
+        return run_fourier_spectral_randomization_method(dataset, config, device=device)
+    if config.method == "joint_truncated_msr":
+        return run_joint_truncated_msr_method(dataset, config, device=device)
+    if config.method == "joint_truncated_rank_msr":
+        return run_joint_truncated_rank_msr_method(dataset, config, device=device)
     if config.method == "cross_validation":
         return run_cross_validation_method(dataset, config, device=device)
     if config.method == "full_retraining":
@@ -2261,7 +2973,14 @@ def run_permutation_method(dataset: DatasetBundle, config: TestConfig) -> TestRe
     )
     # Separate cell-type mode retries OOM per cell type (and for the together model).
     if (
-        config.method in {"parallel_permutation", "block_permutation"}
+        config.method in {
+            "parallel_permutation",
+            "block_permutation",
+            "binning",
+            "fourier_spectral_randomization",
+            "joint_truncated_msr",
+            "joint_truncated_rank_msr",
+        }
         and dataset.meta.get("cell_type_mode") == "separate"
     ):
         return dispatch(device)
