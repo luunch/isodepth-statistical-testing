@@ -154,7 +154,7 @@ class TestRealDataExistenceConsistencySpec(unittest.TestCase):
     def test_spec_rejects_invalid_lengths(self) -> None:
         spec = RealDataExistenceConsistencyStudySpec(
             experiment_name="study",
-            base_config=REPO_ROOT / "configs/mouse_hippocampus_existence.json",
+            base_config=REPO_ROOT / "configs/hippocampus/mouse_hippocampus_existence.json",
             output_root=REPO_ROOT / "results/experiments/test",
             n_repeats=2,
             repeat_seeds=[0],
@@ -167,7 +167,7 @@ class TestRealDataExistenceConsistencySpec(unittest.TestCase):
     def test_spec_rejects_non_positive_n_perms(self) -> None:
         spec = RealDataExistenceConsistencyStudySpec(
             experiment_name="study",
-            base_config=REPO_ROOT / "configs/mouse_hippocampus_existence.json",
+            base_config=REPO_ROOT / "configs/hippocampus/mouse_hippocampus_existence.json",
             output_root=REPO_ROOT / "results/experiments/test",
             n_repeats=1,
             repeat_seeds=[0],
@@ -180,7 +180,7 @@ class TestRealDataExistenceConsistencySpec(unittest.TestCase):
     def test_expand_conditions_and_run_config_are_deterministic(self) -> None:
         spec = RealDataExistenceConsistencyStudySpec(
             experiment_name="study",
-            base_config=REPO_ROOT / "configs/mouse_hippocampus_existence.json",
+            base_config=REPO_ROOT / "configs/hippocampus/mouse_hippocampus_existence.json",
             output_root=REPO_ROOT / "results/experiments/test",
             n_repeats=2,
             repeat_seeds=[7, 9],

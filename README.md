@@ -11,15 +11,19 @@ The active pipeline is built around these files and folders:
 - `methods/`: model architectures, training code, test methods, and metrics
 - `run_permutation.py`: generic entry point that executes a config-defined dataset and test method
 - `experiments/configuration.py`: shared config merge and output writing logic
+- `experiments/core/`: shared study helpers (`study_io`, `dataset_cache`, `study_spec`)
+- `experiments/studies/`: multi-run sweep families (flat `python -m experiments.*` shims remain)
+- `scripts/`: utilities under `data_prep/`, `regen/`, `posthoc/`, `studies/<topic>/` (see `scripts/README.md`)
 - `data/schemas.py`: shared `DatasetBundle`, `TestConfig`, `RunConfig`, and `TestResult` contracts
 - `validation/`: smoothness and related validation checks
 
 `run_permutation.py` is the only Python entry point that should live at the
 repository root. Put all other standalone utilities, diagnostics, and
-regeneration helpers under `scripts/` so the root stays reserved for the main
-pipeline entry point.
+regeneration helpers under `scripts/` (not the repo root). Layout details:
+[`docs/SCRIPTS_EXPERIMENTS_LAYOUT.md`](docs/SCRIPTS_EXPERIMENTS_LAYOUT.md).
 
-Legacy scripts that are not part of this pipeline are archived under `old/`.
+Legacy prototypes live under `old/` (gitignored). Pre-cleanup snapshot:
+`archive/pre-cleanup-20260806`.
 
 ## Data Layout
 

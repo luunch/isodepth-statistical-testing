@@ -1,5 +1,16 @@
 # Agent notes — isodepth-statistical-testing
 
+## Scripts / experiments layout (2026-08 cleanup)
+
+Reorganized `scripts/` and `experiments/` on branch `cleanup/scripts-experiments`.
+Archive snapshot: `archive/pre-cleanup-20260806`. Layout contract:
+`docs/SCRIPTS_EXPERIMENTS_LAYOUT.md` and `scripts/README.md`.
+
+- Shared helpers: `experiments/core/{study_io,dataset_cache,study_spec,paths}.py`
+- Studies live under `experiments/studies/<name>/`; flat `python -m experiments.*` paths are shims
+- Scripts live under `scripts/{data_prep,regen,posthoc,studies}/`; top-level `scripts/*.py` are shims
+- WIP from before this cleanup was stashed on `main` as `wip-before-scripts-experiments-reorg-20260806`
+
 ## Synthetic spatial noise
 
 Two generative modes on `data.kernel`:
