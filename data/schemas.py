@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+import re
 from typing import Any, Dict, Mapping, Optional, Union
 
 import numpy as np
@@ -300,6 +301,7 @@ class DataConfig:
     use_raw: bool = False
     min_cells_per_gene: int = 0
     top_var_genes: int = 0
+    exclude_gene_patterns: Optional[list[str]] = None
     normalize_total: bool = False
     log1p: bool = False
     standardize_expression: bool = True
@@ -382,6 +384,25 @@ class DataConfig:
             raise ValueError("data.top_var_genes must be >= 0 (0 means use all genes)")
         if self.top_var_genes > 0 and self.source != "h5ad":
             raise ValueError("data.top_var_genes is only supported when data.source='h5ad'")
+        if self.exclude_gene_patterns is not None:
+            if self.source != "h5ad":
+                raise ValueError("data.exclude_gene_patterns is only supported when data.source='h5ad'")
+            if (
+                not isinstance(self.exclude_gene_patterns, list)
+                or not self.exclude_gene_patterns
+            ):
+                raise ValueError(
+                    "data.exclude_gene_patterns must be a non-empty list of regex strings"
+                )
+            for pattern in self.exclude_gene_patterns:
+                if not isinstance(pattern, str) or not pattern.strip():
+                    raise ValueError("data.exclude_gene_patterns entries must be non-empty strings")
+                try:
+                    re.compile(pattern)
+                except re.error as exc:
+                    raise ValueError(
+                        f"data.exclude_gene_patterns contains invalid regex {pattern!r}: {exc}"
+                    ) from exc
         if self.log1p and self.q is not None:
             raise ValueError("data.log1p cannot be combined with data.q")
         if self.normalize_total and self.q is not None:
@@ -793,7 +814,7 @@ class TestConfig:
     sgd_cosine_eta_min: float = 0.0
     sgd_cosine_t_max_steps: Optional[int] = None
     max_wall_time_sec: Optional[float] = None
-    record_loss_history: bool = False
+    record_loss_history: bool = True
     delta: list[float] = field(default_factory=lambda: [0.05])
     perturb_target: str = "coordinates"
     subset_fractions: list[float] = field(default_factory=lambda: [0.5, 0.7, 0.9])

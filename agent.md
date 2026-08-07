@@ -1,5 +1,46 @@
 # Agent notes — isodepth-statistical-testing
 
+## Loss history recording
+
+`TestConfig.record_loss_history` defaults to `True`. When on, trainers store
+`loss_history` (true-slot scalar per epoch) and `loss_history_per_slot`
+(stacked array, shape `(epochs, total_slots)`) in `model.training_metadata`.
+Chunk merge concatenates per-slot histories along the slot axis (trimmed to
+shared epoch length).
+
+## Calicost clone-specific configs
+
+`calicost_clone_label` values are float-like strings (`"1.0"`, `"2.0"`). Restrict to one
+clone with `data.obs_filters` (string equality). Omit `obs_numeric_filters` when skipping
+tumor-proportion gating; keep `obs_drop_na` + loss-difference whitening on
+`calicost_tumor_proportion` unless whitening is also dropped. Example:
+`configs/calicost/HT306P1_S1H1Fc2U1Z1Bs1_loss_difference_clone2.json` (~199 clone-2 spots;
+~197 after tumor-prop NA drop).
+
+For posthoc GSEA, invoke the script as a module from repo root because filepath invocation
+imports `experiments` before inserting repo root into `sys.path`. If Scanpy/Numba cache
+writes fail, set writable temp caches:
+`env NUMBA_CACHE_DIR=/tmp/numba-cache MPLCONFIGDIR=/tmp/mplconfig /weka/home/ajain71/miniforge3/envs/isodepth_env/bin/python -m scripts.posthoc.postprocess_gsea_isodepth ...`.
+Run completed for
+`results/calicost/HT306P1_S1H1Fc2U1Z1Bs1/loss_diff_clone2_linear_gt0p5_cropy`;
+outputs are in `gsea_isodepth/`.
+
+Sensitivity config excluding MT/ribo/MALAT1/stress genes:
+`configs/calicost/HT306P1_S1H1Fc2U1Z1Bs1_loss_difference_clone2_no_mtribo_stress.json`.
+Completed run:
+`results/calicost/HT306P1_S1H1Fc2U1Z1Bs1/loss_diff_clone2_linear_gt0p5_cropy_no_mtribo_stress`.
+It remains significant (`p_value=0.004`), and the filtered true isodepth is nearly identical
+to the original gt0p5/cropy isodepth (Spearman 0.994, Pearson 0.997). Posthoc GSEA remains
+dominated by negative-end EMT/ECM, IFN/MHC/allograft, IL6/JAK/STAT3, complement/inflammation;
+MT/MALAT1 no longer dominate the bottom-ranked genes.
+
+## Loss curves (restored after scripts/experiments reorg)
+
+`test.record_loss_history` defaults to **True**. Training stores per-epoch true loss and
+`loss_history_per_slot`; runs write `{type}_loss_curve.png` + `{type}_loss_history.npz`
+(separate mode) or `{run_name}_loss_curve.png` / `_loss_history.npz` (combined). Set
+`record_loss_history: false` to skip (saves memory/time on huge n_perms × epochs jobs).
+
 ## Scripts / experiments layout (2026-08 cleanup)
 
 Reorganized `scripts/` and `experiments/` on branch `cleanup/scripts-experiments`.

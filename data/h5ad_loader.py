@@ -395,6 +395,54 @@ def _apply_obs_subset(
     return sub.copy()
 
 
+def _compile_gene_exclusion_patterns(patterns: Optional[list[str]]) -> list[re.Pattern[str]]:
+    if not patterns:
+        return []
+    return [re.compile(str(pattern)) for pattern in patterns]
+
+
+def _apply_gene_exclusions(
+    adata: ad.AnnData,
+    patterns: Optional[list[str]],
+) -> tuple[ad.AnnData, dict]:
+    compiled = _compile_gene_exclusion_patterns(patterns)
+    if not compiled:
+        return adata, {
+            "exclude_gene_patterns": None,
+            "excluded_gene_count": 0,
+            "excluded_gene_names": [],
+        }
+
+    var_names = np.asarray([str(name) for name in adata.var_names], dtype=object)
+    exclude_mask = np.zeros(var_names.shape[0], dtype=bool)
+    for regex in compiled:
+        exclude_mask |= np.fromiter(
+            (bool(regex.search(str(name))) for name in var_names),
+            dtype=bool,
+            count=var_names.shape[0],
+        )
+    if exclude_mask.all():
+        raise ValueError(
+            "data.exclude_gene_patterns removed all genes; "
+            f"patterns={patterns}"
+        )
+    if not exclude_mask.any():
+        return adata, {
+            "exclude_gene_patterns": [str(pattern) for pattern in patterns],
+            "excluded_gene_count": 0,
+            "excluded_gene_names": [],
+        }
+
+    kept = ~exclude_mask
+    excluded = [str(name) for name in var_names[exclude_mask].tolist()]
+    filtered = adata[:, kept].copy()
+    return filtered, {
+        "exclude_gene_patterns": [str(pattern) for pattern in patterns],
+        "excluded_gene_count": int(exclude_mask.sum()),
+        "excluded_gene_names": excluded,
+    }
+
+
 def load_h5ad_dataset(
     *,
     h5ad_path: str,
@@ -405,6 +453,7 @@ def load_h5ad_dataset(
     use_raw: bool = False,
     min_cells_per_gene: int = 0,
     top_var_genes: int = 0,
+    exclude_gene_patterns: Optional[list[str]] = None,
     normalize_total: bool = False,
     log1p: bool = False,
     standardize_expression: bool = True,
@@ -436,6 +485,7 @@ def load_h5ad_dataset(
         adata = _safe_read_h5ad(h5ad_path)
     if getattr(adata, "isbacked", False):
         adata = adata.to_memory()
+    adata, gene_exclusion_meta = _apply_gene_exclusions(adata, exclude_gene_patterns)
     # In cell_type="separate" mode every expression statistic (HVG dispersion,
     # gene support, z-score mean/std) must be computed *within each cell type*,
     # not across the pooled multi-type matrix.  Defer HVG selection and all
@@ -618,6 +668,9 @@ def load_h5ad_dataset(
         "cell_type_key": str(cell_type_key),
         "min_cells_per_gene": int(min_cells_per_gene),
         "top_var_genes": int(top_var_genes),
+        "exclude_gene_patterns": gene_exclusion_meta["exclude_gene_patterns"],
+        "excluded_gene_count": int(gene_exclusion_meta["excluded_gene_count"]),
+        "excluded_gene_names": list(gene_exclusion_meta["excluded_gene_names"]),
         "normalize_total": bool(normalize_total),
         "log1p": bool(log1p),
         "standardize_expression": bool(standardize_expression),
@@ -690,6 +743,7 @@ def load_dataset_from_config(
         use_raw=config.use_raw,
         min_cells_per_gene=config.min_cells_per_gene,
         top_var_genes=config.top_var_genes,
+        exclude_gene_patterns=config.exclude_gene_patterns,
         normalize_total=config.normalize_total,
         log1p=config.log1p,
         standardize_expression=config.standardize_expression,

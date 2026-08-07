@@ -37,6 +37,33 @@ class TestDataSchema(unittest.TestCase):
         )
         self.assertIs(config.validate(), config)
 
+    def test_exclude_gene_patterns_accepts_regex_list_for_h5ad(self) -> None:
+        config = DataConfig(
+            source="h5ad",
+            h5ad="data/example.h5ad",
+            exclude_gene_patterns=["^MT-", "^RPL", "^MALAT1$"],
+        )
+        self.assertIs(config.validate(), config)
+
+    def test_exclude_gene_patterns_rejects_invalid_values(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="h5ad",
+                h5ad="data/example.h5ad",
+                exclude_gene_patterns=[],
+            ).validate()
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="h5ad",
+                h5ad="data/example.h5ad",
+                exclude_gene_patterns=["["],
+            ).validate()
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="synthetic",
+                exclude_gene_patterns=["^MT-"],
+            ).validate()
+
     def test_log1p_cannot_be_combined_with_q(self) -> None:
         with self.assertRaises(ValueError):
             DataConfig(source="h5ad", h5ad="data/example.h5ad", log1p=True, q=2).validate()

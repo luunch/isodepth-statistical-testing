@@ -1449,6 +1449,7 @@ def _attach_training_metadata(
     loss_history: list[float] | None = None,
     loss_history_elapsed_sec: list[float] | None = None,
     loss_history_gradient_updates: list[int] | None = None,
+    loss_history_per_slot: np.ndarray | None = None,
 ) -> None:
     metadata = {
         "n_reruns": int(n_reruns),
@@ -1463,6 +1464,8 @@ def _attach_training_metadata(
         metadata["loss_history_elapsed_sec"] = [float(value) for value in loss_history_elapsed_sec]
     if loss_history_gradient_updates is not None:
         metadata["loss_history_gradient_updates"] = [int(value) for value in loss_history_gradient_updates]
+    if loss_history_per_slot is not None:
+        metadata["loss_history_per_slot"] = np.asarray(loss_history_per_slot, dtype=np.float64)
     if executed_epochs is not None:
         metadata["executed_epochs"] = int(executed_epochs)
     if executed_gradient_steps is not None:
@@ -1490,6 +1493,7 @@ def get_training_metadata(model: nn.Module) -> dict[str, Any]:
         "loss_history": None,
         "loss_history_elapsed_sec": None,
         "loss_history_gradient_updates": None,
+        "loss_history_per_slot": None,
     }
     result = {
         "n_reruns": int(metadata.get("n_reruns", 1)),
@@ -1512,6 +1516,9 @@ def get_training_metadata(model: nn.Module) -> dict[str, Any]:
         "loss_history_gradient_updates": None
         if metadata.get("loss_history_gradient_updates") is None
         else np.asarray(metadata.get("loss_history_gradient_updates"), dtype=np.int64),
+        "loss_history_per_slot": None
+        if metadata.get("loss_history_per_slot") is None
+        else np.asarray(metadata.get("loss_history_per_slot"), dtype=np.float64),
     }
     if "gaussian_pretrain_epochs" in metadata:
         result["gaussian_pretrain_epochs"] = int(metadata["gaussian_pretrain_epochs"])
@@ -1920,10 +1927,11 @@ def train_batched_isodepth_model(
     executed_epochs = 0
     executed_gradient_steps = 0
     stopped_by_time = False
-    record_loss_history = bool(getattr(config, "record_loss_history", False))
+    record_loss_history = bool(getattr(config, "record_loss_history", True))
     loss_history: list[float] = []
     loss_history_elapsed_sec: list[float] = []
     loss_history_gradient_updates: list[int] = []
+    loss_history_per_slot_rows: list[np.ndarray] = []
     max_wall_time_sec = getattr(config, "max_wall_time_sec", None)
     for epoch in iterator:
         if _wall_time_exceeded(training_start, max_wall_time_sec):
@@ -1967,6 +1975,8 @@ def train_batched_isodepth_model(
 
         active_mask_t.copy_(torch.from_numpy(active_mask_np.astype(np.float32)))
         active_count = float(active_mask_np.sum())
+        epoch_slot_loss_num = np.zeros(total_models, dtype=np.float64)
+        epoch_slot_loss_den = np.zeros(total_models, dtype=np.float64)
         if sgd_batch_size is None:
             optimizer.zero_grad()
             output = _forward_batched_parallel_output(
@@ -1983,6 +1993,9 @@ def train_batched_isodepth_model(
             total_loss.backward()
             optimizer.step()
             executed_gradient_steps += 1
+            if record_loss_history:
+                epoch_slot_loss_num = loss_per_model.detach().cpu().numpy().astype(np.float64)
+                epoch_slot_loss_den[:] = 1.0
         else:
             permutation = torch.randperm(n_cells, generator=minibatch_generator)
             for start in range(0, n_cells, sgd_batch_size):
@@ -2011,6 +2024,17 @@ def train_batched_isodepth_model(
                 if lr_scheduler_step is not None:
                     lr_scheduler_step.step()
                 executed_gradient_steps += 1
+                if record_loss_history:
+                    losses_np = batch_loss_per_model.detach().cpu().numpy().astype(np.float64)
+                    if batch_mask is None:
+                        batch_weights = np.full(total_models, float(batch_indices.numel()), dtype=np.float64)
+                    else:
+                        batch_weights = (
+                            batch_mask.detach().sum(dim=tuple(range(1, batch_mask.ndim))).cpu().numpy().astype(np.float64)
+                        )
+                    positive = batch_weights > 0.0
+                    epoch_slot_loss_num[positive] += losses_np[positive] * batch_weights[positive]
+                    epoch_slot_loss_den[positive] += batch_weights[positive]
             if stopped_by_time:
                 if config.verbose:
                     print(
@@ -2063,20 +2087,21 @@ def train_batched_isodepth_model(
 
         if record_loss_history:
             if use_patience:
-                true_loss = float(loss_per_model[0].detach().cpu().item())
+                slot_losses = loss_per_model.detach().cpu().numpy().astype(np.float64)
+            elif np.any(epoch_slot_loss_den > 0.0):
+                slot_losses = np.divide(
+                    epoch_slot_loss_num,
+                    epoch_slot_loss_den,
+                    out=np.full(total_models, np.nan, dtype=np.float64),
+                    where=epoch_slot_loss_den > 0.0,
+                )
             else:
-                with torch.no_grad():
-                    hist_output = _forward_batched_parallel_output(
-                        model,
-                        s_batched_t,
-                        batch_indices=None,
-                        fixed_latent_t=fixed_latent_t if use_fixed_latent else None,
-                    )
-                    hist_loss_per_model = _compute_reconstruction_loss_per_model(
-                        hist_output, current_a_t, loss_mask_t, poisson_size_factors=current_sf_t
-                    )
-                true_loss = float(hist_loss_per_model[0].detach().cpu().item())
+                continue
+            true_loss = float(slot_losses[0])
+            if not np.isfinite(true_loss):
+                continue
             loss_history.append(true_loss)
+            loss_history_per_slot_rows.append(slot_losses)
             loss_history_elapsed_sec.append(float(time.perf_counter() - training_start))
             loss_history_gradient_updates.append(int(executed_gradient_steps))
 
@@ -2116,6 +2141,9 @@ def train_batched_isodepth_model(
     best_train_loss_per_model = train_loss_per_rerun[
         np.arange(n_models, dtype=np.int64), best_rerun_index_per_model
     ]
+    loss_history_per_slot = (
+        np.stack(loss_history_per_slot_rows, axis=0) if loss_history_per_slot_rows else None
+    )
     _attach_training_metadata(
         compact_model,
         n_reruns=n_reruns,
@@ -2129,6 +2157,7 @@ def train_batched_isodepth_model(
         loss_history=loss_history if record_loss_history else None,
         loss_history_elapsed_sec=loss_history_elapsed_sec if record_loss_history else None,
         loss_history_gradient_updates=loss_history_gradient_updates if record_loss_history else None,
+        loss_history_per_slot=loss_history_per_slot if record_loss_history else None,
     )
     if use_gaussian_pretrain:
         compact_model.training_metadata["gaussian_pretrain_epochs"] = warm_epochs
@@ -2246,6 +2275,7 @@ def _merge_chunked_training_results(
     merged_model.load_state_dict(merged_state)
 
     n_reruns = int(config.n_reruns)
+    first_metadata = get_training_metadata(chunk_models[0])
     all_train_loss_per_model = np.concatenate(
         [get_training_metadata(m)["best_train_loss_per_model"] for m in chunk_models],
     )
@@ -2255,7 +2285,19 @@ def _merge_chunked_training_results(
     all_train_loss_per_rerun = np.concatenate(
         [get_training_metadata(m)["train_loss_per_rerun"] for m in chunk_models],
     )
-    true_rerun_isodepths = get_training_metadata(chunk_models[0]).get("true_rerun_isodepths")
+    true_rerun_isodepths = first_metadata.get("true_rerun_isodepths")
+    loss_history = first_metadata.get("loss_history")
+    loss_history_elapsed_sec = first_metadata.get("loss_history_elapsed_sec")
+    loss_history_gradient_updates = first_metadata.get("loss_history_gradient_updates")
+    per_slot_histories = [get_training_metadata(m).get("loss_history_per_slot") for m in chunk_models]
+    loss_history_per_slot = None
+    if per_slot_histories and all(h is not None for h in per_slot_histories):
+        min_epochs = min(int(np.asarray(h).shape[0]) for h in per_slot_histories)
+        if min_epochs > 0:
+            loss_history_per_slot = np.concatenate(
+                [np.asarray(h, dtype=np.float64)[:min_epochs] for h in per_slot_histories],
+                axis=1,
+            )
 
     _attach_training_metadata(
         merged_model,
@@ -2264,6 +2306,21 @@ def _merge_chunked_training_results(
         best_rerun_index_per_model=all_best_rerun_index,
         train_loss_per_rerun=all_train_loss_per_rerun,
         true_rerun_isodepths=true_rerun_isodepths,
+        executed_epochs=first_metadata.get("executed_epochs"),
+        executed_gradient_steps=first_metadata.get("executed_gradient_steps"),
+        stopped_by_time=bool(first_metadata.get("stopped_by_time", False)),
+        loss_history=None if loss_history is None else [float(v) for v in loss_history],
+        loss_history_elapsed_sec=(
+            None
+            if loss_history_elapsed_sec is None
+            else [float(v) for v in loss_history_elapsed_sec]
+        ),
+        loss_history_gradient_updates=(
+            None
+            if loss_history_gradient_updates is None
+            else [int(v) for v in loss_history_gradient_updates]
+        ),
+        loss_history_per_slot=loss_history_per_slot,
     )
     return merged_model, outputs
 
@@ -2461,6 +2518,10 @@ def train_isodepth_model(
             decoder_type=dec_type,
             device=device,
         )
+    loss_history = metadata.get("loss_history")
+    loss_history_elapsed_sec = metadata.get("loss_history_elapsed_sec")
+    loss_history_gradient_updates = metadata.get("loss_history_gradient_updates")
+    loss_history_per_slot = metadata.get("loss_history_per_slot")
     _attach_training_metadata(
         model,
         n_reruns=metadata["n_reruns"],
@@ -2468,6 +2529,25 @@ def train_isodepth_model(
         best_rerun_index_per_model=metadata["best_rerun_index_per_model"],
         train_loss_per_rerun=metadata["train_loss_per_rerun"],
         true_rerun_isodepths=metadata["true_rerun_isodepths"],
+        executed_epochs=metadata.get("executed_epochs"),
+        executed_gradient_steps=metadata.get("executed_gradient_steps"),
+        stopped_by_time=bool(metadata.get("stopped_by_time", False)),
+        loss_history=None if loss_history is None else [float(v) for v in loss_history],
+        loss_history_elapsed_sec=(
+            None
+            if loss_history_elapsed_sec is None
+            else [float(v) for v in loss_history_elapsed_sec]
+        ),
+        loss_history_gradient_updates=(
+            None
+            if loss_history_gradient_updates is None
+            else [int(v) for v in loss_history_gradient_updates]
+        ),
+        loss_history_per_slot=(
+            None
+            if loss_history_per_slot is None
+            else np.asarray(loss_history_per_slot, dtype=np.float64)
+        ),
     )
     return model, np.asarray(training_outputs.pred_true, dtype=np.float32)
 
@@ -2651,9 +2731,17 @@ def train_celltype_parallel_isodepth_model(
     iterator = tqdm(range(config.epochs), disable=not config.verbose)
     executed_epochs = 0
     executed_gradient_steps = 0
+    record_loss_history = bool(getattr(config, "record_loss_history", True))
+    loss_history: list[float] = []
+    loss_history_elapsed_sec: list[float] = []
+    loss_history_gradient_updates: list[int] = []
+    loss_history_per_slot_rows: list[np.ndarray] = []
+    training_start = time.perf_counter()
     for epoch in iterator:
         active_mask_t.copy_(torch.from_numpy(active_mask_np.astype(np.float32)))
         active_count = float(active_mask_np.sum())
+        epoch_slot_loss_num = np.zeros(total_models, dtype=np.float64)
+        epoch_slot_loss_den = np.zeros(total_models, dtype=np.float64)
 
         if sgd_batch_size is None:
             optimizer.zero_grad()
@@ -2665,6 +2753,9 @@ def train_celltype_parallel_isodepth_model(
             total_loss.backward()
             optimizer.step()
             executed_gradient_steps += 1
+            if record_loss_history:
+                epoch_slot_loss_num = loss_per_model.detach().cpu().numpy().astype(np.float64)
+                epoch_slot_loss_den[:] = 1.0
         else:
             permutation = torch.randperm(n_cells, generator=minibatch_generator)
             for batch_start in range(0, n_cells, sgd_batch_size):
@@ -2690,6 +2781,17 @@ def train_celltype_parallel_isodepth_model(
                 if lr_scheduler_step is not None:
                     lr_scheduler_step.step()
                 executed_gradient_steps += 1
+                if record_loss_history:
+                    losses_np = batch_loss_per_model.detach().cpu().numpy().astype(np.float64)
+                    if batch_mask is None:
+                        batch_weights = np.full(total_models, float(batch_indices.numel()), dtype=np.float64)
+                    else:
+                        batch_weights = (
+                            batch_mask.detach().sum(dim=tuple(range(1, batch_mask.ndim))).cpu().numpy().astype(np.float64)
+                        )
+                    positive = batch_weights > 0.0
+                    epoch_slot_loss_num[positive] += losses_np[positive] * batch_weights[positive]
+                    epoch_slot_loss_den[positive] += batch_weights[positive]
 
         executed_epochs = epoch + 1
 
@@ -2715,6 +2817,26 @@ def train_celltype_parallel_isodepth_model(
                         f"(all {total_models} models exhausted patience={config.patience})"
                     )
                 break
+
+        if record_loss_history:
+            if use_patience:
+                slot_losses = loss_per_model.detach().cpu().numpy().astype(np.float64)
+            elif np.any(epoch_slot_loss_den > 0.0):
+                slot_losses = np.divide(
+                    epoch_slot_loss_num,
+                    epoch_slot_loss_den,
+                    out=np.full(total_models, np.nan, dtype=np.float64),
+                    where=epoch_slot_loss_den > 0.0,
+                )
+            else:
+                continue
+            true_loss = float(slot_losses[0])
+            if not np.isfinite(true_loss):
+                continue
+            loss_history.append(true_loss)
+            loss_history_per_slot_rows.append(slot_losses)
+            loss_history_elapsed_sec.append(float(time.perf_counter() - training_start))
+            loss_history_gradient_updates.append(int(executed_gradient_steps))
 
     if use_patience:
         _restore_parallel_model_snapshot(model, best_state, device)
@@ -2772,6 +2894,9 @@ def train_celltype_parallel_isodepth_model(
     best_train_loss_per_model = train_loss_per_rerun[
         np.arange(n_models, dtype=np.int64), best_rerun_index_per_model
     ]
+    loss_history_per_slot = (
+        np.stack(loss_history_per_slot_rows, axis=0) if loss_history_per_slot_rows else None
+    )
 
     _attach_training_metadata(
         compact_model,
@@ -2782,6 +2907,10 @@ def train_celltype_parallel_isodepth_model(
         true_rerun_isodepths=true_rerun_isodepths,
         executed_epochs=executed_epochs,
         executed_gradient_steps=executed_gradient_steps,
+        loss_history=loss_history if record_loss_history else None,
+        loss_history_elapsed_sec=loss_history_elapsed_sec if record_loss_history else None,
+        loss_history_gradient_updates=loss_history_gradient_updates if record_loss_history else None,
+        loss_history_per_slot=loss_history_per_slot if record_loss_history else None,
     )
     return compact_model, training_outputs, s_batched_np
 

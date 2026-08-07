@@ -25,6 +25,7 @@ from analysis.plots import (
     save_gene_expression_vs_coordinates_comparison,
     save_gene_expression_vs_isodepth_plot,
     save_isodepth_triptych,
+    save_loss_curve_plot,
     save_metric_distribution_plot,
     save_moran_distribution_plot,
     save_msr_surrogate_example_plot,
@@ -52,6 +53,7 @@ from data.schemas import (
 from data import raw_coordinates_from_standardized
 from data.transforms import celltype_expression_residuals
 from methods.metrics import summarize_metric_distribution
+from methods.trainers.isodepth import get_training_metadata
 
 
 def load_json_config(path: str | None) -> dict[str, Any]:
@@ -401,6 +403,7 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
             "layer",
             "use_raw",
             "min_cells_per_gene",
+            "exclude_gene_patterns",
             "log1p",
             "standardize_expression",
             "q",
@@ -623,6 +626,39 @@ def _method_artifact_keys(method_name: str) -> set[str]:
     return shared
 
 
+def _loss_history_arrays_from_model(model: Any) -> dict[str, np.ndarray]:
+    """Pull serializable loss-history arrays out of a trained model (if present)."""
+    if model is None:
+        return {}
+    metadata = get_training_metadata(model)
+    payload: dict[str, np.ndarray] = {
+        "n_reruns": np.asarray([int(metadata.get("n_reruns", 1))], dtype=np.int32),
+    }
+    loss_history = metadata.get("loss_history")
+    if loss_history is not None:
+        payload["loss_history"] = np.asarray(loss_history, dtype=np.float32).reshape(-1)
+    per_slot = metadata.get("loss_history_per_slot")
+    if per_slot is not None:
+        arr = np.asarray(per_slot, dtype=np.float32)
+        if arr.ndim == 2 and arr.size > 0:
+            payload["loss_history_per_slot"] = arr
+    return payload
+
+
+def _save_loss_history_npz(
+    model: Any,
+    out_path: Path,
+) -> Path | None:
+    """Persist train-loss histories so loss/p-value curves can be regenerated offline."""
+    payload = _loss_history_arrays_from_model(model)
+    if "loss_history" not in payload and "loss_history_per_slot" not in payload:
+        return None
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(out_path, **payload)
+    return out_path
+
+
 def _save_single_type_outputs(
     type_name: str,
     type_data: dict,
@@ -719,6 +755,14 @@ def _save_single_type_outputs(
 
     p_dist = save_metric_distribution_plot(subset_result, type_dir / f"{type_name}_metric_distribution.png")
     paths["metric_distribution_plot"] = str(p_dist)
+
+    p_loss = save_loss_curve_plot(
+        subset_result,
+        type_dir / f"{type_name}_loss_curve.png",
+        title=f"{type_name} — training loss by epoch",
+    )
+    if p_loss is not None:
+        paths["loss_curve_plot"] = str(p_loss)
 
     if type_data.get("moran_true_mean") is not None and not type_data.get("moran_skipped"):
         moran_result = TestResult(
@@ -849,11 +893,20 @@ def _save_single_type_outputs(
             npz_payload["moran_i_per_gene_per_slot"] = np.asarray(
                 moran_i_slots, dtype=np.float64
             )
+        model_c = type_data.get("model")
+        npz_payload.update(_loss_history_arrays_from_model(model_c))
         np.savez(npz_path, **npz_payload)
         paths["isodepths_npz"] = str(npz_path)
 
     model_c = type_data.get("model")
-    training_metadata = getattr(model_c, "training_metadata", None)
+    loss_hist_path = _save_loss_history_npz(
+        model_c,
+        type_dir / f"{type_name}_loss_history.npz",
+    )
+    if loss_hist_path is not None:
+        paths["loss_history_npz"] = str(loss_hist_path)
+
+    training_metadata = getattr(model_c, "training_metadata", None) if model_c is not None else None
     if isinstance(training_metadata, Mapping):
         true_rerun_isodepths = training_metadata.get("true_rerun_isodepths")
         if true_rerun_isodepths is not None:
@@ -1128,6 +1181,14 @@ def save_standardized_outputs(
     )
     artifact_paths["metric_distribution_plot"] = str(distribution_plot_path)
 
+    loss_curve_plot_path = save_loss_curve_plot(
+        result,
+        out_dir / f"{run_config.output.run_name}_loss_curve.png",
+        title=f"{run_config.output.run_name} — training loss by epoch",
+    )
+    if loss_curve_plot_path is not None:
+        artifact_paths["loss_curve_plot"] = str(loss_curve_plot_path)
+
     moran_plot_path = save_moran_distribution_plot(
         result,
         out_dir / f"{run_config.output.run_name}_moran_distribution.png",
@@ -1255,6 +1316,13 @@ def save_standardized_outputs(
             )
             if true_rerun_plot_path is not None:
                 artifact_paths["true_rerun_isodepth_grid_plot"] = str(true_rerun_plot_path)
+
+    loss_hist_path = _save_loss_history_npz(
+        model,
+        out_dir / f"{run_config.output.run_name}_loss_history.npz",
+    )
+    if loss_hist_path is not None:
+        artifact_paths["loss_history_npz"] = str(loss_hist_path)
 
     payload = result.to_json_dict(
         config=_compact_run_config(run_config),

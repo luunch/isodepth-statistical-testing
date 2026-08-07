@@ -52,6 +52,34 @@ class TestMostaCoordinateScale(unittest.TestCase):
         scale = _detect_coordinate_um_per_unit(adata, h5ad_path="random.h5ad")
         self.assertIsNone(scale)
 
+    def test_loader_excludes_genes_by_regex_before_preprocessing(self) -> None:
+        adata = ad.AnnData(
+            X=np.ones((4, 5), dtype=np.float32),
+            obsm={"spatial": np.array(
+                [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+                dtype=np.float32,
+            )},
+        )
+        adata.var_names = ["MT-CO1", "RPL41", "MALAT1", "HSPA1A", "ACTB"]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "small.h5ad"
+            adata.write_h5ad(path)
+            from data.h5ad_loader import load_h5ad_dataset
+
+            dataset = load_h5ad_dataset(
+                h5ad_path=str(path),
+                spatial_key="spatial",
+                exclude_gene_patterns=["^MT-", "^RPL", "^MALAT1$", "^HSP"],
+                min_cells_per_gene=0,
+                top_var_genes=0,
+                normalize_total=False,
+                log1p=False,
+                standardize_expression=False,
+            )
+
+        self.assertEqual(dataset.meta["var_names"], ["ACTB"])
+        self.assertEqual(dataset.meta["excluded_gene_count"], 4)
+
     def test_loader_meta_on_real_mosta_file_if_present(self) -> None:
         path = Path("data/h5ad/mouse-organogenesis/E10.5_E1S1.MOSTA.h5ad")
         if not path.is_file():

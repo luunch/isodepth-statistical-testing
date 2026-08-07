@@ -16,6 +16,7 @@ from scipy.stats import f as _f_dist
 from scipy.stats import gaussian_kde, linregress, spearmanr
 
 from data.schemas import DatasetBundle, TestResult
+from methods.metrics import metric_prefers_lower
 
 # Exclude points treated as zero expression when ``hide_zero_expression`` is enabled.
 _EXPRESSION_ZERO_EPS = 1e-15
@@ -4518,3 +4519,180 @@ def save_moran_distribution_plot(result: "TestResult", out_path: "str | Path") -
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return out_path
+
+
+def _training_metadata_from_result(result: TestResult) -> dict[str, Any] | None:
+    metadata = result.artifacts.get("training_metadata")
+    if isinstance(metadata, dict):
+        return metadata
+    model = result.artifacts.get("model")
+    if model is not None:
+        metadata = getattr(model, "training_metadata", None)
+        if isinstance(metadata, dict):
+            return metadata
+    return None
+
+
+
+def _extract_loss_history(result: TestResult) -> np.ndarray | None:
+    history = result.artifacts.get("loss_history")
+    if history is None:
+        metadata = _training_metadata_from_result(result)
+        if metadata is not None:
+            history = metadata.get("loss_history")
+    if history is None:
+        return None
+    arr = np.asarray(history, dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        return None
+    return arr
+
+
+def _extract_loss_history_per_slot(result: TestResult) -> tuple[np.ndarray | None, int]:
+    """Return ``(epochs, slots)`` train-loss history and ``n_reruns`` when available."""
+    metadata = _training_metadata_from_result(result)
+    n_reruns = 1
+    history = result.artifacts.get("loss_history_per_slot")
+    if metadata is not None:
+        n_reruns = max(1, int(metadata.get("n_reruns", 1)))
+        if history is None:
+            history = metadata.get("loss_history_per_slot")
+    if history is None:
+        return None, n_reruns
+    arr = np.asarray(history, dtype=np.float64)
+    if arr.ndim != 2 or arr.shape[0] == 0 or arr.shape[1] == 0:
+        return None, n_reruns
+    return arr, n_reruns
+
+
+def _permutation_loss_curves_from_slots(
+    per_slot: np.ndarray,
+    n_reruns: int,
+) -> np.ndarray | None:
+    """Collapse expanded slots to one curve per logical permutation (min over reruns).
+
+    Slot layout is ``(true + n_perms) * n_reruns`` with reruns contiguous per model.
+    Returns shape ``(n_epochs, n_perms)``, or ``None`` when there are no perm models.
+    """
+    n_epochs, n_slots = per_slot.shape
+    n_reruns = max(1, int(n_reruns))
+    if n_slots < 2 * n_reruns or n_slots % n_reruns != 0:
+        # Fall back: treat every non-leading slot as its own faded curve.
+        if n_slots <= 1:
+            return None
+        return np.asarray(per_slot[:, 1:], dtype=np.float64)
+    n_models = n_slots // n_reruns
+    if n_models <= 1:
+        return None
+    reshaped = per_slot.reshape(n_epochs, n_models, n_reruns)
+    return np.nanmin(reshaped[:, 1:, :], axis=2)
+
+
+def _pvalue_trajectory_from_slots(
+    per_slot: np.ndarray,
+    n_reruns: int,
+    metric: str,
+) -> np.ndarray | None:
+    """Epoch-wise permutation p-value from per-slot train losses (min over reruns).
+
+    At each epoch, select the best rerun per logical model by train loss (same rule
+    as final model selection), then compute the usual Monte Carlo p-value of the
+    true slot against the permutation slots. For ``nll_gaussian_mse`` the recorded
+    history is MSE, which is rank-equivalent to the Gaussian-NLL test statistic.
+    """
+    per_slot = np.asarray(per_slot, dtype=np.float64)
+    if per_slot.ndim != 2 or per_slot.shape[0] == 0 or per_slot.shape[1] == 0:
+        return None
+    n_epochs, n_slots = per_slot.shape
+    n_reruns = max(1, int(n_reruns))
+    if n_slots < 2 * n_reruns or n_slots % n_reruns != 0:
+        return None
+    n_models = n_slots // n_reruns
+    if n_models <= 1:
+        return None
+    selected = np.nanmin(per_slot.reshape(n_epochs, n_models, n_reruns), axis=2)
+    true = selected[:, 0]
+    perms = selected[:, 1:]
+    n_perms = int(perms.shape[1])
+    if metric_prefers_lower(metric):
+        counts = np.sum(perms <= true[:, None], axis=1)
+    else:
+        counts = np.sum(perms >= true[:, None], axis=1)
+    return (1.0 + counts.astype(np.float64)) / float(n_perms + 1)
+
+
+def save_loss_curve_plot(
+    result: TestResult,
+    out_path: str | Path,
+    *,
+    title: str | None = None,
+) -> Path | None:
+    """Save training loss vs epoch; faded permutation curves behind the true curve.
+
+    When per-slot loss history is available, also overlays the epoch-wise
+    permutation p-value on a right-hand axis (min-over-reruns selection at each
+    epoch, matching final model selection).
+    """
+    losses = _extract_loss_history(result)
+    per_slot, n_reruns = _extract_loss_history_per_slot(result)
+    if losses is None and per_slot is None:
+        return None
+    if losses is None:
+        losses = np.asarray(per_slot[:, 0], dtype=np.float64)
+
+    out_path = Path(out_path)
+    epochs = np.arange(1, losses.size + 1, dtype=np.float64)
+    fig, ax = plt.subplots(figsize=(7.2, 4.8))
+
+    perm_curves = None if per_slot is None else _permutation_loss_curves_from_slots(per_slot, n_reruns)
+    if perm_curves is not None and perm_curves.shape[0] == losses.size:
+        n_perms = int(perm_curves.shape[1])
+        alpha = float(min(0.35, max(0.04, 4.0 / max(n_perms, 1))))
+        for perm_index in range(n_perms):
+            ax.plot(
+                epochs,
+                perm_curves[:, perm_index],
+                color="0.55",
+                alpha=alpha,
+                linewidth=0.8,
+                zorder=1,
+            )
+        ax.plot([], [], color="0.55", alpha=min(0.8, alpha * 4.0), linewidth=1.2, label=f"Permutations (n={n_perms})")
+
+    ax.plot(epochs, losses, color="steelblue", linewidth=1.8, zorder=3, label="True")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Train loss")
+    ax.set_title(title or "Training loss by epoch")
+    ax.grid(alpha=0.25, linewidth=0.6)
+
+    p_traj = (
+        None
+        if per_slot is None or per_slot.shape[0] != losses.size
+        else _pvalue_trajectory_from_slots(per_slot, n_reruns, result.metric)
+    )
+    if p_traj is not None:
+        ax_p = ax.twinx()
+        ax_p.plot(
+            epochs,
+            p_traj,
+            color="crimson",
+            linewidth=1.6,
+            zorder=4,
+            label="p-value",
+        )
+        ax_p.set_ylabel("p-value", color="crimson")
+        ax_p.tick_params(axis="y", labelcolor="crimson")
+        ax_p.set_ylim(0.0, 1.0)
+        handles_l, labels_l = ax.get_legend_handles_labels()
+        handles_p, labels_p = ax_p.get_legend_handles_labels()
+        ax.legend(handles_l + handles_p, labels_l + labels_p, loc="best", frameon=False)
+    else:
+        ax.legend(loc="best", frameon=False)
+
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
