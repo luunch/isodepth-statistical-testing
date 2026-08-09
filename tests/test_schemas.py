@@ -64,6 +64,36 @@ class TestDataSchema(unittest.TestCase):
                 exclude_gene_patterns=["^MT-"],
             ).validate()
 
+    def test_gene_list_accepts_gene_symbol_list_for_h5ad(self) -> None:
+        config = DataConfig(
+            source="h5ad",
+            h5ad="data/example.h5ad",
+            gene_list=["ACTB", "VEGFA", "HK1"],
+            top_var_genes=0,
+        )
+        self.assertIs(config.validate(), config)
+
+    def test_gene_list_rejects_invalid_values(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(source="h5ad", h5ad="data/example.h5ad", gene_list=[]).validate()
+        with self.assertRaises(ValueError):
+            DataConfig(source="h5ad", h5ad="data/example.h5ad", gene_list=[""]).validate()
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="h5ad", h5ad="data/example.h5ad", gene_list=["ACTB", "ACTB"]
+            ).validate()
+        with self.assertRaises(ValueError):
+            DataConfig(source="synthetic", gene_list=["ACTB"]).validate()
+
+    def test_gene_list_cannot_be_combined_with_top_var_genes(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="h5ad",
+                h5ad="data/example.h5ad",
+                gene_list=["ACTB", "VEGFA"],
+                top_var_genes=3000,
+            ).validate()
+
     def test_log1p_cannot_be_combined_with_q(self) -> None:
         with self.assertRaises(ValueError):
             DataConfig(source="h5ad", h5ad="data/example.h5ad", log1p=True, q=2).validate()

@@ -864,13 +864,14 @@ def save_covariate_whitening_spatial_plot(
     dataset: DatasetBundle,
     out_path: str | Path,
 ) -> Path | None:
-    """Spatial map of the raw ``data.covariate_whitening`` obs column (e.g. tumor proportion).
+    """Spatial map of the raw ``data.covariate_whitening`` obs column(s).
 
     Shows the untransformed obs values on a real (non-normalized) colorbar, independent
     of any clone/cell-type color coding, so the covariate can be inspected on its own scale.
     One panel per cell type (shared color scale) when the dataset used
-    ``cell_type='separate'``; otherwise a single panel over all cells. Returns ``None``
-    when the run does not use ``data.covariate_whitening``.
+    ``cell_type='separate'``; otherwise a single panel over all cells.  When multiple
+    whitening covariates are configured, writes one figure with one column per covariate.
+    Returns ``None`` when the run does not use ``data.covariate_whitening``.
     """
     cov_values = dataset.meta.get("covariate_whitening_values")
     obs_key = dataset.meta.get("covariate_whitening_obs_key")
@@ -878,14 +879,19 @@ def save_covariate_whitening_spatial_plot(
         return None
 
     S = np.asarray(dataset.S, dtype=np.float32)
-    cov = np.asarray(cov_values, dtype=np.float64).reshape(-1)
+    cov = np.asarray(cov_values, dtype=np.float64)
+    if cov.ndim == 1:
+        cov = cov.reshape(-1, 1)
     if cov.shape[0] != S.shape[0]:
         return None
-    finite = np.isfinite(cov)
-    if not finite.any():
-        return None
-    vmin = float(cov[finite].min())
-    vmax = float(cov[finite].max())
+    if isinstance(obs_key, (list, tuple)):
+        labels = [str(k) for k in obs_key]
+    else:
+        labels = [str(obs_key)]
+    if cov.shape[1] != len(labels):
+        labels = [f"{labels[0]}[{j}]" for j in range(cov.shape[1])] if len(labels) == 1 else [
+            f"cov{j}" for j in range(cov.shape[1])
+        ]
 
     cell_type_labels = dataset.meta.get("cell_type_labels")
     cell_type_names = dataset.meta.get("cell_type_names")
@@ -895,32 +901,58 @@ def save_covariate_whitening_spatial_plot(
         and cell_type_names
     )
 
+    n_cov = cov.shape[1]
     if use_grid:
-        labels = np.asarray(cell_type_labels, dtype=np.int64)
+        type_labels = np.asarray(cell_type_labels, dtype=np.int64)
         n_types = len(cell_type_names)
-        fig, axes = plt.subplots(1, n_types, figsize=(4.6 * n_types, 4.6), squeeze=False)
-        for c in range(n_types):
-            ax = axes[0, c]
-            mask = labels == c
-            if not np.any(mask):
-                ax.axis("off")
+        fig, axes = plt.subplots(
+            n_cov, n_types, figsize=(4.6 * n_types, 4.2 * n_cov), squeeze=False
+        )
+        for j in range(n_cov):
+            col = cov[:, j]
+            finite = np.isfinite(col)
+            if not finite.any():
+                for c in range(n_types):
+                    axes[j, c].axis("off")
                 continue
+            vmin = float(col[finite].min())
+            vmax = float(col[finite].max())
+            for c in range(n_types):
+                ax = axes[j, c]
+                mask = type_labels == c
+                if not np.any(mask):
+                    ax.axis("off")
+                    continue
+                title = str(cell_type_names[c]) if n_cov == 1 else f"{cell_type_names[c]} · {labels[j]}"
+                _covariate_scatter_panel(
+                    ax,
+                    S[mask],
+                    col[mask],
+                    title,
+                    colorbar_label=labels[j],
+                    vmin=vmin,
+                    vmax=vmax,
+                )
+        fig.suptitle("Covariate whitening: " + ", ".join(labels))
+    else:
+        fig, axes = plt.subplots(1, n_cov, figsize=(5.2 * n_cov, 5.0), squeeze=False)
+        for j in range(n_cov):
+            col = cov[:, j]
+            finite = np.isfinite(col)
+            if not finite.any():
+                axes[0, j].axis("off")
+                continue
+            vmin = float(col[finite].min())
+            vmax = float(col[finite].max())
             _covariate_scatter_panel(
-                ax,
-                S[mask],
-                cov[mask],
-                str(cell_type_names[c]),
-                colorbar_label=obs_key,
+                axes[0, j],
+                S,
+                col,
+                f"Covariate: {labels[j]}",
+                colorbar_label=labels[j],
                 vmin=vmin,
                 vmax=vmax,
             )
-        fig.suptitle(f"Covariate: {obs_key}")
-    else:
-        fig, ax = plt.subplots(1, 1, figsize=(6.8, 5.4))
-        _covariate_scatter_panel(
-            ax, S, cov, f"Covariate: {obs_key}", colorbar_label=obs_key,
-            vmin=vmin, vmax=vmax,
-        )
 
     fig.tight_layout()
     out_path = Path(out_path)
@@ -4565,27 +4597,69 @@ def _extract_loss_history_per_slot(result: TestResult) -> tuple[np.ndarray | Non
     return arr, n_reruns
 
 
-def _permutation_loss_curves_from_slots(
+def _select_fixed_rerun_curves_from_slots(
     per_slot: np.ndarray,
     n_reruns: int,
 ) -> np.ndarray | None:
-    """Collapse expanded slots to one curve per logical permutation (min over reruns).
+    """Collapse expanded slots to one curve per logical model, using a *fixed* rerun.
 
     Slot layout is ``(true + n_perms) * n_reruns`` with reruns contiguous per model.
-    Returns shape ``(n_epochs, n_perms)``, or ``None`` when there are no perm models.
+    For each model, the rerun with the lowest loss **at the final recorded epoch**
+    is chosen once (mirroring ``best_rerun_index_per_model = argmin(final loss)``
+    in ``methods/trainers/isodepth.py``, which is how the real training pipeline
+    selects a single rerun per model). That same rerun's full trajectory is then
+    used across *all* epochs.
+
+    This intentionally does NOT re-select the best rerun independently at every
+    epoch: doing so would silently stitch together different reruns at different
+    points in training into an artificial "lower envelope" that no single actual
+    training run ever achieved, which is misleading and inconsistent with the
+    fixed-rerun model that the real test statistic is computed from.
+
+    Returns an array of shape ``(n_epochs, n_models)``, or ``None`` if slots
+    can't be grouped into reruns (e.g. no rerun metadata available).
     """
     n_epochs, n_slots = per_slot.shape
     n_reruns = max(1, int(n_reruns))
-    if n_slots < 2 * n_reruns or n_slots % n_reruns != 0:
-        # Fall back: treat every non-leading slot as its own faded curve.
-        if n_slots <= 1:
-            return None
-        return np.asarray(per_slot[:, 1:], dtype=np.float64)
-    n_models = n_slots // n_reruns
-    if n_models <= 1:
+    if n_slots < n_reruns or n_slots % n_reruns != 0:
         return None
+    n_models = n_slots // n_reruns
     reshaped = per_slot.reshape(n_epochs, n_models, n_reruns)
-    return np.nanmin(reshaped[:, 1:, :], axis=2)
+    final_losses = reshaped[-1, :, :]
+    # np.nanargmin raises on all-NaN rows; treat NaNs as +inf so such a model
+    # falls back to rerun 0 instead of crashing the plot.
+    safe_final_losses = np.where(np.isnan(final_losses), np.inf, final_losses)
+    best_rerun_index = np.argmin(safe_final_losses, axis=1)
+    return reshaped[:, np.arange(n_models), best_rerun_index]
+
+
+def _true_and_perm_loss_curves_from_slots(
+    per_slot: np.ndarray,
+    n_reruns: int,
+) -> tuple[np.ndarray, np.ndarray | None]:
+    """Split fixed-rerun model curves into a true curve and permutation curves.
+
+    Both curves use the single rerun per model that wins at the final epoch (see
+    :func:`_select_fixed_rerun_curves_from_slots`), matching the epoch-wise p-value
+    computation in :func:`_pvalue_trajectory_from_slots`, so the plotted "True" line
+    is directly comparable to the permutation curves and the p-value trajectory.
+
+    Returns ``(true_curve, perm_curves)`` where ``true_curve`` has shape
+    ``(n_epochs,)`` and ``perm_curves`` has shape ``(n_epochs, n_perms)`` or is
+    ``None`` when there are no permutation models.
+    """
+    n_epochs, n_slots = per_slot.shape
+    selected = _select_fixed_rerun_curves_from_slots(per_slot, n_reruns)
+    if selected is None:
+        # Fall back: treat every non-leading slot as its own faded curve, and the
+        # leading slot (no rerun grouping available) as the true curve as-is.
+        true_curve = np.asarray(per_slot[:, 0], dtype=np.float64)
+        perm_curves = None if n_slots <= 1 else np.asarray(per_slot[:, 1:], dtype=np.float64)
+        return true_curve, perm_curves
+    true_curve = selected[:, 0]
+    if selected.shape[1] <= 1:
+        return true_curve, None
+    return true_curve, selected[:, 1:]
 
 
 def _pvalue_trajectory_from_slots(
@@ -4593,24 +4667,23 @@ def _pvalue_trajectory_from_slots(
     n_reruns: int,
     metric: str,
 ) -> np.ndarray | None:
-    """Epoch-wise permutation p-value from per-slot train losses (min over reruns).
+    """Epoch-wise permutation p-value from per-slot train losses (fixed rerun).
 
-    At each epoch, select the best rerun per logical model by train loss (same rule
-    as final model selection), then compute the usual Monte Carlo p-value of the
-    true slot against the permutation slots. For ``nll_gaussian_mse`` the recorded
-    history is MSE, which is rank-equivalent to the Gaussian-NLL test statistic.
+    Each model (true and every permutation) is represented by the single rerun
+    that wins at the final epoch (see :func:`_select_fixed_rerun_curves_from_slots`),
+    matching final model selection. The Monte Carlo p-value is then computed from
+    that fixed trajectory's loss at each epoch, so this traces how the *actual*
+    kept models ranked against each other over the course of training, rather than
+    re-selecting the best rerun independently at every epoch. For
+    ``nll_gaussian_mse`` the recorded history is MSE, which is rank-equivalent to
+    the Gaussian-NLL test statistic.
     """
     per_slot = np.asarray(per_slot, dtype=np.float64)
     if per_slot.ndim != 2 or per_slot.shape[0] == 0 or per_slot.shape[1] == 0:
         return None
-    n_epochs, n_slots = per_slot.shape
-    n_reruns = max(1, int(n_reruns))
-    if n_slots < 2 * n_reruns or n_slots % n_reruns != 0:
+    selected = _select_fixed_rerun_curves_from_slots(per_slot, n_reruns)
+    if selected is None or selected.shape[1] <= 1:
         return None
-    n_models = n_slots // n_reruns
-    if n_models <= 1:
-        return None
-    selected = np.nanmin(per_slot.reshape(n_epochs, n_models, n_reruns), axis=2)
     true = selected[:, 0]
     perms = selected[:, 1:]
     n_perms = int(perms.shape[1])
@@ -4629,22 +4702,26 @@ def save_loss_curve_plot(
 ) -> Path | None:
     """Save training loss vs epoch; faded permutation curves behind the true curve.
 
-    When per-slot loss history is available, also overlays the epoch-wise
-    permutation p-value on a right-hand axis (min-over-reruns selection at each
-    epoch, matching final model selection).
+    When per-slot loss history is available, the plotted "True" curve and the
+    permutation curves both use the min-over-reruns selection at each epoch
+    (matching final model selection), so they are directly comparable and the
+    epoch-wise permutation p-value overlaid on a right-hand axis reflects exactly
+    what's drawn. Without per-slot history, falls back to the single recorded
+    ``loss_history`` (rerun 0) and no permutation curves or p-value are shown.
     """
-    losses = _extract_loss_history(result)
     per_slot, n_reruns = _extract_loss_history_per_slot(result)
-    if losses is None and per_slot is None:
-        return None
+    perm_curves = None
+    if per_slot is not None:
+        losses, perm_curves = _true_and_perm_loss_curves_from_slots(per_slot, n_reruns)
+    else:
+        losses = _extract_loss_history(result)
     if losses is None:
-        losses = np.asarray(per_slot[:, 0], dtype=np.float64)
+        return None
 
     out_path = Path(out_path)
     epochs = np.arange(1, losses.size + 1, dtype=np.float64)
     fig, ax = plt.subplots(figsize=(7.2, 4.8))
 
-    perm_curves = None if per_slot is None else _permutation_loss_curves_from_slots(per_slot, n_reruns)
     if perm_curves is not None and perm_curves.shape[0] == losses.size:
         n_perms = int(perm_curves.shape[1])
         alpha = float(min(0.35, max(0.04, 4.0 / max(n_perms, 1))))
@@ -4659,7 +4736,8 @@ def save_loss_curve_plot(
             )
         ax.plot([], [], color="0.55", alpha=min(0.8, alpha * 4.0), linewidth=1.2, label=f"Permutations (n={n_perms})")
 
-    ax.plot(epochs, losses, color="steelblue", linewidth=1.8, zorder=3, label="True")
+    true_label = "True (best rerun)" if perm_curves is not None or per_slot is not None else "True"
+    ax.plot(epochs, losses, color="steelblue", linewidth=1.8, zorder=3, label=true_label)
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Train loss")
     ax.set_title(title or "Training loss by epoch")

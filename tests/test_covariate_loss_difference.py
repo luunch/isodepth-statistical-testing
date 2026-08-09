@@ -31,6 +31,32 @@ class LossDifferenceWhiteningTests(unittest.TestCase):
         self.assertEqual(cfg.data.covariate_whitening.method, "loss-difference")
         self.assertTrue(cfg.data.covariate_whitening.is_loss_difference)
 
+    def test_covariate_whitening_multi_obs_key_parsing(self) -> None:
+        cfg = run_config_from_mapping(
+            {
+                "data": {
+                    "source": "h5ad",
+                    "h5ad": "data/h5ad/dummy.h5ad",
+                    "covariate_whitening": "loss-difference",
+                    "covariate_whitening_obs_key": [
+                        "calicost_tumor_proportion",
+                        "log1p_total_counts",
+                    ],
+                },
+            }
+        )
+        self.assertEqual(
+            cfg.data.covariate_whitening.obs_keys,
+            ["calicost_tumor_proportion", "log1p_total_counts"],
+        )
+
+    def test_freedman_lane_rejects_multi_obs_key(self) -> None:
+        with self.assertRaises(ValueError):
+            CovariateWhiteningConfig(
+                method="freedman-lane",
+                obs_key=["a", "b"],
+            ).validate()
+
     def test_covariate_whitening_alias(self) -> None:
         whitening = CovariateWhiteningConfig(
             method="loss_difference",
@@ -140,6 +166,48 @@ class LossDifferenceWhiteningTests(unittest.TestCase):
 
         # True slot should have a lower (better) loss than most/all permuted slots
         self.assertLess(float(outputs.stat_true), float(np.median(outputs.stat_perm)))
+
+    def test_parallel_training_with_multi_fixed_covariate(self) -> None:
+        rng = np.random.default_rng(1)
+        n_cells = 60
+        n_genes = 8
+        covariate_values = rng.normal(size=(n_cells, 2)).astype(np.float32)
+        S = rng.normal(size=(n_cells, 2)).astype(np.float32)
+        A = (
+            (S[:, 0] - S[:, 0].mean())[:, None]
+            + 0.4 * covariate_values[:, 0:1]
+            + 0.3 * covariate_values[:, 1:2]
+            + rng.normal(scale=0.05, size=(n_cells, n_genes))
+        ).astype(np.float32)
+        A = (A - A.mean(axis=0, keepdims=True)) / (A.std(axis=0, keepdims=True) + 1e-8)
+
+        config = TestConfig(
+            metric="nll_gaussian_mse",
+            decoder="linear",
+            n_perms=3,
+            epochs=10,
+            n_reruns=1,
+            seed=0,
+            device="cpu",
+            verbose=False,
+        ).validate()
+        device = resolve_device("cpu")
+        model, outputs, _, artifacts = run_loss_difference_parallel_training(
+            train_parallel_isodepth_model,
+            covariate_values=covariate_values,
+            model_label="h(d, n1, n2)",
+            train_kwargs={
+                "S": S,
+                "A": A,
+                "config": config,
+                "device": device,
+            },
+        )
+        self.assertEqual(int(getattr(model, "covariate_dim", -1)), 2)
+        self.assertEqual(outputs.model_metrics.shape[0], config.n_perms + 1)
+        self.assertTrue(np.all(np.isfinite(outputs.model_metrics)))
+        latent = np.asarray(artifacts["loss_difference_covariate_latent"])
+        self.assertEqual(latent.shape, (n_cells, 2))
 
 
 if __name__ == "__main__":

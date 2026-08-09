@@ -96,7 +96,14 @@ def whiten_expression_freedman_lane(
 ) -> tuple[np.ndarray, dict[str, object]]:
     """Fit h(n) on one expression block, residualize, and per-gene re-standardize."""
     A = np.asarray(A, dtype=np.float32)
-    values = np.asarray(covariate_values, dtype=np.float32).reshape(-1)
+    values = np.asarray(covariate_values, dtype=np.float32)
+    if values.ndim == 2 and values.shape[1] > 1:
+        raise ValueError(
+            "Freedman–Lane whitening currently supports a single covariate column; "
+            f"got shape {values.shape}. Use loss-difference whitening for multiple "
+            "covariates, or pass one obs_key."
+        )
+    values = values.reshape(-1)
     if values.shape[0] != A.shape[0]:
         raise ValueError(
             f"covariate_whitening length {values.shape[0]} != expression rows {A.shape[0]}"

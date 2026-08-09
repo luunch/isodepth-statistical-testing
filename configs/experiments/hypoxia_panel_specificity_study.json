@@ -1,0 +1,12 @@
+{
+  "experiment_name": "hypoxia_panel_specificity",
+  "base_config": "configs/calicost/HT306P1_S1H1Fc2U1Z1Bs1_loss_difference_clone2_hypoxia_genes_tumor_logcounts.json",
+  "output_root": "results/experiments/hypoxia_panel_specificity",
+  "n_panels": 30,
+  "panel_size": 200,
+  "panel_seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29],
+  "n_perms": 249,
+  "n_reruns": 30,
+  "universe_min_cells_per_gene": 3,
+  "include_target_run": true
+}

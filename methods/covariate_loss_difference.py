@@ -32,14 +32,14 @@ def dataset_uses_loss_difference_whitening(dataset: DatasetBundle) -> bool:
     return isinstance(cw, Mapping) and cw.get("method") == "loss-difference"
 
 
-def covariate_whitening_obs_key(dataset: DatasetBundle) -> str:
+def covariate_whitening_obs_key(dataset: DatasetBundle) -> str | list[str]:
     cw = dataset.meta.get("covariate_whitening")
     if not isinstance(cw, Mapping):
         raise ValueError("dataset.meta['covariate_whitening'] is missing.")
     obs_key = cw.get("obs_key")
     if not obs_key:
         raise ValueError("dataset.meta['covariate_whitening']['obs_key'] is missing.")
-    return str(obs_key)
+    return obs_key if isinstance(obs_key, (list, tuple)) else str(obs_key)
 
 
 def covariate_whitening_values(dataset: DatasetBundle) -> np.ndarray:
@@ -51,7 +51,21 @@ def covariate_whitening_values(dataset: DatasetBundle) -> np.ndarray:
             "dataset.meta['covariate_whitening_values'] is missing.  "
             "Ensure load_dataset extracts the obs column during data loading."
         )
-    return np.asarray(values, dtype=np.float32).reshape(-1)
+    return _as_covariate_matrix(values)
+
+
+def _as_covariate_matrix(values: np.ndarray) -> np.ndarray:
+    """Squeeze a single-column ``(N, 1)`` covariate to ``(N,)``; keep multi-column ``(N, K)`` as-is.
+
+    Never flatten a genuine ``(N, K)`` multi-covariate matrix with a blanket
+    ``reshape(-1)`` — that scrambles the ``N*K`` values into a single length-``N*K``
+    vector instead of preserving per-cell rows, which is a shape (not just semantic)
+    corruption downstream (e.g. ``_concat_covariate`` in ``methods/architectures.py``).
+    """
+    arr = np.asarray(values, dtype=np.float32)
+    if arr.ndim == 2 and arr.shape[1] == 1:
+        return arr.reshape(-1)
+    return arr
 
 
 def run_loss_difference_parallel_training(
@@ -86,10 +100,16 @@ def run_loss_difference_parallel_training(
 def loss_difference_artifacts_from_outputs(
     *,
     covariate_values: np.ndarray,
-    obs_key: str,
+    obs_key: str | list[str],
     joint_outputs: BatchedTrainingOutputs,
 ) -> dict[str, object]:
-    values = np.asarray(covariate_values, dtype=np.float32).reshape(-1)
+    values = np.asarray(covariate_values, dtype=np.float32)
+    if values.ndim == 1:
+        values = values.reshape(-1)
+    elif values.ndim != 2:
+        raise ValueError(
+            f"covariate_values must be 1D or 2D; got shape {values.shape}"
+        )
     return {
         "loss_difference_obs_key": obs_key,
         "loss_difference_covariate_values": values,

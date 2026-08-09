@@ -468,3 +468,31 @@ def save_spearman_histogram(
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return out_path
+
+
+def save_target_vs_null_histogram(
+    null_values: Iterable[float],
+    target_value: float,
+    out_path: str | Path,
+    *,
+    title: str,
+    x_label: str,
+    target_label: str = "Target",
+) -> Path | None:
+    null_array = np.asarray(list(null_values), dtype=np.float64)
+    if null_array.size == 0:
+        return None
+
+    out_path = Path(out_path)
+    fig, ax = plt.subplots(1, 1, figsize=(7, 5))
+    ax.hist(null_array, bins=min(20, max(5, null_array.size // 2)), color="lightsteelblue", edgecolor="black")
+    ax.axvline(float(target_value), color="crimson", linestyle="--", linewidth=2.0, label=target_label)
+    ax.set_title(title)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel("Count")
+    ax.legend()
+    ax.grid(axis="y", alpha=0.25, linewidth=0.5)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path

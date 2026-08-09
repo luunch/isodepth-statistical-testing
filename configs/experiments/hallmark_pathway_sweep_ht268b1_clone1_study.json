@@ -1,0 +1,10 @@
+{
+  "experiment_name": "hallmark_pathway_sweep_ht268b1_clone1",
+  "base_config": "configs/calicost/HT268B1_slice1_U1_loss_difference_clone1_hypoxia_genes_tumor_logcounts.json",
+  "output_root": "results/experiments/hallmark_pathway_sweep_ht268b1_clone1",
+  "gmt_path": "data/gmt/h.all.v2024.1.Hs.symbols.gmt",
+  "n_perms": 249,
+  "n_reruns": 30,
+  "alpha": 0.05,
+  "min_requested_genes": 15
+}

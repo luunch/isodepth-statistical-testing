@@ -51,13 +51,30 @@ def total_counts_covariate_values(A: np.ndarray) -> np.ndarray:
 
 
 def zscore_covariate(values: np.ndarray) -> np.ndarray:
-    """Per-cell z-score of a 1D covariate on the supplied cell subset."""
-    v = np.asarray(values, dtype=np.float32).reshape(-1)
-    mu = float(v.mean())
-    sigma = float(v.std())
-    if sigma < 1e-8:
-        return np.zeros_like(v, dtype=np.float32)
-    return np.asarray((v - mu) / sigma, dtype=np.float32)
+    """Column-wise z-score of a 1D ``(N,)`` or 2D ``(N, K)`` covariate matrix.
+
+    Returns ``(N,)`` for 1D input and ``(N, K)`` for 2D input.  Constant columns
+    are replaced with zeros.
+    """
+    v = np.asarray(values, dtype=np.float32)
+    if v.ndim == 1:
+        mu = float(v.mean())
+        sigma = float(v.std())
+        if sigma < 1e-8:
+            return np.zeros_like(v, dtype=np.float32)
+        return np.asarray((v - mu) / sigma, dtype=np.float32)
+    if v.ndim != 2:
+        raise ValueError(f"zscore_covariate expects 1D or 2D array; got shape {v.shape}")
+    out = np.empty_like(v, dtype=np.float32)
+    for j in range(v.shape[1]):
+        col = v[:, j]
+        mu = float(col.mean())
+        sigma = float(col.std())
+        if sigma < 1e-8:
+            out[:, j] = 0.0
+        else:
+            out[:, j] = (col - mu) / sigma
+    return out
 
 
 def midline_latent(S: np.ndarray) -> np.ndarray:

@@ -93,11 +93,16 @@ def _run_parallel_isodepth_training(
 ) -> tuple[object, object, np.ndarray, dict[str, object]]:
     """Train the parallel isodepth model, using h(d,n) when loss-difference is enabled."""
     if dataset_uses_loss_difference_whitening(dataset):
-        values = (
-            np.asarray(covariate_values, dtype=np.float32).reshape(-1)
-            if covariate_values is not None
-            else _loss_diff_covariate_whitening_values(dataset)
-        )
+        if covariate_values is not None:
+            values = np.asarray(covariate_values, dtype=np.float32)
+            # Only squeeze a genuine single-column (N, 1) covariate to (N,); a
+            # blanket reshape(-1) here would scramble a multi-covariate (N, K)
+            # matrix (e.g. tumor proportion + log counts) into a flat length-N*K
+            # vector instead of preserving per-cell rows.
+            if values.ndim == 2 and values.shape[1] == 1:
+                values = values.reshape(-1)
+        else:
+            values = _loss_diff_covariate_whitening_values(dataset)
         obs_key = _loss_diff_covariate_whitening_obs_key(dataset)
         model, outputs, s_batched_np, artifacts = run_loss_difference_parallel_training(
             train_fn,

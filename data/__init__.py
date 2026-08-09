@@ -111,9 +111,10 @@ def load_dataset(config: DataConfig, *, covariate=None) -> DatasetBundle:
             covariate_obs_key = covariate.type
         elif covariate.type == TOTAL_COUNTS_COVARIATE:
             compute_total_counts = True
-    whitening_obs_key: Optional[str] = None
+    whitening_obs_key: Optional[str | list[str]] = None
     if config.covariate_whitening is not None:
-        whitening_obs_key = config.covariate_whitening.obs_key
+        keys = config.covariate_whitening.obs_keys
+        whitening_obs_key = keys[0] if len(keys) == 1 else keys
     if config.source == "h5ad":
         dataset = load_h5ad_dataset_from_config(
             config,
@@ -141,9 +142,11 @@ def load_dataset(config: DataConfig, *, covariate=None) -> DatasetBundle:
     else:
         raise ValueError(f"Unsupported data source '{config.source}'")
     if config.covariate_whitening is not None:
+        keys = config.covariate_whitening.obs_keys
         dataset.meta["covariate_whitening"] = {
             "method": config.covariate_whitening.method,
-            "obs_key": config.covariate_whitening.obs_key,
+            "obs_key": keys[0] if len(keys) == 1 else keys,
+            "obs_keys": keys,
         }
     if getattr(config, "spatial_denoise_radius_um", None):
         from data.spatial_regions import denoise_spatial_outliers

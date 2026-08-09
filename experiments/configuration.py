@@ -404,6 +404,7 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
             "use_raw",
             "min_cells_per_gene",
             "exclude_gene_patterns",
+            "gene_list",
             "log1p",
             "standardize_expression",
             "q",

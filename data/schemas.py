@@ -302,6 +302,15 @@ class DataConfig:
     min_cells_per_gene: int = 0
     top_var_genes: int = 0
     exclude_gene_patterns: Optional[list[str]] = None
+    # Restrict analysis to exactly this fixed gene panel (e.g. all genes in a pathway/gene-set
+    # of interest) instead of data-driven HVG selection. Every downstream preprocessing
+    # statistic (min_cells_per_gene support, normalize_total size factors, per-gene z-score
+    # mean/std, HVG dispersion if top_var_genes is also nonzero) is then computed with respect
+    # to only these genes, not the full transcriptome. Genes absent from the dataset are
+    # silently dropped (recorded in dataset meta as gene_list_missing_genes). Mutually
+    # exclusive with top_var_genes > 0 (set top_var_genes=0 to use the panel as-is; gene_list
+    # replaces HVG selection rather than adding to it).
+    gene_list: Optional[list[str]] = None
     normalize_total: bool = False
     log1p: bool = False
     standardize_expression: bool = True
@@ -403,6 +412,22 @@ class DataConfig:
                     raise ValueError(
                         f"data.exclude_gene_patterns contains invalid regex {pattern!r}: {exc}"
                     ) from exc
+        if self.gene_list is not None:
+            if self.source != "h5ad":
+                raise ValueError("data.gene_list is only supported when data.source='h5ad'")
+            if not isinstance(self.gene_list, list) or not self.gene_list:
+                raise ValueError("data.gene_list must be a non-empty list of gene symbol strings")
+            for gene in self.gene_list:
+                if not isinstance(gene, str) or not gene.strip():
+                    raise ValueError("data.gene_list entries must be non-empty strings")
+            if len(set(self.gene_list)) != len(self.gene_list):
+                raise ValueError("data.gene_list must not contain duplicate gene names")
+            if self.top_var_genes > 0:
+                raise ValueError(
+                    "data.gene_list cannot be combined with data.top_var_genes > 0; "
+                    "gene_list replaces HVG selection rather than adding to it -- "
+                    "set data.top_var_genes=0 to use the fixed gene panel as-is"
+                )
         if self.log1p and self.q is not None:
             raise ValueError("data.log1p cannot be combined with data.q")
         if self.normalize_total and self.q is not None:
@@ -679,10 +704,22 @@ COVARIATE_WHITENING_METHOD_ALIASES = {
 
 @dataclass
 class CovariateWhiteningConfig:
-    """Expression whitening applied before the statistical test."""
+    """Expression whitening applied before the statistical test.
+
+    ``obs_key`` may be a single obs column name or a list of columns.  For
+    ``loss-difference``, multiple keys are concatenated as a multi-dimensional
+    fixed covariate ``n`` in ``h(d, n)``.  ``freedman-lane`` currently requires a
+    single key.
+    """
 
     method: str
-    obs_key: str
+    obs_key: str | list[str]
+
+    @property
+    def obs_keys(self) -> list[str]:
+        if isinstance(self.obs_key, str):
+            return [self.obs_key]
+        return list(self.obs_key)
 
     def validate(self) -> "CovariateWhiteningConfig":
         method = _normalize_covariate_whitening_method(self.method)
@@ -691,12 +728,26 @@ class CovariateWhiteningConfig:
                 f"Unsupported data.covariate_whitening method '{self.method}'. "
                 f"Expected one of {sorted(SUPPORTED_COVARIATE_WHITENING_METHODS)}"
             )
-        if not str(self.obs_key).strip():
+        keys = self.obs_keys
+        if not keys:
             raise ValueError(
-                "data.covariate_whitening requires a non-empty obs_key for the covariate column."
+                "data.covariate_whitening requires a non-empty obs_key (string or list)."
+            )
+        cleaned: list[str] = []
+        for key in keys:
+            text = str(key).strip()
+            if not text:
+                raise ValueError(
+                    "data.covariate_whitening obs_key entries must be non-empty strings."
+                )
+            cleaned.append(text)
+        if method == "freedman-lane" and len(cleaned) > 1:
+            raise ValueError(
+                "data.covariate_whitening method 'freedman-lane' currently supports "
+                "a single obs_key; use 'loss-difference' for multiple covariates."
             )
         self.method = method
-        self.obs_key = str(self.obs_key).strip()
+        self.obs_key = cleaned[0] if len(cleaned) == 1 else cleaned
         return self
 
     @property
@@ -711,6 +762,17 @@ class CovariateWhiteningConfig:
 def _normalize_covariate_whitening_method(method: str) -> str:
     normalized = str(method).strip().lower()
     return COVARIATE_WHITENING_METHOD_ALIASES.get(normalized, normalized)
+
+
+def _normalize_obs_key_spec(raw: Any) -> str | list[str]:
+    if isinstance(raw, str):
+        return raw
+    if isinstance(raw, (list, tuple)):
+        return [str(item) for item in raw]
+    raise TypeError(
+        "data.covariate_whitening obs_key must be a string or list of strings; "
+        f"got {type(raw).__name__}"
+    )
 
 
 def _covariate_whitening_from_raw(
@@ -728,7 +790,10 @@ def _covariate_whitening_from_raw(
                 "data.covariate_whitening_obs_key is required when "
                 "data.covariate_whitening is a method string."
             )
-        return CovariateWhiteningConfig(method=method, obs_key=str(obs_key)).validate()
+        return CovariateWhiteningConfig(
+            method=method,
+            obs_key=_normalize_obs_key_spec(obs_key),
+        ).validate()
     if isinstance(raw, Mapping):
         method_raw = raw.get("method", raw.get("type"))
         if method_raw is None:
@@ -736,13 +801,16 @@ def _covariate_whitening_from_raw(
                 "data.covariate_whitening mapping must include 'method'."
             )
         obs_key = raw.get("obs_key", raw.get("column", obs_key_fallback))
+        if obs_key is None and "obs_keys" in raw:
+            obs_key = raw.get("obs_keys")
         if not obs_key:
             raise ValueError(
-                "data.covariate_whitening mapping must include 'obs_key'."
+                "data.covariate_whitening mapping must include 'obs_key' "
+                "(string or list)."
             )
         return CovariateWhiteningConfig(
             method=str(method_raw),
-            obs_key=str(obs_key),
+            obs_key=_normalize_obs_key_spec(obs_key),
         ).validate()
     raise TypeError(
         "data.covariate_whitening must be a method string, a mapping with "

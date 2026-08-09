@@ -1,21 +1,22 @@
 {
   "data": {
     "source": "h5ad",
-    "h5ad": "data/h5ad/calicost/HT268B1-Th1K3Fc2U1Z1Bs1.h5ad",
+    "h5ad": "data/h5ad/calicost/HT112C1-U1_ST_Bn1.h5ad",
     "spatial_key": "spatial",
     "layer": "counts",
     "use_raw": false,
     "cell_type": "separate",
     "cell_type_key": "calicost_clone_label",
-    "obs_filters": {
-      "calicost_clone_label": "1.0"
-    },
     "obs_drop_na": [
       "calicost_clone_label",
-      "calicost_tumor_proportion"
+      "calicost_tumor_proportion",
+      "log1p_total_counts"
     ],
     "covariate_whitening": "loss-difference",
-    "covariate_whitening_obs_key": "calicost_tumor_proportion",
+    "covariate_whitening_obs_key": [
+      "calicost_tumor_proportion",
+      "log1p_total_counts"
+    ],
     "min_cells_per_gene": 3,
     "min_cells_per_celltype": 30,
     "top_var_genes": 3000,
@@ -28,6 +29,11 @@
     "obs_numeric_filters": {
       "calicost_tumor_proportion": {
         "gt": 0.7
+      }
+    },
+    "spatial_crop": {
+      "x": {
+        "gt": -3
       }
     },
     "spatial_denoise_radius_um": 300
@@ -47,11 +53,11 @@
     "decoder": "linear",
     "batch_size": null,
     "verbose": true,
-    "coordinate_um_per_unit": 0.3406761257748889
+    "coordinate_um_per_unit": 59.82434897760636
   },
   "output": {
-    "out_dir": "results/calicost/HT268B1-Th1K3Fc2U1Z1Bs1",
-    "run_name": "loss_diff_clone1_gt0p7_linear",
+    "out_dir": "results/calicost/HT112C1_U1_fig4_loss_diff_tumor_prop_gt0p7",
+    "run_name": "loss_diff_gt0p7_cropx_3000hvg_tumor_logcounts",
     "save_preds": false,
     "save_perm_stats": true
   }

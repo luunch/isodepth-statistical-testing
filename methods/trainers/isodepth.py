@@ -1612,7 +1612,7 @@ def _compact_parallel_model(
 
     if isinstance(expanded_model, ParallelIsoDepthWithFixedCovariateNet):
         n_expanded = _parallel_slot_count(expanded_model)
-        covariate_np = expanded_model.covariate_values.detach().cpu().numpy().reshape(-1)
+        covariate_np = expanded_model.covariate_values.detach().cpu().numpy()
         compact_model = ParallelIsoDepthWithFixedCovariateNet(
             n_models,
             n_genes,
@@ -2249,7 +2249,7 @@ def _merge_chunked_training_results(
             latent_dim=latent_dim, decoder_type=decoder_type,
         )
     elif isinstance(chunk_models[0], ParallelIsoDepthWithFixedCovariateNet):
-        covariate_np = chunk_models[0].covariate_values.detach().cpu().numpy().reshape(-1)
+        covariate_np = chunk_models[0].covariate_values.detach().cpu().numpy()
         merged_model = ParallelIsoDepthWithFixedCovariateNet(
             n_perm_models,
             n_genes,
@@ -2864,7 +2864,7 @@ def train_celltype_parallel_isodepth_model(
             n_models,
             n_cell_types,
             n_genes,
-            model.covariate_values.detach().cpu().numpy().reshape(-1),
+            model.covariate_values.detach().cpu().numpy(),
             latent_dim=latent_dim,
             decoder_type=decoder_type,
             encoder_type=encoder_type,

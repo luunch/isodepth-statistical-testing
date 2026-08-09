@@ -443,6 +443,50 @@ def _apply_gene_exclusions(
     }
 
 
+def _apply_gene_list_filter(
+    adata: ad.AnnData,
+    gene_list: Optional[list[str]],
+) -> tuple[ad.AnnData, dict]:
+    """Restrict ``adata`` to exactly the genes in ``gene_list`` (intersected with what's present).
+
+    Unlike ``top_var_genes`` (data-driven HVG selection), this is a *fixed* gene panel supplied
+    by the caller (e.g. every gene in a pathway/gene-set of interest), so every downstream
+    preprocessing statistic -- ``min_cells_per_gene`` support, ``normalize_total`` size factors,
+    per-gene z-score mean/std -- ends up computed with respect to only these genes rather than
+    the full transcriptome.
+    """
+    if not gene_list:
+        return adata, {
+            "gene_list": None,
+            "gene_list_requested_count": 0,
+            "gene_list_matched_count": 0,
+            "gene_list_missing_genes": [],
+        }
+
+    requested = [str(g) for g in gene_list]
+    var_names = np.asarray([str(name) for name in adata.var_names], dtype=object)
+    present = set(var_names.tolist())
+    missing = [g for g in requested if g not in present]
+    keep = set(requested) & present
+    if not keep:
+        raise ValueError(
+            f"data.gene_list matched no genes in the dataset (requested {len(requested)} genes, "
+            f"e.g. {requested[:10]})"
+        )
+
+    keep_mask = np.fromiter(
+        (name in keep for name in var_names), dtype=bool, count=var_names.shape[0]
+    )
+    filtered = adata[:, keep_mask].copy()
+    meta = {
+        "gene_list": requested,
+        "gene_list_requested_count": len(requested),
+        "gene_list_matched_count": int(keep_mask.sum()),
+        "gene_list_missing_genes": missing,
+    }
+    return filtered, meta
+
+
 def load_h5ad_dataset(
     *,
     h5ad_path: str,
@@ -454,6 +498,7 @@ def load_h5ad_dataset(
     min_cells_per_gene: int = 0,
     top_var_genes: int = 0,
     exclude_gene_patterns: Optional[list[str]] = None,
+    gene_list: Optional[list[str]] = None,
     normalize_total: bool = False,
     log1p: bool = False,
     standardize_expression: bool = True,
@@ -465,7 +510,7 @@ def load_h5ad_dataset(
     min_cells_per_celltype: int = 1,
     covariate_obs_key: Optional[str] = None,
     compute_total_counts_covariate: bool = False,
-    covariate_whitening_obs_key: Optional[str] = None,
+    covariate_whitening_obs_key: Optional[str | list[str] | tuple[str, ...]] = None,
     obs_filters: Optional[dict] = None,
     obs_numeric_filters: Optional[dict] = None,
     obs_indices: Optional[str] = None,
@@ -486,6 +531,7 @@ def load_h5ad_dataset(
     if getattr(adata, "isbacked", False):
         adata = adata.to_memory()
     adata, gene_exclusion_meta = _apply_gene_exclusions(adata, exclude_gene_patterns)
+    adata, gene_list_meta = _apply_gene_list_filter(adata, gene_list)
     # In cell_type="separate" mode every expression statistic (HVG dispersion,
     # gene support, z-score mean/std) must be computed *within each cell type*,
     # not across the pooled multi-type matrix.  Defer HVG selection and all
@@ -531,14 +577,29 @@ def load_h5ad_dataset(
 
     covariate_whitening_values: Optional[np.ndarray] = None
     if covariate_whitening_obs_key is not None:
-        if covariate_whitening_obs_key not in adata.obs.columns:
+        if isinstance(covariate_whitening_obs_key, (list, tuple)):
+            whitening_keys = [str(k).strip() for k in covariate_whitening_obs_key]
+        else:
+            whitening_keys = [str(covariate_whitening_obs_key).strip()]
+        missing = [k for k in whitening_keys if k not in adata.obs.columns]
+        if missing:
             raise ValueError(
-                f"data.covariate_whitening obs key '{covariate_whitening_obs_key}' "
-                f"not found in adata.obs columns. "
-                f"Available obs columns: {list(adata.obs.columns)}"
+                f"data.covariate_whitening obs key(s) {missing} not found in "
+                f"adata.obs columns. Available obs columns: {list(adata.obs.columns)}"
             )
-        covariate_whitening_values = np.asarray(
-            adata.obs[covariate_whitening_obs_key].values, dtype=np.float32
+        if len(whitening_keys) == 1:
+            covariate_whitening_values = np.asarray(
+                adata.obs[whitening_keys[0]].values, dtype=np.float32
+            ).reshape(-1)
+        else:
+            covariate_whitening_values = np.column_stack(
+                [
+                    np.asarray(adata.obs[k].values, dtype=np.float32).reshape(-1)
+                    for k in whitening_keys
+                ]
+            )
+        covariate_whitening_obs_key = (
+            whitening_keys[0] if len(whitening_keys) == 1 else whitening_keys
         )
 
     calicost_tumor_proportion_values: Optional[np.ndarray] = None
@@ -671,6 +732,10 @@ def load_h5ad_dataset(
         "exclude_gene_patterns": gene_exclusion_meta["exclude_gene_patterns"],
         "excluded_gene_count": int(gene_exclusion_meta["excluded_gene_count"]),
         "excluded_gene_names": list(gene_exclusion_meta["excluded_gene_names"]),
+        "gene_list": gene_list_meta["gene_list"],
+        "gene_list_requested_count": int(gene_list_meta["gene_list_requested_count"]),
+        "gene_list_matched_count": int(gene_list_meta["gene_list_matched_count"]),
+        "gene_list_missing_genes": list(gene_list_meta["gene_list_missing_genes"]),
         "normalize_total": bool(normalize_total),
         "log1p": bool(log1p),
         "standardize_expression": bool(standardize_expression),
@@ -729,7 +794,7 @@ def load_dataset_from_config(
     *,
     covariate_obs_key: Optional[str] = None,
     compute_total_counts_covariate: bool = False,
-    covariate_whitening_obs_key: Optional[str] = None,
+    covariate_whitening_obs_key: Optional[str | list[str] | tuple[str, ...]] = None,
 ) -> DatasetBundle:
     config.validate()
     if config.source != "h5ad":
@@ -744,6 +809,7 @@ def load_dataset_from_config(
         min_cells_per_gene=config.min_cells_per_gene,
         top_var_genes=config.top_var_genes,
         exclude_gene_patterns=config.exclude_gene_patterns,
+        gene_list=config.gene_list,
         normalize_total=config.normalize_total,
         log1p=config.log1p,
         standardize_expression=config.standardize_expression,

@@ -80,6 +80,36 @@ class TestMostaCoordinateScale(unittest.TestCase):
         self.assertEqual(dataset.meta["var_names"], ["ACTB"])
         self.assertEqual(dataset.meta["excluded_gene_count"], 4)
 
+    def test_loader_restricts_to_fixed_gene_list_before_preprocessing(self) -> None:
+        adata = ad.AnnData(
+            X=np.ones((4, 5), dtype=np.float32),
+            obsm={"spatial": np.array(
+                [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]],
+                dtype=np.float32,
+            )},
+        )
+        adata.var_names = ["MT-CO1", "RPL41", "MALAT1", "HSPA1A", "ACTB"]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "small.h5ad"
+            adata.write_h5ad(path)
+            from data.h5ad_loader import load_h5ad_dataset
+
+            dataset = load_h5ad_dataset(
+                h5ad_path=str(path),
+                spatial_key="spatial",
+                gene_list=["ACTB", "MALAT1", "NOT_PRESENT"],
+                min_cells_per_gene=0,
+                top_var_genes=0,
+                normalize_total=False,
+                log1p=False,
+                standardize_expression=False,
+            )
+
+        self.assertEqual(sorted(dataset.meta["var_names"]), ["ACTB", "MALAT1"])
+        self.assertEqual(dataset.meta["gene_list_requested_count"], 3)
+        self.assertEqual(dataset.meta["gene_list_matched_count"], 2)
+        self.assertEqual(dataset.meta["gene_list_missing_genes"], ["NOT_PRESENT"])
+
     def test_loader_meta_on_real_mosta_file_if_present(self) -> None:
         path = Path("data/h5ad/mouse-organogenesis/E10.5_E1S1.MOSTA.h5ad")
         if not path.is_file():

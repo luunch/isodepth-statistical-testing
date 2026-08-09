@@ -123,21 +123,30 @@ class ParallelIsoDepthNet(nn.Module):
 
 
 def _zscore_covariate_buffer(values: np.ndarray) -> torch.Tensor:
-    arr = np.asarray(values, dtype=np.float32).reshape(-1)
-    mu = float(arr.mean())
-    sigma = float(arr.std())
-    if sigma < 1e-8:
-        z = np.zeros_like(arr, dtype=np.float32)
-    else:
-        z = ((arr - mu) / sigma).astype(np.float32)
-    return torch.tensor(z.reshape(-1, 1), dtype=torch.float32)
+    """Column-wise z-score buffer with shape ``(N, K)`` (``K=1`` for a scalar covariate)."""
+    arr = np.asarray(values, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr.reshape(-1, 1)
+    elif arr.ndim != 2:
+        raise ValueError(f"covariate_values must be 1D or 2D; got shape {arr.shape}")
+    z = np.empty_like(arr, dtype=np.float32)
+    for j in range(arr.shape[1]):
+        col = arr[:, j]
+        mu = float(col.mean())
+        sigma = float(col.std())
+        if sigma < 1e-8:
+            z[:, j] = 0.0
+        else:
+            z[:, j] = (col - mu) / sigma
+    return torch.tensor(z, dtype=torch.float32)
 
 
 class ParallelIsoDepthWithFixedCovariateNet(nn.Module):
-    """Spatial encoder plus a fixed per-cell covariate concatenated before the decoder.
+    """Spatial encoder plus fixed per-cell covariate(s) concatenated before the decoder.
 
-    Coordinates may be permuted across parallel slots; the covariate stays fixed per cell.
-    Implements h(d(x, y), n(x, y)) for loss-difference covariate whitening.
+    Coordinates may be permuted across parallel slots; covariates stay fixed per cell.
+    Implements ``h(d(x, y), n(x, y))`` for loss-difference covariate whitening, where
+    ``n`` may be scalar or multi-dimensional (``K`` covariates).
     """
 
     def __init__(
@@ -154,7 +163,9 @@ class ParallelIsoDepthWithFixedCovariateNet(nn.Module):
         self.spatial_latent_dim = int(latent_dim)
         self.latent_dim = self.spatial_latent_dim
         self.decoder_type = str(decoder_type)
-        self.decoder_input_dim = self.spatial_latent_dim + 1
+        cov_buf = _zscore_covariate_buffer(covariate_values)
+        self.covariate_dim = int(cov_buf.shape[1])
+        self.decoder_input_dim = self.spatial_latent_dim + self.covariate_dim
         self.encoder = nn.Sequential(
             ParallelLinear(M, 2, 20),
             nn.ReLU(),
@@ -162,7 +173,7 @@ class ParallelIsoDepthWithFixedCovariateNet(nn.Module):
             nn.ReLU(),
             ParallelLinear(M, 20, self.spatial_latent_dim),
         )
-        self.register_buffer("covariate_values", _zscore_covariate_buffer(covariate_values))
+        self.register_buffer("covariate_values", cov_buf)
         self.decoder = _build_parallel_decoder(
             M,
             self.decoder_input_dim,
@@ -448,7 +459,9 @@ class ParallelCellTypeIsoDepthWithFixedCovariateNet(nn.Module):
         self.decoder_type = str(decoder_type)
         self.encoder_type = str(encoder_type)
         self.G = int(G)
-        self.decoder_input_dim = self.spatial_latent_dim + 1
+        cov_buf = _zscore_covariate_buffer(covariate_values)
+        self.covariate_dim = int(cov_buf.shape[1])
+        self.decoder_input_dim = self.spatial_latent_dim + self.covariate_dim
         if encoder_type == "midline":
             if self.spatial_latent_dim != 1:
                 raise ValueError("encoder_type='midline' requires latent_dim=1")
@@ -461,7 +474,7 @@ class ParallelCellTypeIsoDepthWithFixedCovariateNet(nn.Module):
                 nn.ReLU(),
                 ParallelLinear(M, 20, self.spatial_latent_dim),
             )
-        self.register_buffer("covariate_values", _zscore_covariate_buffer(covariate_values))
+        self.register_buffer("covariate_values", cov_buf)
         self.decoders = nn.ModuleList([
             _build_parallel_decoder(
                 M,
