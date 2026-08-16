@@ -11,7 +11,9 @@ venv/
 
 # Data (DO NOT COMMIT)
 data/h5ad
+data/raw/
 *.h5ad
+*.tar.gz
 
 # Results / outputs
 results/
