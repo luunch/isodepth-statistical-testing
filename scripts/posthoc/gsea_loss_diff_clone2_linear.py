@@ -28,7 +28,7 @@ the saved ``A`` before using it for GSEA (the saved ``A`` itself is used for sco
 reconstruction, since it's the ground truth training-space matrix).
 
 Usage (from repo root, isodepth_env):
-    python -m scripts.posthoc.gsea_loss_diff_clone2_linear --gmt data/gmt/h.all.v2024.1.Hs.symbols.gmt
+    python -m scripts.posthoc.gsea_loss_diff_clone2_linear --gmt data/gmt/h.all.v2026.1.Hs.symbols.gmt
 
 Outputs (matching the convention of sibling clone-2 GSEA runs, e.g.
 ``results/calicost/HT306P1_S1H1Fc2U1Z1Bs1/loss_diff_clone2_linear_gt0p5_cropy/gsea_isodepth/``):
@@ -148,7 +148,22 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--gmt", type=Path, required=True, help="Gene-set GMT file")
     parser.add_argument("--out-dir", type=Path, default=None, help="Output directory")
-    parser.add_argument("--score-method", choices=["spearman", "pearson"], default="spearman")
+    parser.add_argument(
+        "--score-method",
+        choices=["decoder", "spearman", "pearson"],
+        default="decoder",
+        help=(
+            "Per-gene ranking statistic. 'decoder' (default) uses "
+            "slope(pred, isodepth) * max(Pearson(obs, pred), 0)."
+        ),
+    )
+    parser.add_argument(
+        "--decoder-refit",
+        choices=["closed-form", "none"],
+        default="closed-form",
+        help="For score-method=decoder: 'closed-form' (default) recomputes predictions via "
+        "exact least-squares on the final isodepth instead of the noisy joint-trained decoder.",
+    )
     parser.add_argument("--min-size", type=int, default=15)
     parser.add_argument("--max-size", type=int, default=500)
     parser.add_argument("--n-permutations", type=int, default=250)
@@ -167,13 +182,31 @@ def main() -> None:
     npz = np.load(NPZ_PATH, allow_pickle=False)
     true_isodepth = np.asarray(npz["true_isodepth"], dtype=np.float64).reshape(-1)
     A = np.asarray(npz["A"], dtype=np.float32)
+    pred = None
+    if "pred_true" in npz:
+        pred_arr = np.asarray(npz["pred_true"], dtype=np.float64)
+        if pred_arr.shape == A.shape:
+            pred = pred_arr
+        else:
+            raise ValueError(
+                f"NPZ pred_true shape {pred_arr.shape} != A shape {A.shape}; "
+                "cannot run decoder scoring."
+            )
 
     gene_names = _recover_gene_names(result, npz)
     gene_sets = _load_gmt(args.gmt.resolve())
     print(f"Loaded {len(gene_sets)} pathways from {args.gmt}", flush=True)
     print(f"[group={CELL_TYPE}] N={A.shape[0]}, G={A.shape[1]}", flush=True)
 
-    scores, pvals = _score_genes(A, true_isodepth, gene_names, method=args.score_method)
+    scores, pvals = _score_genes(
+        A,
+        true_isodepth,
+        gene_names,
+        method=args.score_method,
+        pred=pred,
+        decoder_type="linear",  # this run's run_name (this file's docstring) is the linear-decoder clone-2 GSEA
+        decoder_refit=args.decoder_refit,
+    )
     uniq_genes, uniq_scores, uniq_pvals = _collapse_duplicate_genes(gene_names, scores, pvals)
     order = np.argsort(-uniq_scores)
     ranked_genes = uniq_genes[order]

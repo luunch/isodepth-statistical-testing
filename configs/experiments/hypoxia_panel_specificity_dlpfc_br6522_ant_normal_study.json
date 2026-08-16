@@ -1,0 +1,28 @@
+{
+  "experiment_name": "hypoxia_panel_specificity_dlpfc_br6522_ant_normal",
+  "base_config": "configs/external_controls/DLPFC-Br6522_ant-normal-cortex_hypoxia_genes_logcounts_whitened.json",
+  "output_root": "results/experiments/hypoxia_panel_specificity_dlpfc_br6522_ant_normal",
+  "n_panels": 15,
+  "panel_size": 200,
+  "panel_seeds": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14
+  ],
+  "n_perms": 249,
+  "n_reruns": 30,
+  "universe_min_cells_per_gene": 3,
+  "include_target_run": true
+}

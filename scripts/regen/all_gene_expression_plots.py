@@ -3,10 +3,13 @@
 Walks ``results/**/*_result.json``, reloads the dataset and saved isodepths,
 and rewrites gene-expression PNGs (including spatial SVG companion plots).
 
+Decoder fit curves are drawn as raw ``pred`` vs coordinate (no rolling-mean
+smoothing), so linear/OLS heads appear as straight lines.
+
 Usage:
-    python scripts/regen_all_gene_expression_plots.py
-    python scripts/regen_all_gene_expression_plots.py --results-root results/synthetic
-    python scripts/regen_all_gene_expression_plots.py --dry-run
+    python -m scripts.regen.all_gene_expression_plots
+    python -m scripts.regen.all_gene_expression_plots --results-root results/synthetic
+    python -m scripts.regen.all_gene_expression_plots --dry-run
 """
 
 from __future__ import annotations
@@ -15,6 +18,10 @@ import argparse
 import json
 import sys
 from pathlib import Path
+
+import matplotlib
+
+matplotlib.use("Agg")
 
 from experiments.core.paths import repo_root
 REPO = repo_root(__file__)
@@ -207,6 +214,13 @@ def regen_standard_plots(result_path: Path, *, dry_run: bool = False) -> str:
 
     pred_iso_raw = arts.get("pred_true")
     pred_cov_raw = arts.get("pred_true_covariate")
+    # Prefer a posthoc OLS-refit of the decoder when present (exact MSE fit on
+    # frozen isodepth); otherwise use the saved training predictions.
+    ols_npz = out_dir / f"{run_name}_pred_true_ols_refit.npz"
+    if ols_npz.exists():
+        ols = np.load(ols_npz, allow_pickle=False)
+        if "pred_true_ols" in ols:
+            pred_iso_raw = ols["pred_true_ols"]
     pred_iso = np.asarray(pred_iso_raw, dtype=np.float64) if pred_iso_raw is not None else None
     pred_cov = np.asarray(pred_cov_raw, dtype=np.float64) if pred_cov_raw is not None else None
     decoder_df = _decoder_df_from_config(cfg.get("test", {}).get("decoder"))

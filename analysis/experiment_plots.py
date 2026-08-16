@@ -470,9 +470,39 @@ def save_spearman_histogram(
     return out_path
 
 
+def save_value_histogram(
+    values: Iterable[float],
+    out_path: str | Path,
+    *,
+    title: str,
+    x_label: str,
+) -> Path | None:
+    """Histogram of a single set of scalar values (no marked target line)."""
+    value_array = np.asarray(list(values), dtype=np.float64)
+    if value_array.size == 0:
+        return None
+
+    out_path = Path(out_path)
+    fig, ax = plt.subplots(1, 1, figsize=(7, 5))
+    ax.hist(
+        value_array,
+        bins=min(20, max(5, value_array.size // 2)),
+        color="lightsteelblue",
+        edgecolor="black",
+    )
+    ax.set_title(title)
+    ax.set_xlabel(x_label)
+    ax.set_ylabel("Count")
+    ax.grid(axis="y", alpha=0.25, linewidth=0.5)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
 def save_target_vs_null_histogram(
     null_values: Iterable[float],
-    target_value: float,
+    target_value: float | None,
     out_path: str | Path,
     *,
     title: str,
@@ -482,6 +512,9 @@ def save_target_vs_null_histogram(
     null_array = np.asarray(list(null_values), dtype=np.float64)
     if null_array.size == 0:
         return None
+
+    if target_value is None or not np.isfinite(float(target_value)):
+        return save_value_histogram(null_array, out_path, title=title, x_label=x_label)
 
     out_path = Path(out_path)
     fig, ax = plt.subplots(1, 1, figsize=(7, 5))

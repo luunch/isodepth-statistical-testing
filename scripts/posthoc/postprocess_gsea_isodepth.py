@@ -1,14 +1,24 @@
 """Post-process isodepth runs with pre-ranked GSEA.
 
 This script is a downstream analysis step: it reads a finished result JSON,
-builds a per-gene ranking by association with isodepth, and runs a
-pre-ranked GSEA against a user-provided GMT gene-set file.
+builds a per-gene ranking from the fitted decoder's association with isodepth
+(default), and runs a pre-ranked GSEA against a user-provided GMT gene-set file.
+
+Default gene score (``--score-method decoder``), for each gene j:
+    slope_j = Cov(pred_j, isodepth) / Var(isodepth)   # decoder effect along isodepth
+    fit_j   = Pearson(obs_j, pred_j)                  # how well decoder tracks data
+    score_j = slope_j * max(fit_j, 0)
+
+For a 1-D linear decoder, ``pred_j`` is affine in isodepth, so this reduces to a
+signed, fit-weighted decoder slope (closely related to Pearson(obs, isodepth)).
+Legacy ``spearman`` / ``pearson`` methods rank by direct obs-vs-isodepth correlation
+and do not require ``pred_true``.
 
 Usage (single run):
-    python scripts/postprocess_gsea_isodepth.py \
+    python -m scripts.posthoc.postprocess_gsea_isodepth \
         configs/calicost/HT268B1_Th1H3Fc2U2Z1Bs1_cnv_profile_existence_gaussian_loss_difference_tumor_prop.json \
         results/calicost/HT268B1_Th1H3Fc2U2Z1Bs1_cnv_profile_existence_gaussian_loss_difference_tumor_prop/HT268B1_Th1H3Fc2U2Z1Bs1_cnv_profile_existence_gaussian_loss_difference_tumor_prop_result.json \
-        --gmt /path/to/msigdb/h.all.v2024.1.Hs.symbols.gmt
+        --gmt /path/to/msigdb/h.all.v2026.1.Hs.symbols.gmt
 
 Outputs:
     <result_dir>/gsea_isodepth/<group_name>_prerank_scores.csv
@@ -43,6 +53,9 @@ from experiments.configuration import (  # noqa: E402
     _dataset_for_gene_expression_plots,
     load_json_config,
 )
+from methods.trainers import fit_closed_form_decoder  # noqa: E402
+
+CLOSED_FORM_DECODER_TYPES = ("linear", "quadratic")
 
 
 @dataclass
@@ -51,6 +64,8 @@ class GroupData:
     gene_names: list[str]
     expression: np.ndarray  # (N, G)
     isodepth: np.ndarray  # (N,)
+    pred: np.ndarray | None = None  # (N, G) decoder predictions; required for method=decoder
+    decoder_type: str = "nn"  # from run config's test.decoder; drives closed-form refit eligibility
 
 
 @dataclass
@@ -107,12 +122,100 @@ def _load_gmt(gmt_path: Path) -> dict[str, set[str]]:
     return gene_sets
 
 
+def _pearson_pvalues_from_r(r: np.ndarray, n: int) -> np.ndarray:
+    """Two-sided p-values for Pearson correlations given r and sample size n."""
+    from scipy.stats import t as student_t
+
+    r = np.asarray(r, dtype=np.float64)
+    pvals = np.ones(r.shape[0], dtype=np.float64)
+    if n <= 2:
+        return pvals
+    valid = np.isfinite(r) & (np.abs(r) < 1.0)
+    dof = float(n - 2)
+    rr = np.clip(r[valid], -1.0 + 1e-15, 1.0 - 1e-15)
+    t_stat = rr * np.sqrt(dof / np.maximum(1.0 - rr * rr, 1e-15))
+    pvals[valid] = 2.0 * student_t.sf(np.abs(t_stat), dof)
+    pvals[np.isfinite(r) & (np.abs(r) >= 1.0)] = 0.0
+    return pvals
+
+
+def _refit_closed_form_pred(
+    isodepth: np.ndarray,
+    expression: np.ndarray,
+    decoder_type: str,
+) -> np.ndarray:
+    """Exact MSE-optimal decoder predictions given the model's *final* learned isodepth.
+
+    Joint encoder+decoder training (Adam/SGD) leaves the decoder chasing a moving
+    target (the encoder's latent keeps shifting), so the saved ``pred_true`` is a
+    noisy, shrunk, sometimes sign-flipped estimate relative to the decoder you'd get
+    by exactly solving OLS (linear) / polynomial least squares (quadratic) against the
+    *frozen* final isodepth. This closed-form refit removes that optimization-noise
+    artifact without touching training or the existence-test statistic at all -- it
+    only changes the GSEA-and-friends "does the model track the data" view.
+    """
+    return fit_closed_form_decoder(isodepth, expression, decoder_type)
+
+
+def _score_genes_decoder(
+    expression: np.ndarray,
+    isodepth: np.ndarray,
+    pred: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Rank genes by decoder isodepth slope, shrunk by how well pred matches obs.
+
+    score_j = slope_j * max(Pearson(obs_j, pred_j), 0)
+    where slope_j = Cov(pred_j, isodepth) / Var(isodepth).
+    """
+    x = np.asarray(isodepth, dtype=np.float64).reshape(-1)
+    A = np.asarray(expression, dtype=np.float64)
+    P = np.asarray(pred, dtype=np.float64)
+    if A.shape != P.shape:
+        raise ValueError(f"expression shape {A.shape} != pred shape {P.shape}")
+    if A.shape[0] != x.shape[0]:
+        raise ValueError(
+            f"Row mismatch between expression ({A.shape[0]}) and isodepth ({x.shape[0]})"
+        )
+
+    n, g = A.shape
+    scores = np.zeros(g, dtype=np.float64)
+    if n < 3:
+        return scores, np.ones(g, dtype=np.float64)
+
+    x_c = x - x.mean()
+    var_x = float(np.dot(x_c, x_c) / n)
+    if var_x <= 0.0:
+        return scores, np.ones(g, dtype=np.float64)
+
+    P_c = P - P.mean(axis=0, keepdims=True)
+    A_c = A - A.mean(axis=0, keepdims=True)
+    # Population-style covariances / correlations over cells.
+    cov_xp = (x_c @ P_c) / n
+    slopes = cov_xp / var_x
+
+    ss_a = np.sum(A_c * A_c, axis=0)
+    ss_p = np.sum(P_c * P_c, axis=0)
+    denom = np.sqrt(ss_a * ss_p)
+    fits = np.zeros(g, dtype=np.float64)
+    ok = denom > 0.0
+    fits[ok] = np.sum(A_c[:, ok] * P_c[:, ok], axis=0) / denom[ok]
+    fits = np.where(np.isfinite(fits), fits, 0.0)
+
+    scores = slopes * np.maximum(fits, 0.0)
+    scores = np.where(np.isfinite(scores), scores, 0.0)
+    pvals = _pearson_pvalues_from_r(fits, n)
+    return scores, pvals
+
+
 def _score_genes(
     expression: np.ndarray,
     isodepth: np.ndarray,
     gene_names: list[str],
     *,
     method: str,
+    pred: np.ndarray | None = None,
+    decoder_type: str = "nn",
+    decoder_refit: str = "closed-form",
 ) -> tuple[np.ndarray, np.ndarray]:
     x = np.asarray(isodepth, dtype=np.float64).reshape(-1)
     A = np.asarray(expression, dtype=np.float64)
@@ -130,6 +233,17 @@ def _score_genes(
     scores = np.zeros(A.shape[1], dtype=np.float64)
     pvals = np.ones(A.shape[1], dtype=np.float64)
 
+    if method == "decoder":
+        if decoder_refit == "closed-form" and decoder_type in CLOSED_FORM_DECODER_TYPES:
+            pred = _refit_closed_form_pred(x, A, decoder_type)
+        elif pred is None:
+            raise ValueError(
+                "score-method=decoder requires decoder predictions (pred_true) in the result "
+                "artifacts / isodepths NPZ (or --decoder-refit closed-form with a linear/"
+                "quadratic decoder)."
+            )
+        return _score_genes_decoder(A, x, pred)
+
     if method == "pearson":
         x_center = x - x.mean()
         x_denom = float(np.sqrt(np.sum(x_center**2)))
@@ -141,10 +255,12 @@ def _score_genes(
             y_denom = float(np.sqrt(np.sum(y_center**2)))
             if y_denom <= 0.0:
                 continue
-            scores[j] = float(np.dot(x_center, y_center) / (x_denom * y_denom))
+            r = float(np.dot(x_center, y_center) / (x_denom * y_denom))
+            scores[j] = r
+        pvals = _pearson_pvalues_from_r(scores, A.shape[0])
         return scores, pvals
 
-    # Spearman (default).
+    # Spearman.
     for j in range(A.shape[1]):
         rho, p = spearmanr(x, A[:, j])
         if not np.isfinite(rho):
@@ -379,6 +495,7 @@ def _extract_groups(
 ) -> list[GroupData]:
     data_cfg = run_cfg.data
     dataset = load_dataset(data_cfg)
+    decoder_type = str(getattr(run_cfg.test, "decoder", "nn"))
 
     artifacts = result_json.get("artifacts", {})
     run_name = result_json_path.stem.replace("_result", "")
@@ -435,6 +552,19 @@ def _extract_groups(
                         flush=True,
                     )
 
+            pred = None
+            if "pred_true" in npz:
+                pred_arr = np.asarray(npz["pred_true"], dtype=np.float64)
+                if pred_arr.shape == A_expr.shape:
+                    pred = pred_arr
+                else:
+                    print(
+                        f"[warn] NPZ pred_true shape mismatch for {type_name}: "
+                        f"pred_true={pred_arr.shape}, expected={A_expr.shape}; "
+                        "decoder scoring will be unavailable for this group.",
+                        flush=True,
+                    )
+
             if A_expr.shape[0] != iso.shape[0]:
                 print(
                     f"[warn] skipping {type_name}: cell mismatch A={A_expr.shape[0]} vs isodepth={iso.shape[0]}",
@@ -447,6 +577,8 @@ def _extract_groups(
                     gene_names=[str(v) for v in var_names_c],
                     expression=np.asarray(A_expr, dtype=np.float32),
                     isodepth=iso,
+                    pred=pred,
+                    decoder_type=decoder_type,
                 )
             )
         return groups
@@ -463,12 +595,26 @@ def _extract_groups(
     var_names = plot_dataset.meta.get("var_names")
     if var_names is None:
         var_names = [f"gene_{i}" for i in range(plot_dataset.A.shape[1])]
+    pred = None
+    pred_raw = artifacts.get("pred_true")
+    if pred_raw is not None:
+        pred_arr = np.asarray(pred_raw, dtype=np.float64)
+        if pred_arr.shape == tuple(plot_dataset.A.shape):
+            pred = pred_arr
+        else:
+            print(
+                f"[warn] pred_true shape mismatch: pred_true={pred_arr.shape}, "
+                f"expected={plot_dataset.A.shape}; decoder scoring will be unavailable.",
+                flush=True,
+            )
     groups.append(
         GroupData(
             name=run_name,
             gene_names=[str(v) for v in var_names],
             expression=np.asarray(plot_dataset.A, dtype=np.float32),
             isodepth=iso,
+            pred=pred,
+            decoder_type=decoder_type,
         )
     )
     return groups
@@ -487,9 +633,24 @@ def main() -> None:
     )
     parser.add_argument(
         "--score-method",
-        choices=["spearman", "pearson"],
-        default="spearman",
-        help="Per-gene ranking statistic vs isodepth",
+        choices=["decoder", "spearman", "pearson"],
+        default="decoder",
+        help=(
+            "Per-gene ranking statistic. 'decoder' (default) uses "
+            "slope(pred, isodepth) * max(Pearson(obs, pred), 0); "
+            "'spearman'/'pearson' use direct obs-vs-isodepth correlation."
+        ),
+    )
+    parser.add_argument(
+        "--decoder-refit",
+        choices=["closed-form", "none"],
+        default="closed-form",
+        help=(
+            "For score-method=decoder with a linear/quadratic decoder: 'closed-form' (default) "
+            "recomputes predictions by exactly solving least-squares against the model's final "
+            "isodepth, instead of trusting the noisy jointly-trained decoder weights (see module "
+            "docstring). 'none' uses the raw saved pred_true."
+        ),
     )
     parser.add_argument("--min-size", type=int, default=15, help="Min overlapping genes per pathway")
     parser.add_argument("--max-size", type=int, default=500, help="Max overlapping genes per pathway")
@@ -556,6 +717,9 @@ def main() -> None:
             group.isodepth,
             group.gene_names,
             method=args.score_method,
+            pred=group.pred,
+            decoder_type=group.decoder_type,
+            decoder_refit=args.decoder_refit,
         )
         uniq_genes, uniq_scores, uniq_pvals = _collapse_duplicate_genes(group.gene_names, scores, pvals)
         order = np.argsort(-uniq_scores)

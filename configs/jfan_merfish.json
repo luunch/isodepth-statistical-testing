@@ -7,6 +7,7 @@
       "min_cells_per_celltype": 5,
       "standardize_expression": true,
       "standardize_coordinates": true,
+      "normalize_total": true,
       "log1p": true,
       "use_raw": false,
       "seed": 0
@@ -14,19 +15,19 @@
     "test": {
       "method": "parallel_permutation",
       "metric": "nll_gaussian_mse",
-      "n_perms": 999,
-      "epochs": 500,
-      "n_reruns": 10,
+      "n_perms": 99,
+      "epochs": 1000,
+      "n_reruns": 30,
       "sgd_batch_size": 128,
       "lr": 0.001,
       "seed": 42,
       "device": "cuda",
-      "decoder": "nn",
+      "decoder": "linear",
       "verbose": true
     },
     "output": {
-      "out_dir": "results",
-      "run_name": "jfan_merfish_celltype_separate",
+      "out_dir": "results/jfan_merfish",
+      "run_name": "260810_jfan_merfish_linear_decoder",
       "save_preds": false,
       "save_perm_stats": true
     }

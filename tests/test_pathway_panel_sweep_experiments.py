@@ -22,7 +22,7 @@ from experiments.studies.pathway_panel_sweep.lib import (
 
 class TestPathwayPanelSweep(unittest.TestCase):
     def test_load_gmt_has_fifty_hallmark_pathways(self) -> None:
-        gmt_path = REPO_ROOT / "data/gmt/h.all.v2024.1.Hs.symbols.gmt"
+        gmt_path = REPO_ROOT / "data/gmt/h.all.v2026.1.Hs.symbols.gmt"
         gene_sets = load_gmt_gene_sets(gmt_path)
         self.assertEqual(len(gene_sets), 50)
         self.assertIn("HALLMARK_HYPOXIA", gene_sets)
@@ -69,7 +69,7 @@ class TestPathwayPanelSweep(unittest.TestCase):
                         "experiment_name": "hallmark_pathway_sweep",
                         "base_config": str(base_config),
                         "output_root": str(tmp_path / "study_outputs"),
-                        "gmt_path": str(REPO_ROOT / "data/gmt/h.all.v2024.1.Hs.symbols.gmt"),
+                        "gmt_path": str(REPO_ROOT / "data/gmt/h.all.v2026.1.Hs.symbols.gmt"),
                         "n_perms": 249,
                         "n_reruns": 30,
                         "min_requested_genes": 15,

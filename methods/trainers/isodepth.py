@@ -2269,6 +2269,11 @@ def _merge_chunked_training_results(
         chunk_state = cm.state_dict()
         for name in merged_state:
             src = chunk_state[name]
+            # Only copy per-slot tensors. Shared buffers (e.g. fixed covariate_values
+            # with shape [n_cells, K]) can accidentally match chunk_slot_count when
+            # n_cells == chunk width, and must not be sliced into the merged model.
+            if name == "covariate_values":
+                continue
             if src.ndim > 0 and src.shape[0] == chunk_slot_count:
                 merged_state[name][offset : offset + chunk_slot_count] = src
         offset += chunk_slot_count

@@ -147,7 +147,7 @@ group is silently skipped (just a `[warn] skipping ...: cell mismatch` line, no 
 producing zero output, not a crash.
 
 Fixed via a dedicated script, `scripts/posthoc/gsea_loss_diff_clone2_linear.py` (run via
-`python -m scripts.posthoc.gsea_loss_diff_clone2_linear --gmt data/gmt/h.all.v2024.1.Hs.symbols.gmt`),
+`python -m scripts.posthoc.gsea_loss_diff_clone2_linear --gmt data/gmt/h.all.v2026.1.Hs.symbols.gmt`),
 which: (1) recovers the correct 195-cell subset via the same coordinate-matching technique as the
 QC diagnostics script above, (2) re-runs `preprocess_celltype_subset` (from `data/h5ad_loader.py`)
 on those correctly-matched raw counts using the run's saved `separate_preprocessing` params to
@@ -160,15 +160,33 @@ genes against the saved `A`/`true_isodepth` and run standard pre-ranked GSEA. Ou
 `.../loss_diff_clone2_linear/gsea_isodepth/2.0_{prerank_scores,gsea_results}.csv` +
 `2.0_top_pathways.png`, matching the existing convention from sibling clone-2 GSEA runs (e.g.
 `results/calicost/HT306P1_S1H1Fc2U1Z1Bs1/loss_diff_clone2_linear_gt0p5_cropy/gsea_isodepth/`).
-Gene-set file used: `data/gmt/h.all.v2024.1.Hs.symbols.gmt` (MSigDB Hallmark, 50 sets; this is
-the only `.gmt` file in the repo, under `data/gmt/`). Default GSEA params match sibling runs:
+Gene-set file used (updated 2026-08-10): `data/gmt/h.all.v2026.1.Hs.symbols.gmt` (MSigDB
+Hallmark **2026.1.Hs**, Jan 2026, 50 sets). Prior CalicoST GSEA used
+`data/gmt/h.all.v2024.1.Hs.symbols.gmt` (still kept under `data/gmt/` for reference); all three
+CalicoST `gsea_isodepth/` outputs were regenerated with 2026.1, with pre-update CSVs archived
+as `*_v2024.1.csv` alongside. Hallmark 2026.1 vs 2024.1 differs by **only 4 HGNC symbol
+renames** (same 50 pathway names): `SLC22A18→SLC67A1` (bile-acid + UV-response-DN),
+`PRPF4B→PRP4K` (G2M), `CENPJ→CPAP` (mitotic spindle). Default GSEA params match sibling runs:
 `min_size=15, max_size=500, n_permutations=250, weight=1.0, score_method=spearman, seed=0`.
 
-Result (2026-08-07): 36/50 Hallmark pathways tested (14 excluded by min/max overlap size); top
-hits by q-value are interferon-gamma response, EMT, myogenesis, complement (all NES < -1.5,
-i.e. anti-correlated with isodepth) and DNA repair (NES ~+1.65, positively correlated) — all
-q < 0.03. This is a distinct/independent gene ranking from the sibling `..._gt0p5_cropy` run
-(different cell subset/crop), so don't assume the two GSEA result sets should match.
+**Takeaway from the 2026.1 rerun:** no meaningful biological change. The only true gene-set
+membership effect in any CalicoST GSEA was in `loss_diff_clone2_linear_gt0p5_cropy`, where
+`SLC22A18` was in the HVG background so bile-acid / UV-response-DN each lost 1 overlapping gene;
+both stayed non-significant. The other two runs (`no_mtribo_stress`, legacy
+`loss_diff_clone2_linear`) had zero overlap change for the remapped symbols (renamed genes not
+in those HVG lists), so GSEA was bit-identical under a controlled same-prerank GMT swap.
+Apparent NES/rank churn vs the archived Aug-6 CSVs is mostly shared-RNG null-permutation
+sensitivity in `_gsea_preranked` (one RNG stream across pathways; changing an earlier pathway's
+overlap `k` shifts later NES/p), not biology — enrichment scores (ES) for unchanged pathways
+are identical. Biological headline unchanged: interferon / EMT / myogenesis / complement
+anti-correlated with isodepth; DNA repair positively correlated.
+
+Result (2026-08-07, confirmed unchanged after 2026.1 GMT swap 2026-08-10): 36/50 Hallmark
+pathways tested (14 excluded by min/max overlap size); top hits by q-value are
+interferon-gamma response, EMT, myogenesis, complement (all NES < -1.5, i.e. anti-correlated
+with isodepth) and DNA repair (NES ~+1.65, positively correlated) — all q < 0.03. This is a
+distinct/independent gene ranking from the sibling `..._gt0p5_cropy` run (different cell
+subset/crop), so don't assume the two GSEA result sets should match.
 
 Follow-up finding: of `HALLMARK_HYPOXIA`'s 200 genes, all 200 are present in the full h5ad
 transcriptome, but only 42 survive into the `top_var_genes=3000` HVG-filtered background
@@ -517,6 +535,127 @@ Key findings, for whoever revisits this:
   caveat that transcriptomic hypoxia calls without an orthogonal marker are hypotheses, not
   confirmed findings.**
 
+**Literature grounding for the overall method (2026-08-08, web research, no code changes): confirms
+the base model, finds a close competitor, and frames the core structural critique.** Base model is
+[GASTON, Chitra/Raphael group, *Nature Methods*
+2025](https://doi.org/10.1038/s41592-024-02503-3) ("isodepth" = GASTON's term for the learned 1-D
+topographic coordinate); GASTON's own paper validates biologically, not via a calibrated
+permutation existence test — this repo's `parallel_permutation`/`covariate_loss_difference`/
+recursive-peeling framework is filling a real, currently-unaddressed gap around it. Closest direct
+competitor found: [LSGI, *Genome Biology*
+2025](https://link.springer.com/article/10.1186/s13059-025-03716-1) — spatial gradient detection
+via NMF loadings regressed on coordinates with an empirically-tuned R² threshold (cheap, but a
+heuristic, not a calibrated p-value). Non-spatial analogue: pseudotime trajectory-existence tests
+([EMST-permutation](https://bmcbioinformatics.biomedcentral.com/articles/10.1186/s12859-022-04875-9),
+[tree-dimension test with closed-form log-normal
+null](https://journals.plos.org/ploscompbiol/article?id=10.1371%2Fjournal.pcbi.1009829)) — these
+deliberately use graph statistics with either permutation or closed-form nulls specifically to
+avoid retraining an expensive model per null draw, unlike this repo's per-permutation-per-rerun
+neural-net retraining design. **Framing for future work**: this repo's flexibility (joint nonlinear
+multi-gene modeling) is a real advantage over SVG tools (SpatialDE/SPARK-X, per-gene only) and LSGI
+(linear/NMF only), but its per-permutation neural-net-retraining design is exactly why it's exposed
+to the calibration/reproducibility problems documented above (67% random-panel false-positive rate;
+`stat_true` drifting with `n_perms`/`n_reruns`) that closed-form/asymptotic-null methods don't have
+— matching those methods' calibration guarantees by brute force (more perms/reruns) is expensive
+and, per the batch-size finding, may not even converge to a stable value. Prioritized fix list if
+this is revisited: (1) simple — make an empirical calibration check (random-panel or permuted-null
+false-positive rate) a mandatory, automatic companion to every reported p-value, and drop/guard the
+invalid cross-panel `stat_true` comparison in `compute_target_rank`; (2) moderate but well-scoped —
+decouple true-model training from permutation-batch size in `methods/trainers/isodepth.py` (root
+cause already diagnosed above); (3) hard, open research problem, not a patch — redesign covariate
+whitening as an explicit residualization/orthogonalization (e.g. SpaNorm-style spatial-GLM
+decomposition of the confound before testing) instead of decoder-concatenation, since the latter
+structurally cannot distinguish genuine extra positional signal from a spatially-smoothed copy of
+the whitened confound (mechanism already documented above, independently confirmed as a known
+open problem in [Bhuva et al. 2024](https://doi.org/10.1186/s13059-024-03241-7) /
+[SpaNorm 2025](https://doi.org/10.1186/s13059-025-03565-y)).
+
+**Candidate positive/negative-control benchmark datasets for validating this method against known
+ground truth (2026-08-08, web research, no code changes yet — not integrated).** Since neither
+HT306P1 nor the broader project has an independent (histology/IHC) ground truth for any tested
+pathway gradient, identified external public datasets with histology-validated positive controls
+(and matched same-cohort negative controls) that could be used to sanity-check the existence-test
+pipeline before trusting it on data with unknown ground truth:
+- **Hypoxia/necrosis in GBM** (best tumor-pathology positive control): pathologists have long
+  annotated "pseudopalisading cells around necrosis" (PAN) as a classic hypoxic niche.
+  [Ravi et al. 2022 GBM spatial multi-omics (Dryad, 10x Visium)](https://datadryad.org/dataset/doi:10.5061/dryad.h70rxwdmj)
+  has PAN/microvascular-proliferation pathologist annotations cross-validated against Ivy GAP LCM
+  hypoxia signatures. [Greenwald et al., *Cell* 2024](https://doi.org/10.1016/j.cell.2024.03.029)
+  builds a 5-layer spatial model on top of Ravi's 13 Visium samples matched to histopathology
+  ([Zenodo data](https://zenodo.org/records/12624108)). A [2026 *Nat Commun* GBM
+  atlas](https://link.springer.com/article/10.1038/s41467-026-69716-2) explicitly includes a
+  **normal-brain sample as a built-in negative control** alongside PAN-annotated tumor
+  samples — same paper/platform, ideal for a matched true-positive/true-negative pair.
+- **Liver zonation** (best non-tumor, most rigorously validated oxygen-gradient positive control):
+  [Halpern et al., *Nature* 2017](https://www.nature.com/articles/nature21065) — periportal
+  (oxygenated) vs. pericentral (hypoxic) zonation validated via smFISH (orthogonal to
+  transcriptomics) AND cross-checked against genes independently known to shift under
+  *experimentally induced* chronic hypoxia (a causal anchor, stronger than spatial correlation
+  alone). Not native Visium `(x,y)` coordinates (scRNA-seq + reconstructed lobule position), would
+  need adaptation to this repo's `DatasetBundle` schema.
+- **EMT/ECM gradient at tumor invasive front** (reproducible across cancer types, IHC/RNAscope
+  cross-validated in independent cohorts): [follicular thyroid carcinoma, 2024](https://doi.org/10.1007/s12022-024-09798-0)
+  (POSTN/DPYSL3 IHC-validated in a held-out cohort), [HNSCC tumor budding
+  signature, 2026](https://doi.org/10.1186/s13073-026-01612-2) (28-gene signature, AUC=0.97 in
+  SRT, validated against bulk TCGA-HNSC), [CRC invasive front, 2025](https://doi.org/10.1038/s42003-025-08799-x).
+- **Practical next step, not yet done**: check whether the broader HTAN WUSTL cohort that
+  `HT306P1`/`HT268B1` belong to includes any adjacent-normal tissue sections (same or sibling
+  patients) — lowest-friction option since it needs no new external data-source integration, just
+  pulling another sample already in the same collection, to get a same-cohort negative control.
+- **Suggested validation plan**: run the existence test + random-gene-panel specificity control
+  (pattern already built in `experiments/studies/random_gene_panel_null/`) on GBM PAN-annotated
+  spots for `HALLMARK_HYPOXIA` (expect significant + specific) vs. normal-cortex spots from the
+  same paper (expect null), and similarly tumor-core vs. invasive-margin spots for an EMT gene set.
+  Passing both true-positive and true-negative cases on external, histology-anchored data would be
+  much stronger validation than anything achievable on `HT306P1` clone 2 alone, where the ground
+  truth is fundamentally unknown (see hypoxia/total-counts confound sections above).
+
+**Detailed, pre-registered validation protocol for hypoxia existence-testing (designed 2026-08-08,
+not yet executed).** Full plan, in case this is picked up later — see chat transcript for full
+rationale, condensed here for reuse:
+- **Data**: 2-4 GBM Visium sections from
+  [Ravi et al. 2022 (Dryad)](https://datadryad.org/dataset/doi:10.5061/dryad.h70rxwdmj) or the
+  [2026 *Nat Commun* GBM atlas](https://link.springer.com/article/10.1038/s41467-026-69716-2),
+  ≥2 different patients with PAN (pseudopalisading-cells-around-necrosis) annotations, plus the
+  atlas's normal-brain section. Needs a new `scripts/data_prep/` loader (mirroring
+  `add_qc_obs_columns.py`) to harmonize into this repo's `DatasetBundle` schema with QC obs columns
+  (`total_counts`/`pct_mt`/`log1p_total_counts`) and the pathologist region label preserved.
+- **Three spot groups per section**: (1) PAN spots = positive; (2) leading-edge/cellular-tumor
+  spots from the *same section* = matched within-tumor negative; (3) normal-brain section =
+  tissue-level negative. Gene panel: reuse existing `HALLMARK_HYPOXIA` 200-gene `gene_list`.
+- **Core runs**: `parallel_permutation` existence test per group per patient, at one **fixed**
+  `n_perms`/`n_reruns` across every run (target AND randoms) to avoid the documented
+  `stat_true`-drift confound; each under both no-whitening and `log1p_total_counts`-whitened
+  conditions. Plus the existing `experiments/studies/random_gene_panel_null/` specificity sweep
+  (≥30 random 200-gene panels) per group/condition/patient.
+- **Pre-registered pass/fail criteria (fix before running)**: PAN should be significant AND an
+  outlier vs. its own random-panel null, replicated across ≥2 patients; both negative groups should
+  be non-significant or non-outlier, AND their random-panel false-positive rate should be near
+  nominal (~5-10%) — if negative-control FPR is also inflated (like HT306P1's 67%), that shows the
+  miscalibration is a property of the method, not of HT306P1 specifically.
+- **Decisive experiment (do this early)**: check whether PAN's positive-control significance
+  *survives* `log1p_total_counts` whitening. If yes → real evidence the method can detect true
+  hypoxia net of a total-counts confound (raises confidence in HT306P1's own post-whitening
+  result). If no, even in histology-confirmed-hypoxic tissue → evidence that this whitening
+  approach is too aggressive for genuine hypoxia signals *in general*, arguing for the
+  SpaNorm/mediator-aware redesign discussed earlier as a blanket fix, not a per-dataset judgment.
+- **Spatial concordance**: correlate fitted isodepth against the histological PAN boundary directly
+  (e.g. AUC/Spearman ρ vs. distance-to-PAN), not just the p-value.
+- **Real-data bake-off**: run per-gene SPARK-X/SpatialDE + GSEA (reusing
+  `postprocess_gsea_isodepth.py`) and an LSGI-style NMF+regression+R² proxy on the same 3 groups;
+  compare correctness and wall-clock cost against this method.
+- **Synthetic complement**: use existing `experiments/existence_sigma_sweep` synthetic
+  infrastructure to simulate a panel where genes are individually weak but jointly coherent, plus
+  an injected confound at controlled strength, swept across effect size/confound
+  strength/sample-size (including small `n~125-195` to probe the earlier small-sample concern);
+  compare calibration/power of this method vs. per-gene+GSEA vs. LSGI-proxy with *exact* known
+  ground truth (the only step that can cleanly attribute any power/calibration gap to the method
+  itself rather than real-data ground-truth uncertainty).
+- **Practical**: prototype on 1 patient/1 whitening condition first to estimate wall-clock cost
+  before committing to the full matrix (single runs took ~28s at `n_perms=249`/`n_reruns=30` in the
+  earlier hypoxia-panel-specificity study; this plan's `n_perms=999` runs will be substantially
+  slower, and the full matrix is 3 groups × 2 whitening conditions × ≥2 patients × ~31 runs each).
+
 **Pitfall found in the study's own `stat_true`-based comparison — do not reuse as-is.**
 `lib.py::compute_target_rank` was also applied to raw `stat_true` (giving
 `target_stat_true_percentile_among_random=0.0`, i.e. "looks like a huge outlier") but **this
@@ -589,3 +728,314 @@ Headline (`analysis/analysis_summary.json`):
   experiments.studies.pathway_panel_sweep.analysis --spec
   configs/experiments/hallmark_pathway_sweep_clone2_study.json`.
 
+**Hallmark pathway sweep — HT268B1 clone 1 comparison (RUN 2026-08-08):** Same 50-pathway sweep on
+**HT268B1 clone 1** (426 cells, gt0.7, tumor+logcounts whitening, no spatial crop) — chosen because
+the whole-transcriptome existence test on this section was borderline (**p=0.052** with 3000 HVG).
+Spec: `configs/experiments/hallmark_pathway_sweep_ht268b1_clone1_study.json`; outputs under
+`results/experiments/hallmark_pathway_sweep_ht268b1_clone1/`.
+
+Comparison vs HT306P1 clone 2 (125 cells, y-crop):
+| | clone 2 (HT306P1) | clone 1 (HT268B1) |
+|---|---|---|
+| Significant pathways | 35/50 (70%) | 28/50 (56%) |
+| HALLMARK_HYPOXIA p | 0.012 | 0.004 |
+| Significant in both | — | 22 pathways |
+| Non-significant in both | — | 9 (WNT, NOTCH, HEDGEHOG, APICAL_SURFACE, TGFβ, etc.) |
+| Sig only clone 2 | — | 13 (glycolysis, angiogenesis, G2M, adipogenesis, …) |
+| Sig only HT268B1 | — | 6 (KRAS_UP, PI3K/AKT/mTOR, IL6/JAK/STAT3, apoptosis, …) |
+
+Interpretation: HT268B1 is somewhat less pathway-positive overall, but still majority significant;
+hypoxia is *more* significant there. The **9 pathways non-significant in both** clones are the
+most credible null set; **22 significant in both** are the most reproducible tumor-gradient programs.
+
+## Hallmark pathway sweep clone2 analysis refresh (2026-08-10)
+
+Matched full 3000-HVG reference for the clone-2 pathway sweep (same cells as all
+pathway runs: clone 2.0, gt0.7 tumor prop, y-crop 1.9, denoise 300um, whitening
+`[calicost_tumor_proportion, log1p_total_counts]`, n=125, S bit-identical):
+`configs/calicost/HT306P1_S1H1Fc2U1Z1Bs1_loss_difference_clone2_gt0p7_cropy_tumor_logcounts_3000hvg.json`
+→ `results/calicost/.../loss_diff_clone2_linear_gt0p7_cropy_tumor_logcounts_3000hvg/`
+(used `n_perms=99`, `n_reruns=10` because `(249+1)*30` OOM-chunk merge crashed when
+`n_cells==chunk_slot_count` wrongly sliced `covariate_values`; merge now skips that
+buffer in `methods/trainers/isodepth.py`). GSEA on this run under its `gsea_isodepth/`.
+
+Pathway-sweep analysis updates (`experiments/studies/pathway_panel_sweep/analysis.py`):
+- plot `stat_true / n_genes_surviving` (no hypoxia line / no "lower is better")
+- plot BH q-values; `significant` now means `q < alpha` (34/50)
+- isodepth Spearman matrix + spatial grid vs FULL_3000HVG (pathways sign-oriented)
+Outputs under `results/experiments/hallmark_pathway_sweep_clone2/analysis/`.
+
+Expression-power follow-up (2026-08-11): existence p tracks pathway size/counts more than
+detection or reference-isodepth alignment. Strongest Spearman with p: mean pathway raw
+counts/cell ρ≈−0.56, n_genes_surviving ρ≈−0.50. Scatter saved as
+`analysis/pathway_expression_power_scatter.png` (also regenerated by
+`pathway_expression_power.py` / `python -m experiments.studies.pathway_panel_sweep.expression_power`).
+
+## Hallmark pathway sweep HT268B1 clone1 analysis refresh (2026-08-11)
+
+Same analysis refresh as clone2. Spec now points
+`reference_full_result_json` at the existing matched full-HVG run
+`results/calicost/HT268B1-Th1K3Fc2U1Z1Bs1/loss_diff_clone1_gt0p7_linear_tumor_logcounts/`
+(n=426, A has 2760 genes post-HVG/`min_cells`, S bit-identical to all pathway runs).
+Re-ran `python -m experiments.studies.pathway_panel_sweep.analysis --spec
+configs/experiments/hallmark_pathway_sweep_ht268b1_clone1_study.json`. Removed old
+`*_with_hypoxia_marked.png` plots. Under BH q<0.05: **22/50** significant (was 28/50
+on raw p); hypoxia still significant (p=0.004). New outputs match clone2:
+`hallmark_qvalue_distribution.png`, `hallmark_stat_true_per_gene_distribution.png`,
+`isodepth_spearman_matrix.{csv,png}`, `pathway_isodepths_grid.png`.
+
+**Isodepth Spearman matrix = significant pathways only (2026-08-11):**
+`pathway_panel_sweep/analysis.py` now writes `isodepth_spearman_matrix.{csv,png}` with
+`FULL_3000HVG` + pathways where `q < alpha` only (non-significant dropped from the matrix;
+`spearman_vs_full` and the full `pathway_isodepths_grid` still use all pathways). Regenerated
+for both `hallmark_pathway_sweep_ht268b1_clone1` (23×23 = 1+22) and
+`hallmark_pathway_sweep_clone2` (35×35 = 1+34).
+
+
+
+**Data source found and downloaded.** The Ravi et al. 2022 Dryad GBM dataset
+(`https://datadryad.org/dataset/doi:10.5061/dryad.h70rxwdmj`) is unusable via script: its files API
+requires a bearer token for individual files, and the bulk-download URL pattern
+(`datadryad.org/downloads/file_stream/<id>`) is blocked by an AWS WAF (403) even with a plausible
+`curl` request — no obvious workaround found, would need a real browser session/manual download.
+**Used the companion [Greenwald et al. 2024 *Cell* Zenodo record](https://zenodo.org/records/12624108)
+instead** (`doi:10.5281/zenodo.12624108`), which has no such protection — plain `curl` on
+`https://zenodo.org/api/records/12624108/files/<name>/content` works. Per-sample Visium tar.gz files
+are small (~15-50MB each, standard Space Ranger output: `barcodes.tsv.gz`, `features.tsv.gz`,
+`matrix.mtx.gz`, `filtered_feature_bc_matrix.h5`, `tissue_positions_list.csv`,
+`scalefactors_json.json`, `tissue_lowres_image.png`, `detected_tissue_image.jpg`, `metrics.csv`) —
+no need to pull the whole multi-GB archive. File→sample mapping is in
+`visium_dataset_description.csv` (also fetchable from the same API pattern).
+
+**Picked patient ZH1007 as the first pair — same patient, two regions, ideal matched positive vs.
+negative control:**
+- `GBM_ZH1007nec.tar.gz` → **necrotic region** (positive control; expect true hypoxia signal —
+  necrotic cores are the textbook hypoxic niche).
+- `GBM_ZH1007inf.tar.gz` → **infiltrative region** (relative negative control — non-necrotic tumor
+  margin, same patient, same batch/processing).
+
+Loaded both into scanpy (`sc.read_10x_h5` + manual join of `tissue_positions_list.csv` for
+`obsm['spatial']`, since these directories don't follow scanpy's `read_visium` expected layout —
+had to build the AnnData by hand). **Gotcha**: this environment's numba needs a writable cache dir
+when running from outside the repo (`NUMBA_CACHE_DIR=<writable dir>`, e.g. `/tmp/...`) — without it,
+`scanpy.pp.normalize_total`/`score_genes` crash with a numba caching `RuntimeError` (setting
+`NUMBA_DISABLE_JIT=1` instead "fixes" the crash but introduces a *real* bug, an `UnboundLocalError`
+in scanpy's own `_normalize_csr` non-jitted fallback path — don't use that workaround, use the cache
+dir fix).
+
+Canonical h5ad files (raw counts, `obsm['spatial']` in pixel coords, `obs` QC columns
+`total_counts`/`log1p_total_counts`/`n_genes`/`region_label`/`patient`/`slice_id`, matching this
+repo's h5ad conventions) saved to
+`data/h5ad/external_controls/{ZH1007-nec,ZH1007-inf}.h5ad` (955 and 1436 in-tissue spots
+respectively, 33538 genes, not yet HVG-filtered/gene-panel-restricted — that happens at run-config
+time like every other dataset in this repo). Not yet wired into a `configs/experiments/` run — that
+is the natural next step (Phase 1: run the same `parallel_permutation`/hypoxia-gene-panel/
+random-panel-specificity pipeline already built for HT306P1, on these two new sections).
+
+**Visualization + first quantitative check** (`sc.tl.score_genes` with the same 200-gene
+`HALLMARK_HYPOXIA` panel used elsewhere in this repo, scanpy's default control-gene-binned scoring,
+not yet the more dropout-robust AUCell approach recommended earlier — that upgrade is still
+pending): figure at
+`results/experiments/hypoxia_gbm_positive_negative_control/figs/zh1007_nec_vs_inf_overview.png`
+(H&E + spatial log-total-counts + spatial hypoxia-score + total-counts-vs-hypoxia-score scatter,
+per sample).
+
+- **Sanity check passed**: NEC's mean hypoxia module score (0.196) is significantly higher than
+  INF's (0.123) (Mann-Whitney p≈6e-140, though with n=955/1436 spots this p-value is not itself
+  meaningful evidence of effect size, just directional). This is a first-order confirmation the
+  necrotic/infiltrative region labels track real hypoxia biology, as expected from the literature,
+  before spending compute on the full existence-test pipeline.
+- **The exact same total-counts confound documented for HT306P1 clone 2 reproduces here, in an
+  independent public dataset.** NEC has *higher* median total_counts (15706) than INF (6062) —
+  counter to a naive "necrotic tissue = less RNA" prior, likely reflecting different sequencing
+  depth per sample library rather than per-spot biology (Number of Reads differs too: 272M vs
+  215M) — so **cross-sample (NEC vs INF) total_counts comparisons are confounded by
+  sample-level sequencing depth, not just spot-level biology; any downstream test should model
+  each section independently (as this repo's per-clone/per-section pipeline already does) rather
+  than pooling across sections naively.** Within each section, `corr(log1p(total_counts),
+  hypoxia_score)` is positive and substantial even after CPM+log1p normalization: **+0.30 in NEC,
+  +0.63 in INF**. I.e. even in this brand-new, independent dataset, spots with more sequencing depth
+  systematically score higher on the hypoxia module — the same qualitative confound found in
+  HT306P1, not an HT306P1/CalicoST-pipeline-specific artifact. This strengthens the case (from the
+  literature review above) that this is a general spatial-transcriptomics phenomenon this project's
+  test needs to handle robustly, not a one-off data-quality issue.
+
+**Next steps (not yet done):** (1) build a run config pointing at these two new h5ads (same
+`HALLMARK_HYPOXIA` gene_list, `log1p_total_counts` whitening, matching `n_perms`/`n_reruns` to the
+HT306P1 hypoxia-panel-specificity study for apples-to-apples comparison); (2) run the existence test
++ random-gene-panel specificity sweep on both NEC (expect significant + specific) and INF (expect
+weaker/less specific); (3) if time allows, pull 1-2 more patients (`ZH916`, `ZH881`, `ZH1019` all
+have matched inf/T1 or inf/bulk pairs per `visium_dataset_description.csv`) to check replication
+before trusting a single-patient result, per the pre-registered protocol above.
+
+## Normal-brain negative control for hypoxia existence test (2026-08-09)
+
+**Greenwald Zenodo (`doi:10.5281/zenodo.12624108`) has no normal-brain Visium sections** — only GBM
+and IDH-mut tumor samples per `visium_dataset_description.csv`. The normal cortex references in
+Greenwald *Cell* 2024 (UKF256_C, UKF265_C) come from Ravi et al. 2022 on Dryad
+(`doi:10.5061/dryad.h70rxwdmj`), which remains script-inaccessible (AWS WAF on file downloads; API
+404). The companion Zenodo `18380571` `Visium_GBM_samples.tar.gz` has Ravi *tumor* samples only
+(GBM01, GBM15–26), not UKF256/265 normal cortex.
+
+**Substitute negative control (ABORTED 2026-08-09):** Initial attempt used `Br6522_ant` from
+spatialDLPFC — **not valid** for this question because it is not patient-matched to the GBM
+sections (unlike ZH1007 nec/inf). Sweep killed after user review. The correct null requires
+Ravi UKF256_C / UKF265_C normal cortex (Dryad, manual download) or within-section Struct-Norm
+spots from the same Greenwald GBM sections.
+
+**ZH1007 baseline (for comparison):** NEC hypoxia p=0.004 (stat≈245k), INF p=0.004 (stat≈370k) —
+both significant. Random-panel specificity analysis (2026-08-09): **all 15 random 200-gene panels
+also p=0.004** on both NEC and INF; hypoxia ranks **16/16** (lowest) by p-value and **1/16**
+(lowest stat_true) — zero panel specificity, confirming permutation-test miscalibration on external
+GBM data too.
+
+**Gotcha (2026-08-09): don't manually background long GPU sweep jobs with `nohup ... &` in this
+environment — it breaks CUDA device visibility.** Launching the nec/inf specificity sweeps via
+`nohup python -m ... &` inside a single shell command failed instantly with `ValueError: Requested
+CUDA device but CUDA is not available` (root cause: `cudaGetDeviceCount()` error 304, likely a
+device-node/session detachment issue specific to manual job-control backgrounding in this sandboxed
+shell). The identical command, issued as its own foreground shell call and left to auto-background
+after the tool's own timeout (no `&`, no `nohup`), worked immediately on the same machine seconds
+later. **Always launch long GPU training jobs via the harness's native auto-backgrounding; never via
+manual `&`/`nohup` job control here.**
+
+**User-raised and confirmed pitfall: raw `stat_true` is not a valid cross-panel comparison metric,
+because gene-panel coherence (not spatial signal) drives most of the gap.** Hypoxia's `stat_true` sits
+far below every random panel's (NEC: 245139 vs 266931±323; INF: 370139 vs 401130±395 — roughly an
+8x-the-random-spread gap in both). This looks like strong specificity but isn't: checked mean absolute
+pairwise gene-gene Pearson correlation (on the same standardized expression matrix used for training)
+and found the **187-gene hypoxia panel is ~50-60% more internally correlated (0.058) than three
+checked random 200-gene panels (0.037-0.039)** — i.e. hypoxia is a genuinely more coherent
+(co-regulated) gene set, which makes it easier for *any* flexible shared 1-D-latent decoder to fit
+well, whether that latent is driven by true spatial position or by permuted/arbitrary coordinates.
+This directly explains the `stat_true` gap without requiring any real spatial specificity. **The only
+valid apples-to-apples statistic is each panel's own p-value** (numerator/denominator share identical
+genes) — and on that metric, per the table above, there is zero difference between hypoxia and random
+panels (both saturate the `n_perms=249` floor). Do not use `stat_true` magnitude, even informally, as
+suggestive evidence of anything spatial when comparing panels with different gene sets.
+
+**Per-gene SVG diagnostic follow-up (NEC only, 2026-08-09): 175/187 hypoxia-panel genes individually
+"significant" (BH q<0.05, `compute_isodepth_sig_genes` F-test) — investigated why, since this
+initially looked implausibly high.** Recovered the trained model's actual per-gene fit (`pred_true`,
+saved in `result.json["artifacts"]` even without `save_preds=true`) and the matching preprocessed
+expression matrix (reloaded deterministically via `load_dataset` on the exact same config) to compute
+real per-gene effect sizes rather than trusting the p-value count alone:
+- **Mean per-gene R²=0.088, median=0.073, max=0.40** — i.e. a "significant" gene typically has the
+  fitted isodepth axis explaining under 10% of its variance. With `n=955` spots, even small, consistent
+  linear associations reach extreme statistical significance (98/175 genes hit the exact float64
+  underflow floor `1.11e-16` for the F-test p-value) — this is a large-N-makes-small-effects-detectable
+  artifact, not evidence of strong individual-gene signal. BH correction across only 187 tests doesn't
+  meaningfully counteract this because most raw p-values are already many orders of magnitude below α.
+- **Checked whether this NEC axis is the by-now-familiar total-counts confound — it is not**:
+  `spearman(true_isodepth, total_counts) = -0.02` (p=0.54, n.s.). Unlike HT306P1 clone 2 (where
+  post-whitening isodepth still tracked total_counts at rho≈0.86-0.94), whatever smooth axis GASTON
+  found in ZH1007-nec is genuinely decoupled from library depth. The generic "most genes have some
+  association" phenomenon here is being driven by a *different*, uncharacterized smooth spatial axis,
+  not simply re-litigating the total-counts issue.
+- **Directional coherence check (partial reassurance, but not decisive given the specificity result
+  above):** across the full panel, rho signs split almost 50/50 (97 positive / 90 negative vs.
+  fitted isodepth) — but the canonical HIF-1 target genes are *unanimous*: VEGFA ρ=-0.66, NDRG1
+  ρ=-0.66, SLC2A1/GLUT1 ρ=-0.46, HK2 ρ=-0.42, LDHA ρ=-0.39, BNIP3L ρ=-0.23, P4HA1/2 ρ=-0.20/-0.13 — all
+  correctly and consistently signed, more coordinated than the panel-wide split. This is a mild
+  biological-coherence signal, but **cannot by itself be read as evidence of hypoxia specificity**
+  given that the p-value-based random-panel check above already shows equal "significance" for random
+  panels — the missing control (not yet run) is checking whether random panels' own top-|rho| genes
+  show similarly internal coherence/consistent direction, which would settle whether this directional
+  pattern is itself generic or hypoxia-specific.
+
+**Revised bottom line for the whole external-validation effort**: the ZH1007 nec/inf pair does **not**
+provide supporting evidence that the existence test is hypoxia-specific. If anything, it's fresh,
+independent (different cohort, different pipeline, no CalicoST/CNV step at all) confirmation that the
+test's calibration problem at this gene-panel-size/whitening/spot-count regime is general, not a
+CalicoST-pipeline or HT306P1-specific artifact. Trying more positive/negative-control pairs (e.g. the
+still-pending true normal-brain negative control from Ravi et al., manual Dryad download required) is
+unlikely to resolve this on its own — the underlying fix needs to be at the method level (mandatory
+random-panel calibration check per report, decoupling true/permutation training batch-size effects, or
+an explicit SpaNorm-style residualization instead of decoder-concatenation whitening), all already
+outlined in the HT306P1 section above.
+
+## HT112C1 U1/U2 `pct_mt`/`total_counts` vs isodepth diagnostics (2026-08-09)
+
+Same layout as `scripts/posthoc/loss_diff_clone2_linear_qc_covariate_diagnostics.py`, for the
+tumor-proportion-only whitening cropx runs:
+
+- U1: `results/calicost/HT112C1_U1_fig4_loss_diff_tumor_prop_gt0p7/loss_diff_gt0p7_cropx` — reload with
+  `obs_numeric_filters gt0.7` + `spatial_crop x>-3` (no denoise). Current config JSON also lists
+  denoise/crop for the sibling `..._cropx_3000hvg` run; do not trust `config.data` alone.
+- U2: `results/calicost/HT112C1_U2_loss_difference_gt0p7/loss_diff_gt0p7_cropx` — despite the name,
+  meta has **no** spatial_crop; matching reload needs `spatial_denoise_radius_um=300` (drops 20/564).
+
+Per-clone NPZ `S` is **re-standardized within clone** (mean0/std1), not the global z-scored coords
+in `dataset.S`. Script: `python -m scripts.posthoc.ht112_u1_u2_qc_covariate_diagnostics` →
+`{clone}/{clone}_pct_mt_total_counts_diagnostics.png`.
+
+Unlike HT306P1 clone 2 (rho(isodepth, total_counts)=0.92), HT112 U1 clones show little/no
+total_counts confounding (clone 2.0: rho=0.09, n.s.); U2 clone 1.0 still shows moderate
+total_counts association (rho=0.48).
+
+## Xia2019 MERFISH U2OS linear-decoder existence test + Hallmark GSEA (2026-08-10)
+
+Run: `results/jfan_merfish/260810_jfan_merfish_linear_decoder/` (`configs/jfan_merfish.json`,
+Xia et al. 2019 U2OS MERFISH, n=1368 cells, G=10050 genes after preprocess, linear decoder,
+`n_perms=99`, `n_reruns=30`).
+
+**Existence test:** p=0.01 (observed NLL below *all* 99 perms; gap ≈11.6σ of the null). Visually the
+true/lowest-null/highest-null isodepth maps look similarly unstructured — significance is a
+global NLL separation, not an obvious spatial gradient.
+
+**Per-gene signal is weak / empty under the pipeline's SVG call:**
+`*_isodepth_sig_genes.csv` is header-only (F-test of linear-decoder fit + BH q<0.05 → 0 genes).
+Spearman |ρ| vs isodepth tops out ~0.22 (only 3 genes >0.2; 552 >0.1). Large N still makes many
+tiny correlations nominally significant in a raw Spearman sense (~1372 genes BH q<0.05 on the
+GSEA prerank scores), which is why pre-ranked GSEA can light up even when the F-test SVG list is
+empty.
+
+**GSEA / SVG (current, after OLS decoder refit 2026-08-11):** default prerank is
+decoder-based: `score = slope(pred, isodepth) * max(Pearson(obs, pred), 0)`.
+Legacy obs-correlation methods remain via `--score-method spearman|pearson`.
+
+Jointly trained GD `pred_true` was far from the MSE optimum for the frozen latent
+(slopes ~3% of OLS scale, ~55% sign agreement; median Pearson(obs, pred)≈0.007), which
+is why the original F-test SVG list was empty. Canonical outputs now come from
+`python -m scripts.posthoc.refit_linear_decoder_analyses configs/jfan_merfish.json <result.json> --gmt data/gmt/h.all.v2026.1.Hs.symbols.gmt`
+(`fit_closed_form_decoder` → `*_pred_true_ols_refit.npz` + regenerated plot/SVG/GSEA).
+MSE mean-only=1.000 / gd=0.999907 / **ols=0.996665**; sig genes **0 → 2348** (q<0.05);
+decoder-score GSEA still **0 pathways at q<0.05** (best: E2F_TARGETS NES=-1.296, p=0.012,
+q=0.299; TNFA_SIGNALING_VIA_NFKB p=0.004, q=0.199). Intermediate `*_gd_decoder.*` /
+`*_spearman_obs.*` / `*_decoder_raw.*` archives were deleted.
+
+Root-cause mechanism, independently confirmed via the loss history (`*_loss_history.npz`):
+the last 20/1000 epochs vary by only ~1e-5, i.e. training had fully **plateaued**, so the
+GD/OLS gap is not "needs more epochs" but a converged-but-suboptimal joint fixed point.
+Joint Adam training makes the decoder chase a constantly-shifting encoder latent (never the
+truly frozen final one), and `true_isodepth` itself has tiny variance (std≈0.016 for this
+run), which makes the loss curvature in the decoder-weight direction (∝ Var(z)) very flat —
+so per-gene decoder weights are easily dominated by minibatch (`sgd_batch_size=128`) gradient
+noise relative to the also-tiny informative signal. Net effect: the GD decoder ends up ~55%
+sign-agreement with OLS (barely better than a coin flip) and ~3% of OLS's slope scale — a
+noisy/shrunk estimator, not a real biological "the decoder can't fit these genes" signal.
+`postprocess_gsea_isodepth.py` now exposes this generally as `--score-method decoder
+--decoder-refit {closed-form,none}` (default `closed-form`, applies whenever
+`test.decoder in {linear, quadratic}`; `none` reproduces the raw noisy `pred_true` behavior),
+reusing the same `fit_closed_form_decoder` call as `refit_linear_decoder_analyses.py` above —
+confirmed numerically identical output (same NES/p/q to the decimal) on this run.
+
+Math note: for a 1-D **linear** decoder, closed-form-refit decoder score is an exact monotonic
+transform of raw `Pearson(obs, isodepth)` (verified rank-corr=1.0) — i.e. once GD noise is
+removed, "decoder-based" ranking *is* direct-correlation ranking. It is not identical to
+`--score-method spearman` (rank-corr≈0.877 vs Pearson here), and in this weak/borderline run
+that Pearson-vs-Spearman gap is enough to flip FDR significance (Spearman's original 8
+q<0.05 Hallmark hits, e.g. E2F NES=-1.94/q=0.033, drop to q≥0.199 under the
+decoder-consistent/Pearson view) — read the Spearman-based hit list as a rank-metric-sensitivity
+artifact in this weak-signal regime, not a robust finding.
+
+**Expression variogram true vs coordinate-permutation null (2026-08-11):**
+`python -m scripts.posthoc.plot_expression_variogram_true_vs_perm configs/jfan_merfish.json <result.json>`
+→ `{stem}_expression_variogram_true_vs_perm.{png,csv}` in the run dir. Gene-pooled empirical
+semivariogram γ(d)=1−c(d) on z-scored A, all unordered cell pairs, shared distance bins; null uses
+the same `_build_permuted_coordinate_batch` shuffles as the existence test (`test.seed`). For this
+U2OS MERFISH run: true has a clear short-range excess covariance (peak c≈0.023 / Δγ≈−0.023 at
+~140 µm) that decays to the flat perm null by ~600 µm; 28/40 bins fall outside the perm ±2 SD
+band. So there *is* real (if weak, gene-pooled) spatial structure vs label-shuffle — enough for the
+NLL test to reject — but the absolute effect is small and short-range, consistent with local
+technical/packing structure rather than a tissue-scale expression gradient.

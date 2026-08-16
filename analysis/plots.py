@@ -11,7 +11,6 @@ from matplotlib import colors as mcolors
 from matplotlib.collections import PolyCollection
 from matplotlib.lines import Line2D
 import numpy as np
-from scipy.ndimage import uniform_filter1d
 from scipy.stats import f as _f_dist
 from scipy.stats import gaussian_kde, linregress, spearmanr
 
@@ -3456,10 +3455,10 @@ def _plot_gene_binned_vs_coord(
     """Per-bin mean dots + trend curve, with optional per-cell background scatter.
 
     When ``decoder_preds`` is provided (model decoder predictions for this gene,
-    shape ``(n_cells,)``), the fit curve is the actual decoder output: cells are
-    sorted by coordinate and the predictions are smoothed with a uniform running
-    mean (~10% window).  This shows NN non-linearities faithfully rather than
-    collapsing them to a polynomial.
+    shape ``(n_cells,)``), the fit curve is the actual decoder output vs
+    coordinate (cells sorted by coordinate).  No extra smoothing is applied —
+    a linear decoder appears as a straight line; an NN decoder shows its true
+    shape.
     When ``decoder_preds`` is None, a degree-3 polynomial is fit through the
     per-bin expression means as a non-linear trend approximation.
 
@@ -3495,19 +3494,12 @@ def _plot_gene_binned_vs_coord(
             edgecolors="white", zorder=3,
         )
 
-    # --- fit curve: actual NN predictions (smoothed) or poly through expression bin means ---
+    # --- fit curve: actual decoder predictions vs coordinate (no rolling mean) ---
     if decoder_preds is not None:
-        # Show the actual decoder curve: sort cells by coordinate, then apply a
-        # uniform running mean whose window is ~10% of cells (min 5, max 200).
-        # This preserves NN non-linearities that a degree-3 polynomial would destroy.
         dp = np.asarray(decoder_preds, dtype=np.float64).reshape(-1)
         sort_order = np.argsort(coord)
-        dp_sorted = dp[sort_order]
-        coord_sorted = coord[sort_order]
-        window = max(5, min(200, int(round(len(dp_sorted) * 0.10))))
-        dp_smooth = uniform_filter1d(dp_sorted, size=window, mode="nearest")
         ax.plot(
-            coord_sorted, dp_smooth,
+            coord[sort_order], dp[sort_order],
             color="0.20", linewidth=1.8, alpha=0.9, zorder=4,
         )
     else:
@@ -3546,8 +3538,8 @@ def save_gene_expression_vs_isodepth_plot(
     """Top n_top_genes genes (by |Spearman ρ| with isodepth) as binned mean
     expression vs isodepth.
 
-    ``decoder_preds`` (n_cells, G): when provided the fit curve uses the binned
-    mean decoder output smoothed over isodepth.  ``decoder_df`` triggers an
+    ``decoder_preds`` (n_cells, G): when provided the fit curve is the decoder
+    prediction vs isodepth (no rolling-mean smoothing).  ``decoder_df`` triggers an
     F-test across all G genes (parametric decoders only); significant genes
     (BH q < q_threshold) are saved to
     ``<stem>_isodepth_sig_genes.csv`` beside the PNG, and a companion spatial
@@ -3691,10 +3683,9 @@ def save_gene_expression_vs_coordinates_comparison(
 
     When ``pred_isodepth`` / ``pred_covariate`` are provided (model decoder
     predictions, shape ``(n_cells, G)``), the fit curve shows the actual decoder
-    output: cells sorted by coordinate, predictions smoothed with a uniform
-    running mean (~10% window) to remove per-cell noise while preserving NN
-    non-linearities.  Otherwise a degree-3 polynomial fit through the per-bin
-    expression means is used as a non-linear trend approximation.
+    output vs coordinate (cells sorted by coordinate; no rolling-mean smoothing).
+    Otherwise a degree-3 polynomial fit through the per-bin expression means is
+    used as a non-linear trend approximation.
 
     When ``decoder_df`` is set (e.g. 1 for a linear decoder, 2 for quadratic)
     an F-test is run across **all** genes for each decoder model and significant
