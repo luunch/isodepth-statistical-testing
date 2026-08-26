@@ -92,8 +92,17 @@ To verify/reproduce this kind of check, load `<clone>_loss_history.npz` (contain
 `loss_history` (slot 0 only), `loss_history_per_slot` shape `(n_epochs, (1+n_perms)*n_reruns)`)
 and manually reshape/min over reruns per model to compare true-vs-perm at any epoch.
 
-Python env for this repo: `/weka/home/ajain71/miniforge3/envs/isodepth_env/bin/python`
-(system `python3`/`python` do not have numpy etc.).
+Python env for this repo: `/weka/home/jhu/ajain71/miniforge3/envs/isodepth_env/bin/python`
+(system `python3`/`python` do not have numpy etc.). **Note (2026-08-23):** this path has moved /
+is unstable across sessions — it was previously `/weka/home/ajain71/...` (missing `jhu/`, now
+404s, same stale-path pattern as the manifest bug below) and mid-session on 2026-08-23 a
+*different* previously-working env at
+`/weka/scratch/jhu/uchitra1/users/ajain71/miniforge3/envs/isodepth_env` (used earlier in this same
+session, confirmed to have `sklearn` installed) disappeared entirely (`ls` on its parent dir no
+longer showed a `miniforge3` subdirectory) while `/weka/home/jhu/ajain71/miniforge3/envs/isodepth_env`
+kept working throughout — always run `mamba env list` first to get the current live path(s) rather
+than trusting any hardcoded path (including this one) if a `mamba run -p <path>` invocation fails
+with "prefix does not exist".
 
 ## `loss_diff_clone2_linear` run: stale/legacy config, must match cells by coordinates, not by reloading
 
@@ -791,6 +800,206 @@ on raw p); hypoxia still significant (p=0.004). New outputs match clone2:
 for both `hallmark_pathway_sweep_ht268b1_clone1` (23×23 = 1+22) and
 `hallmark_pathway_sweep_clone2` (35×35 = 1+34).
 
+**All-genes reference line, attempt 1 (2026-08-23, WRONG interpretation, reverted):** Initially
+added a vertical line to the two *sweep-level summary* histograms
+(`hallmark_qvalue_distribution.png` / `hallmark_stat_true_per_gene_distribution.png`) marking the
+all-genes run's own (independently-trained) p-value/stat_true_per_gene. **This was not what was
+asked** — the request is to treat the all-genes isodepth as a fixed covariate, OLS-refit it to
+each pathway's own genes, and plot that refit loss on each *per-run*
+`{run_name}_combined_metric_distribution.png` null-distribution plot (analogous to the existing
+`stat_covariate`/`p_value_covariate` dual-line pattern in
+`analysis/plots.py::save_metric_distribution_plot` /
+`save_combined_celltype_metric_distribution`, normally used for `test.covariate` configs) — not a
+comparison of independently-fit stats across the pathway family. Reverted
+(`git checkout -- experiments/studies/pathway_panel_sweep/analysis.py`); see the correct
+implementation below.
+
+**All-genes-isodepth-as-covariate line on each pathway's own `*_metric_distribution.png` /
+`{run_name}_combined_metric_distribution.png` (2026-08-23, correct implementation):** New
+`experiments/studies/pathway_panel_sweep/lib.py::apply_all_genes_covariate_baseline(result_json_path,
+reference_isodepth, reference_S)`: for each pathway run, z-scores the fixed all-genes isodepth
+(loaded once from `reference_full_result_json`, e.g. `FULL_3000HVG`/whole-transcriptome run) and
+refits it as a 1-D covariate against that run's *own* saved post-preprocessing expression matrix
+(`A` from its `*_isodepths.npz`, same array the isodepth model was trained on) — closed-form OLS
+via `methods/trainers/isodepth.py::fit_closed_form_decoder` when `test.decoder` is
+`linear`/`quadratic` (`fit_poisson_glm_irls` if `test.metric` is Poisson), else GD via
+`train_fixed_covariate_model` for `decoder="nn"`. The resulting loss (`compute_metric` on the
+refit predictions) and its permutation p-value (against the run's own `stat_perm`, already saved)
+are added as a third "All-genes isodepth (OLS)" line/legend entry alongside the existing
+"Isodepth"/observed line, via the pre-existing `stat_covariate`/`p_value_covariate` dual-line
+branch in `analysis/plots.py::save_metric_distribution_plot` /
+`save_combined_celltype_metric_distribution` (both now accept a `covariate_label=` override,
+plumbed through `TestResult.artifacts["covariate_label"]` for the single-plot function — default
+stays `"Covariate (midline) decoder"` for the pre-existing midline-covariate regen script that
+doesn't pass a label). Persists `stat_covariate`/`p_value_covariate` into each
+`artifacts.per_type_summaries[type]` in the run's own result JSON (survives re-analysis) and
+rewrites its PNGs in place. Requires `cell_type_mode == "separate"` (what these sweeps always
+produce) and matching `S` coordinates between the reference run's npz and the pathway's own npz
+(same skip-with-warning pattern as the existing full-vs-pathway Spearman comparison); wired into
+`pathway_panel_sweep/analysis.py`'s existing per-row full-isodepth-comparison loop (right after the
+coordinate-match check, so `full_iso`/`full_S` are reused) — no new I/O beyond what that loop
+already does. New `per_pathway_results.csv` columns `stat_covariate_all_genes` /
+`p_value_covariate_all_genes` (mean across cell-type groups; both sweeps only ever have 1 group
+per pathway run in practice). Ran for both sweeps end-to-end: **every single pathway in both
+sweeps** has `p_value_covariate_all_genes == 1.0` (all 50/50 in each) — i.e. the whole-transcriptome
+isodepth axis, even after an optimal OLS refit onto any individual 200-gene panel, never beats
+that panel's own null distribution; each pathway's freely-trained isodepth (its own `p_value`) is
+a categorically different/better fit than forcing the global axis onto it. Mean
+`stat_covariate_all_genes` vs mean `stat_true`: HT268B1 clone1 82205 vs 78794; clone2 (HT306P1)
+21619 vs 21251 — covariate consistently worse, as expected.
+
+**Follow-up investigation: why does the all-genes covariate underperform even for
+high-correlation pathways? (2026-08-23):** User pushback — many clone2 pathways have very high
+`spearman_vs_full` (mean |rho|=0.84, median 0.91, 26/50 > 0.9; **clone1 pathways are only
+weakly correlated**: mean |rho|=0.23, median 0.21, max 0.53, none > 0.7 — so the "isodepths match
+almost completely" recollection only applies to clone2/HT306P1, not clone1/HT268B1). Investigated
+whether `apply_all_genes_covariate_baseline`'s OLS refit has a bug, given even clone2's `hypoxia`
+pathway (rho=0.84) still gets `p_value_covariate=1.0` (stat_covariate 31048 vs stat_true 30539,
+vs null range ~30520-30670). Verified via two independent fresh re-trainings (direct
+`train_parallel_isodepth_model` call, and the exact production `_process_single_celltype_separate`
+path, both on `hallmark_pathway_sweep_ht268b1_clone1__apical_junction`'s saved `S`/`A`) that
+`fit_closed_form_decoder` on a model's own freshly-extracted isodepth **always** achieves loss <=
+that same model's actual (GD-trained) loss for the same z — i.e. **the OLS-refit methodology is
+mathematically sound and self-consistent**, confirming no bug in the new covariate code. (Aside:
+found that the *original* `apical_junction` run's saved `true_isodepth` does NOT reproduce its own
+saved `stat_true` when OLS-refit — OLS gives 107355 vs saved stat_true=104242, which is
+impossible if `true_isodepth` were really the exact z that produced that run's `pred_true`; both
+fresh re-trainings above landed at 106610–107284, much closer to the OLS-refit figure than to
+104242. Root cause not identified (ruled out: rerun/slot index-mismatch in
+`_finalize_batched_parallel_training`'s `np.repeat`-based expansion, which is self-consistent;
+ruled out: hidden IRLS/closed-form decoder substitution for Gaussian metric, which only applies to
+Poisson per `_slot_metric_and_prediction`) — most likely explanation is plain CUDA
+non-determinism across training runs (same `seed=42` does not give bit-identical results on GPU)
+combined with a **highly multi-modal loss landscape** across the `n_reruns=30` random encoder
+inits, i.e. 104242 may just be an unusually lucky one of 30 draws for that specific run. Not
+fixed/flagged for follow-up if exact reproducibility ever matters.)
+
+The real answer to "why does even 0.84-correlated covariate underperform the null": (1) Spearman
+measures rank/monotonic agreement, not the linear fit a `decoder=linear` OLS refit needs — at
+rho=0.84 there is substantial nonlinear/residual disagreement between the two isodepths, and
+`nll_gaussian_mse` here is extremely tight (null spread is ~70 units on a ~30600 baseline, <0.25%
+relative), so even small deviations from the *ideal* per-gene affine fit blow the loss past the
+entire null band. (2) More fundamentally, it's a degrees-of-freedom mismatch, not a correlation
+one: the "Isodepth" line (and every null-permutation draw) comes from **freely re-optimizing** a
+2-layer-MLP encoder (2→20→20→1, i.e. effectively cell-level flexibility) jointly with the linear
+decoder for that specific 200-gene panel; the "covariate" line freezes the latent to the
+already-fixed full-transcriptome axis and only fits 2 parameters/gene (slope+intercept) via OLS.
+Even a *perfectly rank-correlated but not affinely-identical* latent will lose to a
+freshly-fit encoder+decoder, and critically the **null itself gets that same fresh-refit advantage
+per permutation** (each null draw retrains its own encoder on shuffled coordinates) — so the
+covariate line is being compared against a moving target that always gets to cheat via per-cell
+flexibility, not just against the true pathway signal. This is an intrinsic property of comparing
+a fixed 1-parameter covariate against a family of freely-refit existence tests, not a flaw in the
+new covariate code.
+
+**UNRESOLVED: cached hallmark-sweep artifacts do not reproduce under fresh retraining with
+identical config/seed — casts doubt on the "covariate always loses" conclusion above
+(2026-08-23):** For `hallmark_pathway_sweep_ht268b1_clone1__apical_junction`, retraining from
+scratch via the exact production path (`_process_single_celltype_separate`, same `test` config
+incl. `seed=42`, `n_reruns=30`, `epochs=1000`, `n_perms=249`, on the identical saved `S`/`A`)
+gives `stat_true≈106610` and null range `[107202, 107546]` — ~2–3% *worse* (higher loss) than the
+**cached** result.json's `stat_true=104242` / null `[104279, 104376]`. Also found the cached
+run's saved `pred_true` is empirically **rank-3** (SVD of centered `pred_true` has singular values
+`[5687, 412, 301, ~1e-13, ...]`, i.e. exactly 3 nonzero components) — mathematically impossible
+for `decoder="linear"` (`nn.Linear(1, G)` on a 1-D latent can only produce rank ≤2 output: one
+term from the scalar latent, one from the per-gene bias). Ruled out as explanations: (a) rerun/slot
+index-mismatch in `_finalize_batched_parallel_training`'s `np.repeat`-based (n_models×n_reruns)
+expansion — verified self-consistent via direct testing; (b) hidden closed-form/IRLS decoder
+substitution — `_slot_metric_and_prediction` only does this for `nll_poisson_mse`, not
+`nll_gaussian_mse`; (c) mislabeled `decoder="quadratic"` — fitting `[z, z², 1]` on the saved
+`true_isodepth` still doesn't reproduce `pred_true` (residual as large as the raw fit). Root cause
+still unknown — likely either the sweep was run under an earlier version of
+`methods/trainers/isodepth.py` / `methods/permutation.py` (git history shows the training code has
+changed across several commits; no timestamp in the result JSON to confirm), or there is
+significant CUDA non-determinism + a highly multi-modal `n_reruns=30` optimization landscape (two
+*independent* fresh retrains of this same pathway in this session — one quick, one full — differed
+from each other by ~0.6%, and both differed from the cached value by ~2–3%, i.e. cached looks like
+an outlier/lucky draw relative to current-code retrains, not just ordinary rerun noise).
+**Practical impact:** the all-genes-covariate-vs-null comparison documented above
+(`p_value_covariate_all_genes == 1.0` for 50/50 pathways in both sweeps) is computed against these
+cached `stat_true`/`stat_perm` values without re-verifying them, and for this one pathway a fresh
+null would have put the covariate stat (107387) *inside* the null range (~p=0.5) rather than
+p=1.0. **Do not treat the "covariate never beats the null" conclusion as reliable until the
+underlying sweep is re-run from scratch on current code and spot-checked for
+reproducibility/self-consistency** (e.g. verify `fit_closed_form_decoder(saved true_isodepth, A) <=
+saved stat_true`, which should always hold and did not for this pathway).
+
+**Pre-existing bug found while re-running the above (NOT fixed, flagged for follow-up):**
+`per_pathway_results.csv` / `significant_pathway_names` / spearman-matrix & grid labels are all
+blank (`pathway_name=""`, `pathway_index=-1`) for **every** row in a fresh re-run of both hallmark
+sweeps from this session's shell. Root cause: `manifest.json` (`load_manifest_entries` in
+`experiments/studies/pathway_panel_sweep/lib.py`, shared pattern in `fourier_kmax*`,
+`existence_sigma`, `existence_consistency`, `random_gene_panel_null`) stores each run's
+`result_json_path` as an **absolute path baked in at sweep time**
+(`/weka/scratch/uchitra1/users/ajain71/...`, missing a `jhu/` segment), which no longer exists as
+a real path — only `/weka/scratch/jhu/uchitra1/users/ajain71/...` does now (this session's
+`/home/jhu/ajain71/scratch_uchitra1` symlink resolves to the latter). Manifest keys and
+freshly-scanned-file keys never match, so `manifest_entry` is `None` for every row and
+`entry.get("pathway_name", "")` falls back to `""`. The two headline histogram plots are
+unaffected (they read `p_value`/`stat_true` directly from each pathway's own result JSON, not
+from the manifest), but the CSV/matrix/grid pathway labels are currently broken for any fresh
+re-run. Not fixed here (out of scope, and the same brittle-absolute-path-in-manifest pattern
+recurs in ~6 other study modules) — a real fix should join scanned result files to manifest rows
+by `run_name` (derivable from the file path itself) instead of by exact absolute path string.
+
+**Compared the actual pipeline against the user's intended 3-step GSEA-covariate design
+(2026-08-23) — found the covariate was never wired through the real pipeline at all, plus a
+genuine `test.n_perms`/`n_reruns` mismatch between the reference run and the pathway sweeps.**
+User's intended design: (1) run the all-genes/3K-HVG test once, no permutations needed, just save
+the isodepth; (2) same settings, gene-set-restricted subsets, with step-1's isodepth fed into the
+model **as a covariate**; (3) permutation-test the subsets with parameters identical to step 1
+except the gene set. Checked against the codebase:
+- The codebase **already has** exactly this "isodepth as a fixed model covariate" mechanism —
+  `TestConfig.covariate` (`data/schemas.py` `CovariateConfig`, types `midline` / `total_counts` /
+  any `obs_key`) → `methods/permutation.py::_train_covariate_artifacts`. For `type=<obs_key>` (the
+  relevant case here — a per-cell array read from `adata.obs[obs_key]`), it does *exactly* what my
+  post-hoc `apply_all_genes_covariate_baseline` (`experiments/studies/pathway_panel_sweep/lib.py`)
+  does: `zscore_covariate` → `fit_closed_form_decoder` (closed-form OLS for `linear`/`quadratic`
+  decoders) → `compute_metric` → `permutation_p_value(stat_covariate, stat_perm)`. So the *math* my
+  post-hoc script does is a faithful reproduction of the built-in mechanism.
+- **But neither the reference (step-1) run nor any pathway-sweep run ever actually sets
+  `test.covariate`** — checked the saved `config.test.covariate` in both hallmark sweeps'
+  `reference_full_result_json` and in every pathway base config
+  (`configs/calicost/*loss_difference*.json`, `configs/experiments/hallmark_pathway_sweep_*.json`):
+  all are `null`. The only "covariate" concept actually active anywhere in these configs is a
+  **completely different, pre-existing mechanism** — `data.covariate_whitening` (method
+  `"loss-difference"`, whitening out `calicost_tumor_proportion` + `log1p_total_counts` from
+  expression *before* fitting, for QC-confound removal) — do not confuse the two; they share the
+  word "covariate" but are unrelated (one whitens inputs at the data layer, the other fixes the
+  model's latent at the test layer).
+  So the "all-genes isodepth as a `test.covariate`" design was never implemented in the actual
+  training pipeline for this sweep — my post-hoc script is the *only* place it exists, and it runs
+  external to any real training run, reusing whatever `stat_perm` happens to be cached in each
+  pathway's already-saved result JSON (see the reproducibility finding above — that cached
+  `stat_perm` does not reliably reproduce under a fresh retrain with identical settings).
+- **Confirmed settings mismatch between step 1 and steps 2/3** (violates "parameters EXACT same as
+  step 1 except gene set"): reference runs use `n_perms=99, n_reruns=10`
+  (`loss_diff_clone1_gt0p7_linear_tumor_logcounts_result.json`,
+  `loss_diff_clone2_linear_gt0p7_cropy_tumor_logcounts_3000hvg_result.json`), while both
+  `hallmark_pathway_sweep_*_study.json` study configs override every pathway run to
+  `n_perms=249, n_reruns=30`. `decoder="linear"` and `metric="nll_gaussian_mse"` do match. More
+  reruns-per-permutation for the pathway's own free encoder+decoder null means that null is more
+  thoroughly optimized (lower/tighter) than the reference's, which — independent of the covariate
+  question — makes the pathway's own bar higher to beat than step 1's was.
+  (`obs_numeric_filters`/`spatial_denoise_radius_um`/`normalize_total`/`spatial_crop` could not be
+  verified from the reference's saved `config.data` — it's missing those keys entirely despite the
+  run *name* implying `gt0.7` tumor filter + crop, consistent with the already-documented
+  "saved config predates newer serialized fields" issue seen elsewhere for these older calicost
+  runs, e.g. `scripts/posthoc/gsea_loss_diff_clone2_linear.py`'s docstring — so this one is
+  unverified rather than confirmed-different.)
+- **Net conclusion for the user:** the "covariate never wins" result documented above should not
+  be trusted as a real biological finding. Two independent, compounding issues: (a) the covariate
+  was only ever tested post-hoc against a *stale, possibly-unrepresentative* cached null instead of
+  through the real `test.covariate` pipeline with a null computed fresh in the same run, and (b)
+  even setting that aside, the pathway sweeps use 2.5x the permutations and 3x the reruns-per-model
+  of the reference run, biasing the comparison further against a fixed covariate. **To actually
+  answer whether the all-genes isodepth is a significant covariate for these gene subsets**, the
+  isodepth would need to be written into `adata.obs` (or otherwise threaded into
+  `dataset.meta["covariate_values"]`) and each pathway run re-executed with `test.covariate={"type":
+  <obs_key>}` end-to-end through `_process_single_celltype_separate`/`_train_covariate_artifacts`,
+  with `n_perms`/`n_reruns` matched to the reference — not recomputed post-hoc against old cached
+  artifacts.
+
 
 
 **Data source found and downloaded.** The Ravi et al. 2022 Dryad GBM dataset
@@ -1039,3 +1248,157 @@ U2OS MERFISH run: true has a clear short-range excess covariance (peak c≈0.023
 band. So there *is* real (if weak, gene-pooled) spatial structure vs label-shuffle — enough for the
 NLL test to reject — but the absolute effect is small and short-range, consistent with local
 technical/packing structure rather than a tissue-scale expression gradient.
+
+## Gene expression vs isodepth + spatial companion: rank by encoder-decoder loss (2026-08-23)
+
+The binned `*_gene_expression_vs_isodepth.png` and companion
+`*_svg_spatial_expression.png` now show the **same top 5 genes**, ranked by
+per-gene MSE of `pred_true` (full encoder-decoder reconstruction).  Panel
+annotations are decoder R² / MSE.  Spearman |ρ| is only the fallback when no
+decoder fit exists.  The F-test CSV is still written for parametric decoders
+but is **not** used to pick those panels (floored p-values were selecting a
+different gene set than the scatter).  Comparison plots rank isodepth rows by
+`pred_true` MSE and covariate rows by `pred_true_covariate` MSE, and the
+spatial grid uses those same two lists.
+
+## Inclusion-survey selected DBSCAN clusters (2026-08-24, corrected)
+
+The first pass wrongly used whole clones from `survey_inclusion_clones.png`.
+Those run dirs, clone-level configs/indices, `selected_panels/`, and
+`inclusion_gt0p7_qc60-*.log` were deleted. The intended units are panels
+1,2,3,4,5,6,7,11,12,18,21,24 of
+`survey_inclusion_dbscan_clusters.png` (5-col, left-to-right then
+top-to-bottom). Panel 20 (HT270P1 clone 1 cluster 0) was swapped for
+panel 21 (HT288P1 clone 1 cluster 0, n=53). Artifacts:
+`results/calicost/cohort_survey/gt1clone/inclusion_gt0p7_qc60/selected_clusters/`
+and `configs/calicost/inclusion_gt0p7_qc60/`. Spots are pinned with
+`obs_indices` to the exact DBSCAN cluster (SpotSweeper pass +
+`tumor_prop > 0.7` + cluster membership). Same test settings as before
+(3000 HVG, linear decoder, 249 perms, 30 reruns, 1000 epochs). Submit:
+`sbatch run_inclusion_gt0p7_qc60.sh`. Re-run only panel 21 with
+`sbatch --array=10 run_inclusion_gt0p7_qc60.sh`.
+
+**HVG without scanpy:** `_select_hvg_mask` falls back to numpy/pandas
+Seurat-style HVG (`_seurat_hvg_mask_from_counts`) when scanpy is missing
+(`isodepth_env` currently has no scanpy).
+
+## Gaussian-blurred visium vs full pseudobulk (2026-08-24)
+
+Spatial autocorrelation is **Gaussian blur of white noise**, not Cholesky
+`exp`+`δ`.  Each cell's noise is a Gaussian-weighted average of nearby cells:
+`Z'_i ∝ Σ_j Z_j exp(-‖x_i-x_j‖² / (2σ²))` with `kernel.type='smooth'`.
+The sweep axis is **`gaussian_blur_sigma_um`: 15, 30, 55, 100 µm** (four
+panels, not one blur length).  Neighbor cutoff is `4σ`.
+
+Two aggregation methods, same blur / seeds / 100 µm hex pitch:
+
+| Arm | Spec | Method | Geometry |
+|---|---|---|---|
+| Visium-style | `configs/experiments/kernel_blurred_visium_pseudobulk_sweep.json` | `visium_pseudobulk` | 100 µm pitch, 55 µm circles, gap cells dropped |
+| Full pseudobulk | `configs/experiments/kernel_blurred_pseudobulk_sweep.json` | `binning` | 100 µm hex tiles, every cell assigned |
+
+`bw15` / `bw30` / `bw55` / `bw100` in run names are **Gaussian blur σ in µm**, not
+the bin size.  Both arms use the same synthetic data recipe (4096 cells, same
+seeds); they look different in `_dataset.png` / `_isodepth.png` because those
+figures are drawn **after** aggregation (Visium drops gap cells; hex binning
+keeps every cell as a 100 µm tile).  Cell-level pre-aggregation figures are
+`{run}_original_dataset.png` (expression + blur field) plus `{run}_overlay.png`
+(capture geometry on the original cells).  Backfill existing runs with
+`python scripts/posthoc/backfill_pre_aggregation_plots.py --spec <sweep.json>`.
+
+`--spec` is required.  Results:
+`results/experiments/kernel_blurred_visium_pseudobulk_sweep` and
+`results/experiments/kernel_blurred_pseudobulk_sweep`.
+
+```
+python -m experiments.kernel_blurred_sweep --spec configs/experiments/kernel_blurred_visium_pseudobulk_sweep.json
+python -m experiments.kernel_blurred_sweep --spec configs/experiments/kernel_blurred_pseudobulk_sweep.json
+python -m experiments.kernel_blurred_sweep_analysis --spec configs/experiments/kernel_blurred_visium_pseudobulk_sweep.json
+python -m experiments.kernel_blurred_sweep_analysis --spec configs/experiments/kernel_blurred_pseudobulk_sweep.json
+```
+
+## Inclusion panel02 non-significant: jagged decoder is covariate, not a failed isodepth fit (2026-08-25)
+
+`panel02_HT112C1_U1_ST_Bn1_clone1_cluster1` (n=67, p=0.184). The black line on
+`*_gene_expression_vs_isodepth.png` looks jagged even though `decoder="linear"`
+and the plot sorts by isodepth. That is expected under loss-difference: the
+decoder is `h(d, n) = Linear([isodepth, zscored tumor_prop])`, so `pred_true` is
+exactly affine in `(iso, tumor_prop)` and **not** a function of isodepth alone.
+For this run, median `R²(pred ~ tumor_prop)=0.97` vs `R²(pred ~ iso)=0.03`; the
+top-5 genes by reconstruction loss (LGALS1 etc.) have `R²(pred ~ tumor)≈1` and
+only `R²(A ~ iso)` of 0.006–0.11. Plotting that joint prediction vs isodepth
+traces tumor-proportion jitter.
+
+The existence test is whether spatial `d` beats coordinate-shuffled slots that
+still see `n`. True NLL is only 0.90σ below the perm mean (45/249 nulls ≤ true).
+Sibling cluster 0 on the same clone (`panel01`, n=239) has the same jagged
+decoder (tumor still dominates `pred_true`) but z=19.9 / p=0.004 — small extra
+spatial signal is detectable at larger n, not here. Do not rank genes by joint
+`pred_true` MSE if the question is “which genes follow isodepth.”
+
+## Xia2019 MERFISH Visium-style pseudobulk (2026-08-25)
+
+Config: `configs/jfan_merfish_visium_pseudobulk.json`. Same Xia et al. 2019 U2OS
+h5ad and training recipe as `configs/jfan_merfish.json`, but
+`test.method=visium_pseudobulk` (100 µm pitch / 55 µm circles). Native
+`obsm['spatial']` is already microns (`obs` has `x_microns`/`y_microns`, bbox
+~3.2 mm), so `coordinate_um_per_unit=1.0`. Cultured monolayer is sparse (median
+NN ~45 µm), so a 55 µm Visium spot typically captures 1 cell (max 3); dry-run
+gave 347 occupied pseudospots from 1368 cells (~71% dropped in inter-spot gaps).
+`run_permutation.py` loads raw counts and applies CPM/log1p/z-score after
+aggregation. Overlay is written automatically as `{run}_overlay.png`.
+499-perm sibling: `configs/jfan_merfish_visium_pseudobulk_p499.json`
+(`n_perms=499`, `epochs=2000`, run `260825_jfan_merfish_visium_pseudobulk_p499`).
+
+## `p (covariate)` in hallmark pathway sweep + HVG3000 covariate is miscalibrated to 1.0 across the board (2026-08-26)
+
+In `results/experiments/hallmark_pathway_sweep_clone2_hvg3000_covariate/`, checked all
+50 pathway×celltype `*_metric_distribution.png` teal ("HVG3000 isodepth") lines: **0/50**
+fall inside the null histogram range, **50/50** have `p_value_covariate == 1.0`. This is
+not (necessarily) a biological result — it's an apples-to-oranges comparison baked into
+the pipeline when `test.covariate.type` (e.g. `hvg3000_isodepth`) is combined with
+`data.covariate_whitening: "loss-difference"` (both true here, per
+`configs/experiments/hallmark_pathway_sweep_clone2_hvg3000_covariate_study.json` →
+`configs/calicost/HT306P1_S1H1Fc2U1Z1Bs1_loss_difference_clone2_*_tumor_logcounts*.json`,
+whitening on `[calicost_tumor_proportion, log1p_total_counts]`):
+
+- `stat_true` (red line) and **every** `stat_perm` null value come from the joint
+  `h(d, n)` model: `methods/architectures.py::_concat_covariate` concatenates the fixed
+  `n = [tumor_proportion, log1p_total_counts]` onto the encoder's spatial latent before
+  the decoder, for both the true layout and all coordinate-permuted slots (see also the
+  `panel02 ... jagged decoder` note above). So the whole null histogram already "sees"
+  tumor proportion + log-counts.
+- `stat_covariate` (teal line, the fixed external HVG3000 isodepth) is fit by
+  `methods/permutation.py::_train_covariate_artifacts` → `_covariate_type_values` branch,
+  which does `fit_closed_form_decoder(zscore_covariate(hvg3000_isodepth), A, decoder_type)`
+  — **`n` is never concatenated in on this path.** The covariate baseline is missing two
+  of the most predictive variables in the dataset that both the null and the true stat get
+  for free, which alone is enough to push it above every permutation regardless of whether
+  the HVG3000 spatial axis is actually informative for the pathway's genes.
+
+Net: don't trust `p (covariate)` from this pipeline as a fair "does the global isodepth
+axis explain this pathway as well as its own fitted isodepth" test when
+`covariate_whitening=loss-difference` is also active — it's structurally biased toward
+`p=1`. A fix would need `_train_covariate_artifacts`'s values branch to also concatenate
+`dataset.meta["covariate_whitening_values"]` (the same `n` used for `stat_true`/`stat_perm`)
+onto the fixed latent before fitting/evaluating the covariate decoder.
+
+**2026-08-26: dropped `log1p_total_counts` from this experiment's whitening, temporarily.**
+`covariate_whitening_obs_key` was `["calicost_tumor_proportion", "log1p_total_counts"]` in
+both `configs/calicost/HT306P1_S1H1Fc2U1Z1Bs1_loss_difference_clone2_hypoxia_genes_tumor_logcounts.json`
+(base_config) and `..._gt0p7_cropy_tumor_logcounts_3000hvg_r30.json` (hvg3000_config) —
+`log1p_total_counts` was added because total_counts/library size turned out to be strongly
+spatially confounded with the fitted isodepth in this clone (rho≈0.86–0.95, see the
+"structural limitation" section above), so it was whitened out to try to isolate spatial
+signal beyond sequencing-depth/tissue-quality gradients. Per user request, reverted both
+configs to single-covariate `covariate_whitening_obs_key: "calicost_tumor_proportion"` (also
+dropped `log1p_total_counts` from `obs_drop_na`) to test this in isolation. Renamed
+`output.run_name` in both (`..._tumor_logcounts` → `..._tumor_prop_only` /
+`..._tumor_prop_only_3000hvg_r30`) so old two-covariate results aren't confused with new
+ones — harmless since the pathway sweep overrides `run_name` per-pathway anyway
+(`experiments/studies/pathway_panel_sweep/lib.py::build_pathway_run_config`). Note the
+`log1p_total_counts` asymmetry documented just above (missing from the covariate-baseline
+path) is independent of this change and still applies even with only `tumor_proportion`
+whitened. Have NOT yet re-run the HVG3000 reference or the pathway sweep with these edited
+configs — configs only, no new results yet as of this note.
+

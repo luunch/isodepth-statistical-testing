@@ -9,6 +9,7 @@ These public paths must keep working (shims re-export from new locations when ne
 - `from experiments.configuration import …`
 - `from experiments.recursive_svg import …`
 - `python -m experiments.<study>_sweep` / `_analysis` (flat module names)
+- `python -m experiments.kernel_blurred_sweep` / `kernel_blurred_sweep_analysis`
 - `from experiments.kernel_noise_study import load_dataset_cache` (re-exports `experiments.core.dataset_cache`)
 - `from experiments.existence_sigma import load_result_payload, scan_result_json_paths, write_csv`
 
@@ -25,7 +26,7 @@ Prefer new imports:
 |---|---|
 | `configuration.py`, `recursive_svg.py` | Framework (stay top-level) |
 | `core/` | Shared study helpers (`study_io`, `dataset_cache`, `study_spec`, `paths`) |
-| `studies/<name>/` | Active sweep families (existence_sigma, fourier_kmax, …) |
+| `studies/<name>/` | Active sweep families (existence_sigma, fourier_kmax, kernel_blurred_sweep, …) |
 | `diagnostics/` | batchsize, bias detection, rerun_* |
 | `figures/` | publication_figures, merfish viz |
 

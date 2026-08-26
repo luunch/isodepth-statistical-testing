@@ -32,12 +32,14 @@ from analysis.plots import (
     save_obs_numeric_filter_diagnostic_plot,
     save_obs_numeric_filter_histogram,
     save_permutation_null_comparison,
+    save_pre_aggregation_dataset_plot,
     save_perturbation_delta_pvalue_plot,
     save_synthetic_kernel_plot,
     save_synthetic_true_curve_plot,
     save_subset_fraction_pvalue_plot,
     save_true_rerun_isodepth_grid,
     save_freedman_lane_covariate_plot,
+    save_visium_pseudobulk_overlay,
     save_covariate_whitening_spatial_plot,
     save_single_type_covariate_plot,
     save_fourier_surrogate_example_plot,
@@ -459,6 +461,7 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
         "parallel_permutation",
         "block_permutation",
         "binning",
+        "visium_pseudobulk",
         "joint_truncated_msr",
         "joint_truncated_rank_msr",
         "fourier_spectral_randomization",
@@ -481,6 +484,13 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
         test_keys |= {
             "bin_shape",
             "bin_spot_distance_um",
+            "coordinate_um_per_unit",
+            "block_jitter",
+        }
+    if method == "visium_pseudobulk":
+        test_keys |= {
+            "visium_spot_distance_um",
+            "visium_spot_diameter_um",
             "coordinate_um_per_unit",
             "block_jitter",
         }
@@ -528,6 +538,7 @@ def _method_artifact_keys(method_name: str) -> set[str]:
         "parallel_permutation",
         "block_permutation",
         "binning",
+        "visium_pseudobulk",
         "joint_truncated_msr",
         "joint_truncated_rank_msr",
         "cross_validation",
@@ -566,6 +577,11 @@ def _method_artifact_keys(method_name: str) -> set[str]:
             extra |= {
                 "binning_summary",
                 "binning_cell_counts",
+            }
+        if method_name == "visium_pseudobulk":
+            extra |= {
+                "visium_pseudobulk_summary",
+                "visium_pseudobulk_cell_counts",
             }
         if method_name in MSR_METHODS:
             extra.add("msr_surrogate_example")
@@ -701,6 +717,11 @@ def _save_single_type_outputs(
             "true_isodepth_covariate": type_data.get("true_isodepth_covariate"),
             "stat_covariate": type_data.get("stat_covariate"),
             "p_value_covariate": type_data.get("p_value_covariate"),
+            "covariate_label": (
+                "HVG3000 isodepth"
+                if dataset_meta.get("covariate_obs_key") == "hvg3000_isodepth"
+                else dataset_meta.get("covariate_obs_key")
+            ),
             "rerun_summary": type_data.get("rerun_summary", {}),
             "true_rerun_index": type_data.get("true_rerun_index", 0),
             "true_train_loss": type_data.get("true_train_loss", 0.0),
@@ -1050,9 +1071,36 @@ def _resolve_covariate_label(run_config: RunConfig) -> str:
         return "Midline"
     if cov.type == TOTAL_COUNTS_COVARIATE:
         return "Log total counts"
+    if cov.type == "hvg3000_isodepth":
+        return "HVG3000 isodepth"
     if cov.is_obs_key and cov.type:
         return str(cov.type).capitalize()
     return "Covariate"
+
+
+def _save_pre_aggregation_artifacts(
+    original_dataset: DatasetBundle,
+    result: TestResult,
+    run_config: RunConfig,
+    out_dir: Path,
+) -> dict[str, str]:
+    """Cell-level plots taken before swapping in the aggregated pseudospot dataset."""
+    if result.method_name not in {"binning", "visium_pseudobulk"}:
+        return {}
+
+    aggregation_label = (
+        "Visium capture" if result.method_name == "visium_pseudobulk" else "pseudospot binning"
+    )
+    artifact_paths: dict[str, str] = {}
+    original_path = save_pre_aggregation_dataset_plot(
+        original_dataset,
+        out_dir / f"{run_config.output.run_name}_original_dataset.png",
+        run_name=run_config.output.run_name,
+        aggregation_label=aggregation_label,
+    )
+    if original_path is not None:
+        artifact_paths["original_dataset_plot"] = str(original_path)
+    return artifact_paths
 
 
 def _save_block_permutation_overlay_artifact(
@@ -1108,15 +1156,27 @@ def save_standardized_outputs(
     out_dir = out_root / run_config.output.run_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    original_dataset = dataset
     if result.method_name == "binning":
         binned_dataset = result.artifacts.get("binned_dataset")
         if isinstance(binned_dataset, DatasetBundle):
             dataset = binned_dataset
+    if result.method_name == "visium_pseudobulk":
+        pseudobulk_dataset = result.artifacts.get("visium_pseudobulk_dataset")
+        if isinstance(pseudobulk_dataset, DatasetBundle):
+            dataset = pseudobulk_dataset
+
+    pre_aggregation_paths = _save_pre_aggregation_artifacts(
+        original_dataset,
+        result,
+        run_config,
+        out_dir,
+    )
 
     if result.artifacts.get("cell_type_mode") == "separate":
         return _save_separate_celltype_outputs(dataset, result, run_config, out_dir)
 
-    artifact_paths: dict[str, str] = {}
+    artifact_paths: dict[str, str] = dict(pre_aggregation_paths)
 
     dataset_triptych_path = save_dataset_triptych(
         dataset,
@@ -1146,7 +1206,7 @@ def save_standardized_outputs(
         artifact_paths["synthetic_true_curve_plot"] = str(synthetic_true_curve_path)
 
     synthetic_kernel_paths = save_synthetic_kernel_plot(
-        dataset,
+        original_dataset if result.method_name in {"binning", "visium_pseudobulk"} else dataset,
         out_dir / f"{run_config.output.run_name}_kernel_diagnostics.png",
     )
     if synthetic_kernel_paths is not None:
@@ -1196,6 +1256,65 @@ def save_standardized_outputs(
     )
     if moran_plot_path is not None:
         artifact_paths["moran_distribution_plot"] = str(moran_plot_path)
+
+    if result.method_name == "visium_pseudobulk":
+        overlay_S = result.artifacts.get("visium_overlay_S_um")
+        overlay_assigned = result.artifacts.get("visium_overlay_assigned")
+        overlay_centers = result.artifacts.get("visium_overlay_centers_in_tissue_um")
+        overlay_occupied = result.artifacts.get("visium_overlay_occupied_ids")
+        if overlay_S is not None and overlay_centers is not None:
+            summary = dict(result.artifacts.get("visium_pseudobulk_summary") or {})
+            overlay_path = save_visium_pseudobulk_overlay(
+                overlay_S,
+                overlay_assigned,
+                overlay_centers,
+                overlay_occupied,
+                hex_radius_um=float(
+                    result.artifacts.get("visium_overlay_hex_radius_um", summary.get("hex_radius_um", 0.0))
+                ),
+                spot_radius_um=float(
+                    result.artifacts.get("visium_overlay_spot_radius_um", summary.get("spot_radius_um", 0.0))
+                ),
+                out_path=out_dir / f"{run_config.output.run_name}_overlay.png",
+                run_name=run_config.output.run_name,
+                spot_distance_um=summary.get("spot_distance_um"),
+                spot_diameter_um=summary.get("spot_diameter_um"),
+            )
+            if overlay_path is not None:
+                artifact_paths["visium_pseudobulk_overlay_plot"] = str(overlay_path)
+
+    if result.method_name == "binning":
+        overlay_S = result.artifacts.get("binning_overlay_S_um")
+        overlay_ids = result.artifacts.get("binning_overlay_block_ids")
+        if overlay_S is not None:
+            summary = dict(result.artifacts.get("binning_summary") or {})
+            overlay_shape = str(
+                result.artifacts.get(
+                    "binning_overlay_shape",
+                    summary.get("shape", run_config.test.bin_shape),
+                )
+            )
+            overlay_path = save_block_permutation_overlay(
+                overlay_S,
+                None,
+                overlay_ids,
+                out_dir / f"{run_config.output.run_name}_overlay.png",
+                run_name=run_config.output.run_name,
+                radius_units=float(
+                    result.artifacts.get(
+                        "binning_overlay_radius_um",
+                        summary.get("radius_um", 0.0),
+                    )
+                ),
+                block_shape=overlay_shape,
+                figure_title=(
+                    f"Binning overlay — {run_config.output.run_name} "
+                    f"({summary.get('n_pseudospots', '?')} {overlay_shape} tiles, "
+                    f"{float(summary.get('spot_distance_um', 100.0)):g} µm pitch)"
+                ),
+            )
+            if overlay_path is not None:
+                artifact_paths["binning_overlay_plot"] = str(overlay_path)
 
     if result.method_name == "block_permutation":
         S_true_raw = raw_coordinates_from_standardized(dataset.S, dataset.meta)
@@ -1452,6 +1571,7 @@ def _save_separate_celltype_outputs(
         cell_type_names,
         out_dir / f"{run_config.output.run_name}_combined_metric_distribution.png",
         metric=result.metric,
+        covariate_label=_resolve_covariate_label(run_config),
     )
 
     combined_isodepth_path = save_combined_celltype_isodepth_grid(

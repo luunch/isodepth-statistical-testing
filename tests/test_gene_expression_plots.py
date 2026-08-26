@@ -4,9 +4,13 @@ import numpy as np
 
 from analysis.plots import (
     _bin_mean_series,
+    _decoder_fit_stats,
     _expression_label,
     _expression_y_axis_label,
+    _mse_per_gene,
     _quantile_bin_assignments,
+    _r2_per_gene,
+    _top_genes_by_decoder_loss,
 )
 from experiments.configuration import _decoder_df_from_config
 
@@ -61,6 +65,29 @@ class GeneExpressionPlotHelpersTests(unittest.TestCase):
         smooth_range = float(np.max(fit_y) - np.min(fit_y))
         self.assertGreater(per_cell_range, 10.0)
         self.assertLess(smooth_range, 0.5 * per_cell_range)
+
+    def test_top_genes_by_decoder_loss_are_lowest_mse(self):
+        losses = np.array([0.40, 0.05, 0.20, 0.01, 0.30])
+        top = _top_genes_by_decoder_loss(losses, 3)
+        np.testing.assert_array_equal(top, np.array([3, 1, 2]))
+
+    def test_decoder_fit_stats_rank_by_pred_true_not_spearman(self):
+        rng = np.random.default_rng(1)
+        n, g = 80, 6
+        iso = np.linspace(-1.0, 1.0, n)
+        A = rng.normal(size=(n, g))
+        A[:, 0] = 3.0 * iso + rng.normal(scale=0.05, size=n)
+        A[:, 1] = rng.normal(size=n)
+        A[:, 1] += np.where(np.arange(n) < 4, 8.0, 0.0)
+        pred = np.zeros_like(A)
+        pred[:, 1] = A[:, 1]
+        pred[:, 2] = 0.9 * A[:, 2]
+        mse, r2 = _decoder_fit_stats(A, iso, pred, decoder_df=1)
+        self.assertIsNotNone(mse)
+        top = _top_genes_by_decoder_loss(mse, 2)
+        self.assertEqual(int(top[0]), 1)
+        self.assertGreater(float(r2[1]), float(r2[0]))
+        self.assertLess(float(mse[1]), float(_mse_per_gene(A, pred)[0]))
 
 
 if __name__ == "__main__":

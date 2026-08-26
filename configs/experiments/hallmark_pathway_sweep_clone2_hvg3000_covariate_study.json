@@ -1,0 +1,13 @@
+{
+  "experiment_name": "hallmark_pathway_sweep_clone2_hvg3000_covariate",
+  "base_config": "configs/calicost/HT306P1_S1H1Fc2U1Z1Bs1_loss_difference_clone2_hypoxia_genes_tumor_logcounts.json",
+  "hvg3000_config": "configs/calicost/HT306P1_S1H1Fc2U1Z1Bs1_loss_difference_clone2_gt0p7_cropy_tumor_logcounts_3000hvg_r30.json",
+  "output_root": "results/experiments/hallmark_pathway_sweep_clone2_hvg3000_covariate",
+  "gmt_path": "data/gmt/h.all.v2026.1.Hs.symbols.gmt",
+  "n_perms": 249,
+  "n_reruns": 30,
+  "alpha": 0.05,
+  "min_requested_genes": 15,
+  "covariate_from_hvg3000": true,
+  "covariate_obs_key": "hvg3000_isodepth"
+}

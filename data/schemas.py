@@ -232,6 +232,7 @@ SUPPORTED_PERMUTATION_METHODS = {
     "parallel_permutation",
     "block_permutation",
     "binning",
+    "visium_pseudobulk",
     "fourier_spectral_randomization",
     "joint_truncated_msr",
     "joint_truncated_rank_msr",
@@ -247,6 +248,7 @@ SUPPORTED_EXISTENCE_METHODS = {
     "parallel_permutation",
     "block_permutation",
     "binning",
+    "visium_pseudobulk",
     "fourier_spectral_randomization",
     "joint_truncated_msr",
     "joint_truncated_rank_msr",
@@ -894,6 +896,8 @@ class TestConfig:
     block_shape: str = "hexagon"
     bin_shape: str = "hexagon"
     bin_spot_distance_um: float = 100.0
+    visium_spot_distance_um: float = 100.0
+    visium_spot_diameter_um: float = 55.0
     coordinate_um_per_unit: Optional[float] = None
     block_jitter: bool = True
     save_permutation_null_comparison: bool = False
@@ -973,6 +977,7 @@ class TestConfig:
             "parallel_permutation",
             "block_permutation",
             "binning",
+            "visium_pseudobulk",
             "fourier_spectral_randomization",
             *MSR_METHODS,
             "cross_validation",
@@ -1006,6 +1011,20 @@ class TestConfig:
             )
         if float(self.bin_spot_distance_um) <= 0:
             raise ValueError("test.bin_spot_distance_um must be > 0")
+        if float(self.visium_spot_distance_um) <= 0:
+            raise ValueError("test.visium_spot_distance_um must be > 0")
+        if float(self.visium_spot_diameter_um) <= 0:
+            raise ValueError("test.visium_spot_diameter_um must be > 0")
+        if float(self.visium_spot_diameter_um) >= float(self.visium_spot_distance_um):
+            raise ValueError(
+                "test.visium_spot_diameter_um must be strictly less than "
+                "test.visium_spot_distance_um so neighboring spot circles cannot overlap "
+                f"(got diameter={self.visium_spot_diameter_um}, distance={self.visium_spot_distance_um})"
+            )
+        if self.method == "visium_pseudobulk" and self.coordinate_um_per_unit is None:
+            raise ValueError(
+                "test.coordinate_um_per_unit is required when test.method='visium_pseudobulk'"
+            )
         if self.save_permutation_null_comparison and self.method != "block_permutation":
             raise ValueError(
                 "test.save_permutation_null_comparison requires test.method='block_permutation'"

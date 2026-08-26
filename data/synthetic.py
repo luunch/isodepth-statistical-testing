@@ -52,6 +52,16 @@ def _spatial_shape_mask(xy: np.ndarray, shape: str, *, eps: float = 1e-9) -> np.
     raise ValueError(f"unknown spatial shape {shape!r}")
 
 
+def spatial_shape_mask(xy: np.ndarray, shape: str, *, eps: float = 1e-9) -> np.ndarray:
+    """Public re-export of :func:`_spatial_shape_mask` for tissue-mask checks outside this module.
+
+    Used by pseudobulk-style methods (e.g. ``visium_pseudobulk``) that need to test whether a
+    candidate spot footprint lies within the configured synthetic tissue shape, in the same
+    native ``[0, 1]^2``-normalized coordinate space these shapes are defined in.
+    """
+    return _spatial_shape_mask(xy, shape, eps=eps)
+
+
 def _grid_dims_from_xy_extent(s_arr: np.ndarray) -> tuple[int, int]:
     """Match plot aspect hints to ``_fit_shaped_lattice`` (grid_height, grid_width)."""
     sx = float(s_arr[:, 0].max() - s_arr[:, 0].min()) + 1e-9

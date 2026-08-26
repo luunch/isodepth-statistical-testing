@@ -21,9 +21,72 @@ DEFAULT_OBS_COORD_CANDIDATES = [
 ]
 
 
+def _as_dense_counts(X) -> np.ndarray:
+    if sp.issparse(X):
+        X = X.toarray()
+    return np.asarray(X, dtype=np.float64)
+
+
+def _seurat_hvg_mask_from_counts(counts: np.ndarray, n_top: int, *, n_bins: int = 20) -> np.ndarray:
+    """Scanpy ``flavor='seurat'`` HVG mask without importing scanpy.
+
+    Matches the usual scanpy sequence used here: ``normalize_total(1e4)`` →
+    ``log1p`` → ``highly_variable_genes(flavor='seurat')`` — mean/dispersion
+    are computed after ``expm1``, logged, binned by mean, and z-scored within
+    20 equal-width mean bins.
+    """
+    counts = _as_dense_counts(counts)
+    n_cells, n_genes = counts.shape
+    n_keep = min(int(n_top), max(n_genes - 1, 0))
+    if n_keep <= 0 or n_cells < 2:
+        return np.ones(n_genes, dtype=bool)
+
+    size = np.maximum(counts.sum(axis=1, keepdims=True), 1e-12)
+    x_lin = np.expm1(np.log1p(counts * (1e4 / size)))
+    mean = np.mean(x_lin, axis=0, dtype=np.float64)
+    mean_sq = np.mean(np.square(x_lin), axis=0, dtype=np.float64)
+    var = np.maximum(mean_sq - np.square(mean), 0.0)
+    var *= n_cells / max(n_cells - 1, 1)  # sample variance, as in scanpy
+    mean = np.maximum(mean, 1e-12)
+    dispersion = var / mean
+    log_disp = np.full(n_genes, np.nan, dtype=np.float64)
+    positive = dispersion > 0
+    log_disp[positive] = np.log(dispersion[positive])
+    mean_log = np.log1p(mean)
+
+    df = pd.DataFrame({"mean": mean_log, "disp": log_disp})
+    try:
+        df["mean_bin"] = pd.cut(df["mean"], bins=n_bins)
+    except ValueError:
+        scores = np.nan_to_num(log_disp, nan=0.0)
+        order = np.argsort(-scores, kind="mergesort")
+        mask = np.zeros(n_genes, dtype=bool)
+        mask[order[:n_keep]] = True
+        return mask
+
+    grouped = df.groupby("mean_bin", observed=False)["disp"]
+    mu = grouped.transform("mean")
+    sigma = grouped.transform("std")  # ddof=1
+    singleton = sigma.isna() & mu.notna()
+    sigma = sigma.mask(singleton, mu)  # scanpy: singleton-bin z-score → 0
+    z = (df["disp"] - mu) / sigma.replace(0.0, np.nan)
+    scores = z.fillna(0.0).to_numpy(dtype=np.float64)
+
+    order = np.argsort(-scores, kind="mergesort")
+    mask = np.zeros(n_genes, dtype=bool)
+    mask[order[:n_keep]] = True
+    return mask
+
+
 def _select_hvg_mask(adata: ad.AnnData, n_top: int) -> np.ndarray:
     """Seurat HVG mask computed on a normalize+log1p copy (safe for raw counts)."""
-    import scanpy as sc
+    try:
+        import scanpy as sc
+    except ImportError:
+        sc = None
+
+    if sc is None:
+        return _seurat_hvg_mask_from_counts(adata.X, int(n_top))
 
     tmp = ad.AnnData(adata.X)
     tmp.var_names = adata.var_names.copy()

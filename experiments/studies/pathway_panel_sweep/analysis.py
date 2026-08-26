@@ -15,7 +15,9 @@ from experiments.core.study_io import scan_result_json_paths, write_csv
 from experiments.studies.pathway_panel_sweep.lib import (
     REPO_ROOT,
     analysis_dir_for_spec,
+    apply_all_genes_covariate_baseline,
     extract_pathway_result_payload,
+    hvg3000_result_json_for_spec,
     load_manifest_entries,
     load_pathway_panel_sweep_spec,
     manifest_path_for_spec,
@@ -42,6 +44,8 @@ PER_PATHWAY_FIELDS = [
     "n_reruns",
     "runtime_sec",
     "spearman_vs_full",
+    "stat_covariate_all_genes",
+    "p_value_covariate_all_genes",
     "result_json_path",
 ]
 
@@ -154,6 +158,10 @@ def analyze_pathway_panel_sweep_results(
         reference_path = Path(reference_full_result_json).resolve()
     else:
         reference_path = _resolve_reference_result(Path(spec_path).resolve(), spec_payload)
+        if reference_path is None and (spec.hvg3000_config is not None or spec.hvg3000_result_json is not None):
+            candidate = hvg3000_result_json_for_spec(spec)
+            if candidate.exists():
+                reference_path = candidate
 
     manifest_entries = load_manifest_entries(manifest_path_for_spec(spec))
     candidate_paths: dict[str, dict[str, object] | None] = {
@@ -176,6 +184,10 @@ def analyze_pathway_panel_sweep_results(
             record["stat_true_per_gene"] = float(record["stat_true"]) / float(n_genes)
             record["q_value"] = float("nan")
             record["spearman_vs_full"] = float("nan")
+            native_stat_cov = record.pop("stat_covariate", float("nan"))
+            native_p_cov = record.pop("p_value_covariate", float("nan"))
+            record["stat_covariate_all_genes"] = float(native_stat_cov)
+            record["p_value_covariate_all_genes"] = float(native_p_cov)
             collected_rows.append(record)
 
     # BH q-values across pathways; significance uses q < alpha.
@@ -236,6 +248,32 @@ def analyze_pathway_panel_sweep_results(
                 row["_oriented_abs_rho"] = float(abs(raw_rho)) if np.isfinite(raw_rho) else float("nan")
                 labels.append(str(row["pathway_name"]))
                 oriented.append(oriented_iso)
+
+                # Prefer the in-pipeline test.covariate stats when the sweep was run
+                # with the HVG3000 isodepth attached. Fall back to the post-hoc OLS
+                # refit only for older cached runs that never set test.covariate.
+                if not np.isfinite(float(row.get("p_value_covariate_all_genes", float("nan")))):
+                    try:
+                        cov_summary = apply_all_genes_covariate_baseline(
+                            Path(str(row["result_json_path"])),
+                            full_iso,
+                            full_S,
+                        )
+                    except Exception as exc:
+                        cov_summary = None
+                        warning_rows.append(
+                            {
+                                "warning_type": "all_genes_covariate_baseline_failed",
+                                "result_json_path": str(row["result_json_path"]),
+                                "pathway_name": str(row["pathway_name"]),
+                                "message": str(exc),
+                            }
+                        )
+                    if cov_summary is not None and cov_summary["per_type"]:
+                        stat_covs = [d["stat_covariate"] for d in cov_summary["per_type"].values()]
+                        p_covs = [d["p_value_covariate"] for d in cov_summary["per_type"].values()]
+                        row["stat_covariate_all_genes"] = float(np.mean(stat_covs))
+                        row["p_value_covariate_all_genes"] = float(np.mean(p_covs))
 
             # Matrix/plot: FULL reference + significant pathways only.
             significant_names = {

@@ -62,14 +62,18 @@ def _format_variant_label(
     truncate_um: float | None,
     neighbor_um: float | None,
     spot_distance_um: float | None = None,
+    method_name: str = "",
 ) -> str:
     if spot_distance_um is not None:
         return f"spot{spot_distance_um:g}"
-    if truncate_um is None:
-        return "MSR"
-    if neighbor_um is None:
+    if truncate_um is not None and neighbor_um is not None:
+        return f"T{truncate_um:g}|N{neighbor_um:g}"
+    if truncate_um is not None:
         return f"T{truncate_um:g}"
-    return f"T{truncate_um:g}|N{neighbor_um:g}"
+    method = str(method_name or "").strip()
+    if method in {"joint_truncated_msr", "joint_truncated_rank_msr", ""}:
+        return "MSR"
+    return method or "MSR"
 
 
 def _parse_dataset_key_from_run_name(run_name: str) -> tuple[float, float, int]:
@@ -130,6 +134,7 @@ def _extract_rows_from_runs(
             truncate_um=truncate_um,
             neighbor_um=neighbor_um,
             spot_distance_um=spot_distance_um,
+            method_name=test_method,
         )
         p_value = float(result["p_value"])
         rows.append(
@@ -320,11 +325,11 @@ def analyze_kernel_noise_msr_study(spec_path: str | Path, *, plots_only: bool = 
     _write_csv(per_run_csv, PER_RUN_FIELDS, rows)
     _write_csv(summary_csv, SUMMARY_FIELDS, summary_rows)
 
-    plot_path = analysis_dir / (
-        "kernel_noise_binning_study_pvalues.png"
-        if spec.spot_distances_um
-        else "kernel_noise_msr_study_pvalues.png"
-    )
+    if spec.spot_distances_um:
+        plot_name = "kernel_noise_binning_study_pvalues.png"
+    else:
+        plot_name = "kernel_noise_msr_study_pvalues.png"
+    plot_path = analysis_dir / plot_name
     save_kernel_noise_msr_pvalue_plot(rows, plot_path, spec=spec, alpha=float(spec.alpha))
 
     payload = {

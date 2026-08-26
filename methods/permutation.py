@@ -38,6 +38,10 @@ from methods.block_permutation import (
     resolve_um_per_unit,
 )
 from methods.binning import bin_dataset_to_pseudospots, parallel_config_for_binned_run
+from methods.visium_pseudobulk import (
+    build_visium_pseudobulk_dataset,
+    parallel_config_for_visium_pseudobulk_run,
+)
 from methods.moran import maybe_compute_moran_artifacts
 from methods.msr import (
     build_joint_truncated_msr_surrogates,
@@ -2939,6 +2943,33 @@ def run_binning_method(
     return result.validate()
 
 
+def run_visium_pseudobulk_method(
+    dataset: DatasetBundle, config: TestConfig, device: torch.device | None = None
+) -> TestResult:
+    """Aggregate cells into Visium-style pseudospots, then run the standard permutation test."""
+    binned_dataset, pseudobulk_artifacts = build_visium_pseudobulk_dataset(dataset, config)
+    if config.verbose:
+        summary = pseudobulk_artifacts["visium_pseudobulk_summary"]
+        print(
+            "Visium pseudobulk: "
+            f"spot_distance={summary['spot_distance_um']:.1f} µm, "
+            f"spot_diameter={summary['spot_diameter_um']:.1f} µm, "
+            f"original cells={summary['original_n_cells']}, "
+            f"spots in tissue={summary['n_spots_in_tissue']}, "
+            f"pseudospots={summary['n_pseudospots']}, "
+            f"cells/pseudospot median={summary['median_cells_per_pseudospot']:.1f}, "
+            f"cells dropped in gaps={summary['n_cells_dropped_in_gaps']} "
+            f"({100.0 * summary['fraction_cells_dropped_in_gaps']:.1f}%)",
+            flush=True,
+        )
+    inner_config = parallel_config_for_visium_pseudobulk_run(config)
+    result = run_parallel_permutation_method(binned_dataset, inner_config, device=device)
+    result.method_name = "visium_pseudobulk"
+    result.config = {"test": config.__dict__.copy()}
+    result.artifacts.update(pseudobulk_artifacts)
+    return result.validate()
+
+
 def _run_permutation_method_on_device(
     dataset: DatasetBundle, config: TestConfig, device: torch.device
 ) -> TestResult:
@@ -2956,6 +2987,8 @@ def _run_permutation_method_on_device(
         return run_block_permutation_method(dataset, config, device=device)
     if config.method == "binning":
         return run_binning_method(dataset, config, device=device)
+    if config.method == "visium_pseudobulk":
+        return run_visium_pseudobulk_method(dataset, config, device=device)
     if config.method == "fourier_spectral_randomization":
         return run_fourier_spectral_randomization_method(dataset, config, device=device)
     if config.method == "joint_truncated_msr":
@@ -2982,6 +3015,7 @@ def run_permutation_method(dataset: DatasetBundle, config: TestConfig) -> TestRe
             "parallel_permutation",
             "block_permutation",
             "binning",
+            "visium_pseudobulk",
             "fourier_spectral_randomization",
             "joint_truncated_msr",
             "joint_truncated_rank_msr",

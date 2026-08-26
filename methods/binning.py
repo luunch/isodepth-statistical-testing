@@ -282,6 +282,10 @@ def bin_dataset_to_pseudospots(
         "binned_dataset": binned,
         "binning_summary": dict(meta["binning"]),
         "binning_cell_counts": bin_counts,
+        "binning_overlay_S_um": np.asarray(S_um, dtype=np.float32),
+        "binning_overlay_block_ids": np.asarray(block_ids, dtype=np.int64),
+        "binning_overlay_radius_um": float(radius_um),
+        "binning_overlay_shape": shape,
     }
     return binned, artifacts
 

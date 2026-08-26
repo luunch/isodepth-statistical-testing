@@ -762,6 +762,76 @@ def save_dataset_triptych(
     return out_path
 
 
+def save_pre_aggregation_dataset_plot(
+    dataset: DatasetBundle,
+    out_path: str | Path,
+    *,
+    run_name: str = "",
+    aggregation_label: str = "aggregation",
+) -> Path | None:
+    """Cell-resolution spatial view before pseudospot / Visium aggregation.
+
+    Left: mean |expression| at the original cells. Right (when present): the
+    stored Gaussian-blur noise draw, which is stripped from the aggregated
+    dataset and therefore missing from the post-binning kernel diagnostic.
+    """
+    S = np.asarray(dataset.S, dtype=np.float32)
+    if S.ndim != 2 or S.shape[1] != 2 or S.shape[0] == 0:
+        return None
+
+    noise_raw = dataset.meta.get("kernel_noise_sample")
+    noise = None if noise_raw is None else np.asarray(noise_raw, dtype=np.float32).reshape(-1)
+    has_noise = noise is not None and noise.shape[0] == S.shape[0]
+    n_panels = 2 if has_noise else 1
+    fig, axes = plt.subplots(1, n_panels, figsize=(6.2 * n_panels, 5.4))
+    if n_panels == 1:
+        axes = [axes]
+
+    _plot_spatial_dataset_heatmap(
+        axes[0],
+        S,
+        _cell_expression_signal(dataset.A),
+        "Mean |expression|",
+    )
+    if has_noise:
+        vmax = float(np.abs(noise).max()) or 1.0
+        scatter = axes[1].scatter(
+            S[:, 0],
+            S[:, 1],
+            c=noise,
+            cmap="RdBu_r",
+            s=_point_size(S),
+            vmin=-vmax,
+            vmax=vmax,
+            linewidths=0,
+            alpha=0.9,
+        )
+        plt.colorbar(scatter, ax=axes[1], fraction=0.046, pad=0.04)
+        bandwidth = dataset.meta.get("smooth_bandwidth_um")
+        if bandwidth is None:
+            bandwidth = (dataset.meta.get("kernel") or {}).get("distance")
+        bw_label = f", σ={float(bandwidth):g} µm" if bandwidth is not None else ""
+        axes[1].set_title(f"Gaussian-blurred noise (1 gene{bw_label})")
+        axes[1].set_xlabel("x")
+        axes[1].set_ylabel("y")
+        axes[1].set_aspect("equal")
+        xlim, ylim = _spatial_axis_limits(S)
+        axes[1].set_xlim(float(xlim[0]), float(xlim[1]))
+        axes[1].set_ylim(float(ylim[0]), float(ylim[1]))
+
+    n_cells = int(S.shape[0])
+    heading = f"Original cells before {aggregation_label} (n={n_cells})"
+    if run_name:
+        heading = f"{heading} — {run_name}"
+    fig.suptitle(heading, fontsize=11)
+    fig.tight_layout()
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
 def save_celltype_dataset_plot(
     dataset: DatasetBundle,
     out_path: str | Path,
@@ -1888,6 +1958,7 @@ def save_metric_distribution_plot(result: TestResult, out_path: str | Path) -> P
     stat_cov = result.artifacts.get("stat_covariate")
     p_cov = result.artifacts.get("p_value_covariate")
     has_cov_dual = stat_cov is not None and p_cov is not None
+    covariate_label = str(result.artifacts.get("covariate_label", "Covariate (midline) decoder"))
 
     fig, ax = plt.subplots(1, 1, figsize=(6.4, 5.2))
     ax.hist(
@@ -1910,7 +1981,7 @@ def save_metric_distribution_plot(result: TestResult, out_path: str | Path) -> P
             color="teal",
             linestyle="--",
             linewidth=1.5,
-            label=f"Covariate (midline) decoder: {float(stat_cov):.4g}",
+            label=f"{covariate_label}: {float(stat_cov):.4g}",
         )
         ax.set_title(
             "Null distribution\n"
@@ -2052,6 +2123,7 @@ def save_combined_celltype_metric_distribution(
     out_path: str | Path,
     *,
     metric: str = "nll_gaussian_mse",
+    covariate_label: str = "Covariate",
 ) -> Path:
     """Grid of null-distribution histograms, one panel per cell type."""
     n = len(cell_type_names)
@@ -2080,7 +2152,7 @@ def save_combined_celltype_metric_distribution(
             ax.axvline(stat_true, color="crimson", linestyle="--", linewidth=1.5,
                        label=f"Isodepth: {stat_true:.4g}")
             ax.axvline(float(stat_cov), color="teal", linestyle="--", linewidth=1.5,
-                       label=f"Covariate: {float(stat_cov):.4g}")
+                       label=f"{covariate_label}: {float(stat_cov):.4g}")
             ax.set_title(
                 f"{type_name} (n={n_cells})\n"
                 f"p = {p_value:.4g}  |  p (cov) = {float(p_cov):.4g}",
@@ -3127,6 +3199,51 @@ def _rss_per_gene(A: np.ndarray, fitted: np.ndarray) -> np.ndarray:
     return np.sum((A - fitted) ** 2, axis=0)
 
 
+def _mse_per_gene(A: np.ndarray, fitted: np.ndarray) -> np.ndarray:
+    """Per-gene mean squared reconstruction error of a decoder fit."""
+    n = max(int(np.asarray(A).shape[0]), 1)
+    return _rss_per_gene(A, fitted) / float(n)
+
+
+def _r2_per_gene(A: np.ndarray, fitted: np.ndarray) -> np.ndarray:
+    """Per-gene coefficient of determination of a decoder fit."""
+    A = np.asarray(A, dtype=np.float64)
+    sst = np.sum((A - A.mean(axis=0)) ** 2, axis=0)
+    rss = _rss_per_gene(A, fitted)
+    r2 = np.zeros(A.shape[1], dtype=np.float64)
+    np.divide(sst - rss, sst, out=r2, where=sst > 0)
+    return r2
+
+
+def _top_genes_by_decoder_loss(losses: np.ndarray, n_top: int) -> np.ndarray:
+    """Indices of the ``n_top`` genes with lowest decoder reconstruction loss."""
+    losses = np.asarray(losses, dtype=np.float64)
+    safe = np.where(np.isfinite(losses), losses, np.inf)
+    return np.argsort(safe)[: min(int(n_top), int(safe.size))]
+
+
+def _decoder_loss_annotation(mse: float | None, r2: float | None) -> str:
+    bits: list[str] = []
+    if r2 is not None and np.isfinite(r2):
+        bits.append(f"decoder R² = {float(r2):.3f}")
+    if mse is not None and np.isfinite(mse):
+        bits.append(f"MSE = {float(mse):.3f}")
+    return "  ".join(bits)
+
+
+def _decoder_fit_stats(
+    A: np.ndarray,
+    coord: np.ndarray,
+    decoder_preds: np.ndarray | None,
+    decoder_df: int | None,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Return per-gene (MSE, R²) for the encoder-decoder fit, or (None, None)."""
+    fitted = _decoder_fitted_values(A, coord, decoder_preds, decoder_df)
+    if fitted is None:
+        return None, None
+    return _mse_per_gene(A, fitted), _r2_per_gene(A, fitted)
+
+
 def _residual_ratio_hist_bins(values: np.ndarray, n_bins: int = 40) -> np.ndarray:
     """Equal-width histogram bins symmetric about 1.0."""
     vals = np.asarray(values, dtype=np.float64).reshape(-1)
@@ -3451,6 +3568,8 @@ def _plot_gene_binned_vs_coord(
     decoder_preds: np.ndarray | None = None,
     show_background_cells: bool = False,
     expression_y_label: str = "Expression",
+    decoder_mse: float | None = None,
+    decoder_r2: float | None = None,
 ) -> None:
     """Per-bin mean dots + trend curve, with optional per-cell background scatter.
 
@@ -3508,7 +3627,10 @@ def _plot_gene_binned_vs_coord(
         )
 
     title = gene_name
-    if rho is not None:
+    loss_ann = _decoder_loss_annotation(decoder_mse, decoder_r2)
+    if loss_ann:
+        title += f"\n{loss_ann}"
+    elif rho is not None:
         title += f"\n|Spearman r| = {abs(float(rho)):.3f}"
     ax.set_title(title, fontsize=9)
     ax.set_xlabel(xlabel, fontsize=8)
@@ -3535,15 +3657,18 @@ def save_gene_expression_vs_isodepth_plot(
     qvalues: np.ndarray | None = None,
     spatial_S: np.ndarray | None = None,
 ) -> Path:
-    """Top n_top_genes genes (by |Spearman ρ| with isodepth) as binned mean
-    expression vs isodepth.
+    """Top ``n_top_genes`` genes as binned mean expression vs isodepth.
+
+    Genes are ranked by **encoder-decoder reconstruction loss** (per-gene MSE of
+    ``decoder_preds``, or of a polynomial stand-in when ``decoder_df`` is set
+    and predictions are absent).  The companion spatial scatter
+    ``<stem>_svg_spatial_expression.png`` uses the **same** top genes.
+    Spearman |ρ| is used only when no decoder fit is available.
 
     ``decoder_preds`` (n_cells, G): when provided the fit curve is the decoder
-    prediction vs isodepth (no rolling-mean smoothing).  ``decoder_df`` triggers an
-    F-test across all G genes (parametric decoders only); significant genes
-    (BH q < q_threshold) are saved to
-    ``<stem>_isodepth_sig_genes.csv`` beside the PNG, and a companion spatial
-    expression scatter is saved to ``<stem>_svg_spatial_expression.png``.
+    prediction vs isodepth (no rolling-mean smoothing).  ``decoder_df`` still
+    triggers an F-test CSV of significant genes (BH q < q_threshold) at
+    ``<stem>_isodepth_sig_genes.csv``; that list is **not** used to pick panels.
 
     ``spatial_S``: optional (N, 2) spatial coordinates used for the companion
     scatter.  Defaults to ``dataset.S`` when not provided.
@@ -3559,9 +3684,14 @@ def save_gene_expression_vs_isodepth_plot(
     )
 
     rhos = _gene_spearman_rhos(A, coord)
+    mse, r2 = _decoder_fit_stats(A, coord, decoder_preds, decoder_df)
     if gene_indices is None:
-        top_idx = _top_genes_by_abs_rho(rhos, n_top_genes)
-        title = f"Top {{n_top}} genes by |Spearman r| with {coord_label}"
+        if mse is not None:
+            top_idx = _top_genes_by_decoder_loss(mse, n_top_genes)
+            title = "Top {n_top} genes by encoder-decoder reconstruction loss"
+        else:
+            top_idx = _top_genes_by_abs_rho(rhos, n_top_genes)
+            title = f"Top {{n_top}} genes by |Spearman r| with {coord_label}"
     else:
         top_idx = np.asarray(gene_indices, dtype=np.intp)[: int(n_top_genes)]
         title = figure_title or f"Selected genes vs {coord_label}"
@@ -3579,6 +3709,12 @@ def save_gene_expression_vs_isodepth_plot(
             if decoder_preds is not None else None
         )
         show_rho = None if (pv_arr is not None and qv_arr is not None) else float(rhos[gene_idx])
+        show_mse = None if mse is None else float(mse[gene_idx])
+        show_r2 = None if r2 is None else float(r2[gene_idx])
+        if pv_arr is not None and qv_arr is not None:
+            show_mse = None
+            show_r2 = None
+            show_rho = None
         _plot_gene_binned_vs_coord(
             axes[0, col], A[:, gene_idx], coord,
             gene_names[gene_idx], coord_label,
@@ -3586,6 +3722,8 @@ def save_gene_expression_vs_isodepth_plot(
             rho=show_rho, color=colors[col],
             decoder_preds=dp,
             expression_y_label=expression_y_label,
+            decoder_mse=show_mse,
+            decoder_r2=show_r2,
         )
         if pv_arr is not None and qv_arr is not None:
             axes[0, col].set_title(
@@ -3611,7 +3749,9 @@ def save_gene_expression_vs_isodepth_plot(
     )
     spatial_out = out_path.parent / (out_path.stem + "_svg_spatial_expression.png")
 
-    # --- F-test significance CSV + companion spatial expression scatter ---
+    # --- F-test significance CSV (parametric decoders) + companion spatial scatter ---
+    # Spatial panels always use the same top_idx as the binned plot (decoder loss,
+    # or an explicit gene_indices override).  F-test hits stay in the CSV only.
     if decoder_df is not None:
         svg_result = compute_isodepth_sig_genes(
             A, gene_names, decoder_preds, decoder_df,
@@ -3623,36 +3763,28 @@ def save_gene_expression_vs_isodepth_plot(
             svg_result["pvalues"], svg_result["qvalues"],
             q_threshold=q_threshold,
         )
-        if svg_result["sig_indices"].size > 0:
-            try:
-                save_svg_spatial_expression_plots(
-                    S_plot, A, gene_names,
-                    svg_result["sig_indices"],
-                    spatial_out,
-                    pvalues=svg_result["pvalues"],
-                    qvalues=svg_result["qvalues"],
-                    expression_meta=dataset.meta,
-                    suptitle=f"Top SVG Spatial Expression — {coord_label}",
-                )
-            except Exception:
-                pass
     else:
         stale_csv = out_path.parent / (out_path.stem + "_isodepth_sig_genes.csv")
         if stale_csv.exists():
             stale_csv.unlink()
-        # nn decoder: no F-test, use the same top-|rho| genes shown in the binned plot
-        if top_idx.size > 0:
-            try:
-                save_svg_spatial_expression_plots(
-                    S_plot, A, gene_names,
-                    top_idx,
-                    spatial_out,
-                    rhos=rhos,
-                    expression_meta=dataset.meta,
-                    suptitle=f"Top Gene Spatial Expression — {coord_label}",
-                )
-            except Exception:
-                pass
+    if top_idx.size > 0:
+        try:
+            save_svg_spatial_expression_plots(
+                S_plot, A, gene_names,
+                top_idx,
+                spatial_out,
+                rhos=None if mse is not None else rhos,
+                losses=mse,
+                r2s=r2,
+                expression_meta=dataset.meta,
+                suptitle=(
+                    f"Top genes by encoder-decoder loss — {coord_label}"
+                    if mse is not None
+                    else f"Top Gene Spatial Expression — {coord_label}"
+                ),
+            )
+        except Exception:
+            pass
 
     return out_path
 
@@ -3676,10 +3808,15 @@ def save_gene_expression_vs_coordinates_comparison(
 ) -> Path:
     """4-row × n_top_genes comparison grid.
 
-    Row 0: top isodepth genes vs isodepth
-    Row 1: top isodepth genes vs covariate  (ρ shown vs covariate)
-    Row 2: top covariate genes vs covariate
-    Row 3: top covariate genes vs isodepth  (ρ shown vs isodepth)
+    Row 0: top isodepth-decoder-loss genes vs isodepth
+    Row 1: those same genes vs covariate
+    Row 2: top covariate-decoder-loss genes vs covariate
+    Row 3: those same genes vs isodepth
+
+    Gene ranking uses per-gene MSE of the corresponding decoder (``pred_isodepth``
+    / ``pred_covariate``, or a polynomial stand-in).  The companion spatial
+    grid uses the same gene sets.  Spearman |ρ| is only used when no decoder
+    fit is available.
 
     When ``pred_isodepth`` / ``pred_covariate`` are provided (model decoder
     predictions, shape ``(n_cells, G)``), the fit curve shows the actual decoder
@@ -3711,32 +3848,44 @@ def save_gene_expression_vs_coordinates_comparison(
 
     rhos_iso = _gene_spearman_rhos(A, iso)
     rhos_cov = _gene_spearman_rhos(A, cov)
-    top_iso = _top_genes_by_abs_rho(rhos_iso, n_top_genes)
-    top_cov = _top_genes_by_abs_rho(rhos_cov, n_top_genes)
+    mse_iso, r2_iso = _decoder_fit_stats(A, iso, pred_isodepth, decoder_df)
+    mse_cov, r2_cov = _decoder_fit_stats(A, cov, pred_covariate, decoder_df)
+    if mse_iso is not None:
+        top_iso = _top_genes_by_decoder_loss(mse_iso, n_top_genes)
+        iso_rank_label = "decoder loss"
+    else:
+        top_iso = _top_genes_by_abs_rho(rhos_iso, n_top_genes)
+        iso_rank_label = "|Spearman r|"
+    if mse_cov is not None:
+        top_cov = _top_genes_by_decoder_loss(mse_cov, n_top_genes)
+        cov_rank_label = "decoder loss"
+    else:
+        top_cov = _top_genes_by_abs_rho(rhos_cov, n_top_genes)
+        cov_rank_label = "|Spearman r|"
     n_top = max(len(top_iso), len(top_cov))
 
     iso_colors = plt.cm.Blues(np.linspace(0.45, 0.85, max(len(top_iso), 1)))
     cov_colors = plt.cm.Greens(np.linspace(0.45, 0.85, max(len(top_cov), 1)))
 
-    # (gene_indices, rhos_to_display, coordinate, x_label, colors, pred_array)
+    # (gene_indices, rhos_to_display, coordinate, x_label, colors, pred_array, mse, r2)
     # pred_array shape: (n_cells, G) or None
     row_specs = [
-        (top_iso, rhos_iso, iso, isodepth_label, iso_colors, pred_isodepth),
-        (top_iso, rhos_cov, cov, covariate_label, iso_colors, pred_covariate),
-        (top_cov, rhos_cov, cov, covariate_label, cov_colors, pred_covariate),
-        (top_cov, rhos_iso, iso, isodepth_label, cov_colors, pred_isodepth),
+        (top_iso, rhos_iso, iso, isodepth_label, iso_colors, pred_isodepth, mse_iso, r2_iso),
+        (top_iso, rhos_cov, cov, covariate_label, iso_colors, pred_covariate, mse_iso, r2_iso),
+        (top_cov, rhos_cov, cov, covariate_label, cov_colors, pred_covariate, mse_cov, r2_cov),
+        (top_cov, rhos_iso, iso, isodepth_label, cov_colors, pred_isodepth, mse_cov, r2_cov),
     ]
     row_titles = [
-        f"Top {len(top_iso)} isodepth genes — vs {isodepth_label}",
-        f"Top {len(top_iso)} isodepth genes — vs {covariate_label}",
-        f"Top {len(top_cov)} covariate genes — vs {covariate_label}",
-        f"Top {len(top_cov)} covariate genes — vs {isodepth_label}",
+        f"Top {len(top_iso)} isodepth genes ({iso_rank_label}) — vs {isodepth_label}",
+        f"Top {len(top_iso)} isodepth genes ({iso_rank_label}) — vs {covariate_label}",
+        f"Top {len(top_cov)} covariate genes ({cov_rank_label}) — vs {covariate_label}",
+        f"Top {len(top_cov)} covariate genes ({cov_rank_label}) — vs {isodepth_label}",
     ]
 
     fig, axes = plt.subplots(4, n_top, figsize=(4.0 * n_top, 3.6 * 4), squeeze=False)
     expression_y_label = _expression_y_axis_label(dataset.meta)
 
-    for row_idx, (gene_indices, rhos_for_row, coord, xlabel, colors, preds) in enumerate(row_specs):
+    for row_idx, (gene_indices, rhos_for_row, coord, xlabel, colors, preds, mse_arr, r2_arr) in enumerate(row_specs):
         for col, gene_idx in enumerate(gene_indices):
             dp = (
                 np.asarray(preds, dtype=np.float64)[:, gene_idx]
@@ -3746,9 +3895,12 @@ def save_gene_expression_vs_coordinates_comparison(
                 axes[row_idx, col], A[:, gene_idx], coord,
                 gene_names[gene_idx], xlabel,
                 n_bins=n_bins, min_bin_cells=min_bin_cells,
-                rho=float(rhos_for_row[gene_idx]), color=colors[col],
+                rho=None if mse_arr is not None else float(rhos_for_row[gene_idx]),
+                color=colors[col],
                 decoder_preds=dp,
                 expression_y_label=expression_y_label,
+                decoder_mse=None if mse_arr is None else float(mse_arr[gene_idx]),
+                decoder_r2=None if r2_arr is None else float(r2_arr[gene_idx]),
             )
         for col in range(len(gene_indices), n_top):
             axes[row_idx, col].set_visible(False)
@@ -3793,7 +3945,21 @@ def save_gene_expression_vs_coordinates_comparison(
         else np.asarray(dataset.S, dtype=np.float32)
     )
 
-    # --- F-test significance CSVs (parametric decoders only) ---
+    # Spatial panels use the same decoder-loss gene sets as the binned plot.
+    iso_spatial_label = (
+        f"Top {isodepth_label} genes  (decoder loss)"
+        if mse_iso is not None
+        else f"Top {isodepth_label} genes  (by |Spearman r|)"
+    )
+    cov_spatial_label = (
+        f"Top {covariate_label} genes  (decoder loss)"
+        if mse_cov is not None
+        else f"Top {covariate_label} genes  (by |Spearman r|)"
+    )
+    spatial_row_specs = [
+        (top_iso, mse_iso, r2_iso, None if mse_iso is not None else rhos_iso, iso_spatial_label),
+        (top_cov, mse_cov, r2_cov, None if mse_cov is not None else rhos_cov, cov_spatial_label),
+    ]
     if decoder_df is not None:
         iso_svg = compute_isodepth_sig_genes(
             A, gene_names, pred_isodepth, decoder_df, coord=iso, alpha=q_threshold,
@@ -3809,19 +3975,6 @@ def save_gene_expression_vs_coordinates_comparison(
             Path(f"{stem}_covariate_sig_genes.csv"), gene_names,
             cov_svg["pvalues"], cov_svg["qvalues"], q_threshold=q_threshold,
         )
-        # rows for the combined spatial plot: (gene_indices, pvalues, qvalues, rhos, label)
-        spatial_row_specs = [
-            (iso_svg["sig_indices"], iso_svg["pvalues"], iso_svg["qvalues"], None,
-             f"Top {isodepth_label} SVGs  (q\u2009<\u2009{q_threshold})"),
-            (cov_svg["sig_indices"], cov_svg["pvalues"], cov_svg["qvalues"], None,
-             f"Top {covariate_label} SVGs  (q\u2009<\u2009{q_threshold})"),
-        ]
-    else:
-        # nn decoder: top-|rho| genes already computed for the binned plot
-        spatial_row_specs = [
-            (top_iso, None, None, rhos_iso, f"Top {isodepth_label} genes  (by |Spearman r|)"),
-            (top_cov, None, None, rhos_cov, f"Top {covariate_label} genes  (by |Spearman r|)"),
-        ]
 
     # --- Combined 2 × n_top spatial expression grid ---
     # Mirrors the layout of the 4-row comparison binned-plot: rows = gene sets,
@@ -3840,17 +3993,12 @@ def save_gene_expression_vs_coordinates_comparison(
             squeeze=False,
         )
 
-        for row_idx, (g_indices, pvals, qvals, rho_arr, row_label) in enumerate(spatial_row_specs):
+        for row_idx, (g_indices, mse_arr, r2_arr, rho_arr, row_label) in enumerate(spatial_row_specs):
             g_indices = np.asarray(g_indices, dtype=np.intp)
-            pv_arr = np.asarray(pvals, dtype=np.float64) if pvals is not None else None
-            qv_arr = np.asarray(qvals, dtype=np.float64) if qvals is not None else None
+            ms_arr = np.asarray(mse_arr, dtype=np.float64) if mse_arr is not None else None
+            r2_row = np.asarray(r2_arr, dtype=np.float64) if r2_arr is not None else None
             rh_arr = np.asarray(rho_arr, dtype=np.float64) if rho_arr is not None else None
-
-            if pv_arr is not None and g_indices.size > 0:
-                order = np.argsort(pv_arr[g_indices])
-                top = g_indices[order[:n_cols]]
-            else:
-                top = g_indices[:n_cols]
+            top = g_indices[:n_cols]
 
             for col, gene_idx in enumerate(top):
                 ax = axes[row_idx, col]
@@ -3864,8 +4012,9 @@ def save_gene_expression_vs_coordinates_comparison(
                 ax.set_xlabel("x", fontsize=7)
                 ax.set_ylabel("y", fontsize=7)
                 gname = gene_names[int(gene_idx)] if int(gene_idx) < len(gene_names) else f"gene_{gene_idx}"
-                if pv_arr is not None and qv_arr is not None:
-                    ann = f"p={pv_arr[int(gene_idx)]:.2e}  q={qv_arr[int(gene_idx)]:.2e}"
+                if ms_arr is not None:
+                    r2_val = None if r2_row is None else float(r2_row[int(gene_idx)])
+                    ann = _decoder_loss_annotation(float(ms_arr[int(gene_idx)]), r2_val)
                 elif rh_arr is not None:
                     ann = f"|Spearman r| = {abs(float(rh_arr[int(gene_idx)])):.3f}"
                 else:
@@ -3922,6 +4071,8 @@ def save_svg_spatial_expression_plots(
     pvalues: np.ndarray | None = None,
     qvalues: np.ndarray | None = None,
     rhos: np.ndarray | None = None,
+    losses: np.ndarray | None = None,
+    r2s: np.ndarray | None = None,
     expression_meta: dict | None = None,
     n_top: int = 5,
     suptitle: str = "",
@@ -3948,9 +4099,11 @@ def save_svg_spatial_expression_plots(
     gene_names   : length-G list of gene name strings.
     gene_indices : gene indices (into G columns of A) to consider.
     out_path     : destination PNG path.
-    pvalues      : (G,) raw F-test p-values — used for ranking and annotation.
+    pvalues      : (G,) raw F-test p-values — ranking/annotation when no losses.
     qvalues      : (G,) BH q-values — used for annotation only.
-    rhos         : (G,) |Spearman rho| values — used when pvalues are absent.
+    rhos         : (G,) |Spearman rho| values — used when losses/pvalues absent.
+    losses       : (G,) per-gene decoder MSE — preferred ranking/annotation.
+    r2s          : (G,) per-gene decoder R² — annotation when losses are set.
     n_top        : maximum panels to display (default 5).
     suptitle     : optional figure super-title.
     """
@@ -3966,9 +4119,14 @@ def save_svg_spatial_expression_plots(
     pv_arr = np.asarray(pvalues, dtype=np.float64) if pvalues is not None else None
     qv_arr = np.asarray(qvalues, dtype=np.float64) if qvalues is not None else None
     rho_arr = np.asarray(rhos, dtype=np.float64) if rhos is not None else None
+    loss_arr = np.asarray(losses, dtype=np.float64) if losses is not None else None
+    r2_arr = np.asarray(r2s, dtype=np.float64) if r2s is not None else None
 
-    # Ranking: p-value order for parametric, caller-supplied order for nn
-    if pv_arr is not None:
+    # Ranking: decoder loss, else F-test p-value, else caller order
+    if loss_arr is not None:
+        order = np.argsort(loss_arr[gene_indices])
+        top_indices = gene_indices[order[: int(n_top)]]
+    elif pv_arr is not None:
         order = np.argsort(pv_arr[gene_indices])
         top_indices = gene_indices[order[: int(n_top)]]
     else:
@@ -3996,7 +4154,10 @@ def save_svg_spatial_expression_plots(
         ax.set_xlabel("x", fontsize=8)
         ax.set_ylabel("y", fontsize=8)
         gname = gene_names[int(gene_idx)] if int(gene_idx) < len(gene_names) else f"gene_{gene_idx}"
-        if pv_arr is not None and qv_arr is not None:
+        if loss_arr is not None:
+            r2_val = None if r2_arr is None else float(r2_arr[int(gene_idx)])
+            annotation = _decoder_loss_annotation(float(loss_arr[int(gene_idx)]), r2_val)
+        elif pv_arr is not None and qv_arr is not None:
             annotation = f"p={pv_arr[int(gene_idx)]:.2e}  q={qv_arr[int(gene_idx)]:.2e}"
         elif rho_arr is not None:
             annotation = f"|Spearman r| = {abs(float(rho_arr[int(gene_idx)])):.3f}"
@@ -4083,6 +4244,7 @@ def save_block_permutation_overlay(
     run_name: str = "",
     radius_units: float | None = None,
     block_shape: str = "hexagon",
+    figure_title: str | None = None,
 ) -> Path | None:
     """Two-panel diagnostic: true layout with block mesh, then a sample centroid permutation.
 
@@ -4209,16 +4371,160 @@ def save_block_permutation_overlay(
                     arrowprops=dict(arrowstyle="->", color="black", lw=0.6, alpha=0.45),
                 )
 
-    title_parts = ["Block permutation overlay"]
-    if run_name:
-        title_parts = [f"Block permutation overlay — {run_name}"]
-    if radius_units is not None:
-        title_parts.append(f"radius = {radius_units:.1f} coord units")
-    title_parts.append(f"shape = {block_shape}")
-    fig.suptitle("  ".join(title_parts), fontsize=11)
+    if figure_title:
+        fig.suptitle(figure_title, fontsize=11)
+    else:
+        title_parts = ["Block permutation overlay"]
+        if run_name:
+            title_parts = [f"Block permutation overlay — {run_name}"]
+        if radius_units is not None:
+            title_parts.append(f"radius = {radius_units:.1f} coord units")
+        title_parts.append(f"shape = {block_shape}")
+        fig.suptitle("  ".join(title_parts), fontsize=11)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def save_visium_pseudobulk_overlay(
+    S_cells_um: np.ndarray,
+    assigned_mask: np.ndarray,
+    centers_in_tissue_um: np.ndarray,
+    occupied_ids: np.ndarray,
+    *,
+    hex_radius_um: float,
+    spot_radius_um: float,
+    out_path: str | Path,
+    run_name: str = "",
+    spot_distance_um: float | None = None,
+    spot_diameter_um: float | None = None,
+) -> Path | None:
+    """Original cells with Visium hex lattice and circular capture footprints.
+
+    Grey points are cells that fall in the inter-spot gaps. Coloured points are
+    aggregated into a spot. Solid hexes + circles are occupied captures; dashed
+    hexes are in-tissue spots that received no cells.
+    """
+    from matplotlib.patches import Circle
+
+    from methods.block_permutation import hex_vertex_offsets_pointy_top
+
+    out_path = Path(out_path)
+    S = np.asarray(S_cells_um, dtype=np.float64)
+    assigned = np.asarray(assigned_mask, dtype=bool)
+    centers = np.asarray(centers_in_tissue_um, dtype=np.float64)
+    occupied = np.asarray(occupied_ids, dtype=np.int64)
+    if S.ndim != 2 or S.shape[1] != 2 or S.shape[0] == 0:
+        return None
+    if centers.ndim != 2 or centers.shape[0] == 0:
+        return None
+
+    occupied_mask = np.zeros(centers.shape[0], dtype=bool)
+    if occupied.size:
+        occupied_mask[occupied] = True
+
+    offsets = hex_vertex_offsets_pointy_top(float(hex_radius_um))
+    occupied_polys = [centers[i] + offsets for i in np.flatnonzero(occupied_mask)]
+    empty_polys = [centers[i] + offsets for i in np.flatnonzero(~occupied_mask)]
+
+    fig, ax = plt.subplots(figsize=(6.8, 6.4))
+    ps = max(_point_size(S), 2.5)
+    if np.any(~assigned):
+        ax.scatter(
+            S[~assigned, 0],
+            S[~assigned, 1],
+            c="#c8c8c8",
+            s=ps,
+            linewidths=0,
+            alpha=0.45,
+            rasterized=True,
+            zorder=1,
+            label="cells in gaps",
+        )
+    if np.any(assigned):
+        ax.scatter(
+            S[assigned, 0],
+            S[assigned, 1],
+            c="#4c78a8",
+            s=ps * 1.15,
+            linewidths=0,
+            alpha=0.8,
+            rasterized=True,
+            zorder=2,
+            label="cells in spots",
+        )
+
+    if empty_polys:
+        ax.add_collection(
+            PolyCollection(
+                empty_polys,
+                facecolors="none",
+                edgecolors="#7a7a7a",
+                linewidths=0.45,
+                linestyles="--",
+                alpha=0.7,
+                zorder=3,
+            )
+        )
+    if occupied_polys:
+        ax.add_collection(
+            PolyCollection(
+                occupied_polys,
+                facecolors="none",
+                edgecolors="#222222",
+                linewidths=0.7,
+                alpha=0.95,
+                zorder=4,
+            )
+        )
+    for i in np.flatnonzero(occupied_mask):
+        ax.add_patch(
+            Circle(
+                (float(centers[i, 0]), float(centers[i, 1])),
+                float(spot_radius_um),
+                fill=False,
+                edgecolor="#c0392b",
+                linewidth=0.85,
+                zorder=5,
+            )
+        )
+
+    ax.set_aspect("equal")
+    ax.set_xlabel("x (µm)")
+    ax.set_ylabel("y (µm)")
+    spacing = (
+        float(spot_distance_um)
+        if spot_distance_um is not None
+        else float(hex_radius_um) * np.sqrt(3.0)
+    )
+    diameter = float(spot_diameter_um) if spot_diameter_um is not None else 2.0 * float(spot_radius_um)
+    n_occ = int(occupied_mask.sum())
+    n_empty = int((~occupied_mask).sum())
+    ax.set_title(
+        f"{n_occ} occupied spots, {n_empty} empty in-tissue spots\n"
+        f"hex spacing {spacing:g} µm, capture diameter {diameter:g} µm"
+    )
+    legend_handles = [
+        Line2D([0], [0], marker="o", color="none", markerfacecolor="#4c78a8", markersize=6, label="cells in spots"),
+        Line2D([0], [0], marker="o", color="none", markerfacecolor="#c8c8c8", markersize=6, label="cells in gaps"),
+        Line2D([0], [0], color="#222222", lw=1.2, label="occupied hex"),
+        Line2D([0], [0], color="#7a7a7a", lw=1.0, ls="--", label="empty in-tissue hex"),
+        Line2D([0], [0], color="#c0392b", lw=1.2, label="55 µm capture circle" if abs(diameter - 55.0) < 1e-6 else "capture circle"),
+    ]
+    ax.legend(handles=legend_handles, loc="upper right", fontsize=8, framealpha=0.9)
+    xlim, ylim = _spatial_axis_limits(S)
+    pad = max(float(hex_radius_um), float(spot_radius_um))
+    ax.set_xlim(float(xlim[0]) - pad, float(xlim[1]) + pad)
+    ax.set_ylim(float(ylim[0]) - pad, float(ylim[1]) + pad)
+    title = "Visium pseudobulk overlay"
+    if run_name:
+        title = f"Visium pseudobulk overlay — {run_name}"
+    fig.suptitle(title, fontsize=11)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
     return out_path
 

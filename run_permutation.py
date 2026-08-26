@@ -133,6 +133,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=argparse.SUPPRESS,
         help="Center-to-center pseudospot spacing in microns for test.method='binning'.",
     )
+    parser.add_argument(
+        "--visium-spot-distance-um",
+        dest="visium_spot_distance_um",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Center-to-center hex spot spacing in microns for test.method='visium_pseudobulk'.",
+    )
+    parser.add_argument(
+        "--visium-spot-diameter-um",
+        dest="visium_spot_diameter_um",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="Circular spot diameter in microns for test.method='visium_pseudobulk'.",
+    )
     parser.add_argument("--batch-size", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--sgd-batch-size", type=int, default=argparse.SUPPRESS)
     parser.add_argument(
@@ -313,6 +327,8 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict:
         "decoder": "decoder",
         "bin_shape": "bin_shape",
         "bin_spot_distance_um": "bin_spot_distance_um",
+        "visium_spot_distance_um": "visium_spot_distance_um",
+        "visium_spot_diameter_um": "visium_spot_diameter_um",
         "batch_size": "batch_size",
         "sgd_batch_size": "sgd_batch_size",
         "sgd_cosine_lr_decay": "sgd_cosine_lr_decay",
@@ -366,7 +382,8 @@ def main() -> None:
     run_config = build_run_config(args.config, cli_overrides)
 
     data_config_for_load = run_config.data
-    if run_config.test.method == "binning" and run_config.data.source == "h5ad":
+    _pseudobulk_methods = {"binning", "visium_pseudobulk"}
+    if run_config.test.method in _pseudobulk_methods and run_config.data.source == "h5ad":
         data_config_for_load = replace(
             run_config.data,
             normalize_total=False,
@@ -381,6 +398,16 @@ def main() -> None:
     )
     if run_config.test.method == "binning":
         dataset.meta["binning_preprocessing"] = {
+            "min_cells_per_gene": int(run_config.data.min_cells_per_gene),
+            "top_var_genes": int(run_config.data.top_var_genes),
+            "normalize_total": bool(run_config.data.normalize_total),
+            "log1p": bool(run_config.data.log1p),
+            "standardize_expression": bool(run_config.data.standardize_expression),
+            "q": run_config.data.q,
+            "seed": int(run_config.data.seed),
+        }
+    if run_config.test.method == "visium_pseudobulk":
+        dataset.meta["visium_pseudobulk_preprocessing"] = {
             "min_cells_per_gene": int(run_config.data.min_cells_per_gene),
             "top_var_genes": int(run_config.data.top_var_genes),
             "normalize_total": bool(run_config.data.normalize_total),
