@@ -21,9 +21,21 @@ from typing import Any
 
 from data import generate_synthetic_dataset
 from data.schemas import DataConfig, DatasetBundle, RunConfig, run_config_from_mapping
-from experiments.configuration import build_manifest_config_snapshot, save_standardized_outputs
+from experiments.configuration import (
+    build_manifest_config_snapshot,
+    save_standardized_outputs,
+)
 from experiments.core.dataset_cache import load_dataset_cache, save_dataset_cache
 from experiments.core.paths import repo_root
+from experiments.core.study_spec import (
+    add_spec_argument,
+    add_sweep_run_arguments,
+    analysis_dir_for_output,
+    common_study_fields,
+    load_spec,
+    manifest_path_for_output,
+    runs_dir_for_output,
+)
 
 REPO_ROOT = repo_root(__file__)
 DEFAULT_VISIUM_SPEC = REPO_ROOT / "configs/experiments/kernel_blurred_visium_pseudobulk_sweep.json"
@@ -74,13 +86,6 @@ class KernelBlurredRunCondition:
     run_name: str
 
 
-def _resolve_repo_path(path_value: str | Path) -> Path:
-    path = Path(path_value)
-    if path.is_absolute():
-        return path.resolve()
-    return (REPO_ROOT / path).resolve()
-
-
 def _format_number(value: float) -> str:
     text = f"{float(value):.6g}"
     return text.replace("-", "m").replace(".", "p")
@@ -105,12 +110,12 @@ def _load_gaussian_blur_sigmas_um(payload: dict[str, Any]) -> list[float]:
 
 
 def load_kernel_blurred_sweep_spec(path: str | Path) -> KernelBlurredSweepSpec:
-    with open(path, encoding="utf-8") as handle:
-        payload = json.load(handle)
+    payload = load_spec(path)
+    experiment_name, base_config, output_root = common_study_fields(payload)
     spec = KernelBlurredSweepSpec(
-        experiment_name=str(payload["experiment_name"]),
-        base_config=_resolve_repo_path(payload["base_config"]),
-        output_root=_resolve_repo_path(payload["output_root"]),
+        experiment_name=experiment_name,
+        base_config=base_config,
+        output_root=output_root,
         alpha=float(payload.get("alpha", 0.05)),
         bandwidths_um=_load_gaussian_blur_sigmas_um(payload),
         seeds=[int(v) for v in payload["seeds"]],
@@ -122,7 +127,7 @@ def load_kernel_blurred_sweep_spec(path: str | Path) -> KernelBlurredSweepSpec:
 
 
 def analysis_dir_for_spec(spec: KernelBlurredSweepSpec) -> Path:
-    return spec.output_root / "analysis"
+    return analysis_dir_for_output(spec.output_root)
 
 
 def datasets_dir_for_spec(spec: KernelBlurredSweepSpec) -> Path:
@@ -130,11 +135,11 @@ def datasets_dir_for_spec(spec: KernelBlurredSweepSpec) -> Path:
 
 
 def runs_dir_for_spec(spec: KernelBlurredSweepSpec) -> Path:
-    return spec.output_root / "runs"
+    return runs_dir_for_output(spec.output_root)
 
 
 def manifest_path_for_spec(spec: KernelBlurredSweepSpec) -> Path:
-    return spec.output_root / "manifest.json"
+    return manifest_path_for_output(spec.output_root)
 
 
 def dataset_cache_path(spec: KernelBlurredSweepSpec, key: DatasetKey) -> Path:
@@ -340,19 +345,19 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run the Gaussian-blurred synthetic-noise sweep (not an MSR study)."
     )
-    parser.add_argument(
-        "--spec",
-        required=True,
+    add_spec_argument(
+        parser,
         help=(
             "Sweep spec. Use "
             "configs/experiments/kernel_blurred_visium_pseudobulk_sweep.json "
-            "(Visium circles) or "
+            "(Visium circles), "
             "configs/experiments/kernel_blurred_pseudobulk_sweep.json "
-            "(full hex tiling)."
+            "(full hex tiling), or "
+            "configs/experiments/kernel_blurred_variogram_gene_specific_sweep.json "
+            "(variogram-matched permutations, 10 seeds at 10, 15, and 20 µm)."
         ),
     )
-    parser.add_argument("--dry-run", action="store_true", help="Print planned datasets/runs without executing")
-    parser.add_argument("--max-runs", type=int, default=None, help="Optional cap on number of test runs")
+    add_sweep_run_arguments(parser)
     return parser
 
 

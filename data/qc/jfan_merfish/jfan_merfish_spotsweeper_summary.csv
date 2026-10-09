@@ -1,0 +1,4 @@
+batch,n_cells,n_discarded,n_kept,n_counts_outliers,n_genes_outliers,n_neighbors,cutoff,keep_indices_path
+B1,645,19,626,12,18,20,3.0,data/qc/jfan_merfish/jfan_merfish_spotsweeper_keep_B1.npy
+B2,400,22,378,13,17,20,3.0,data/qc/jfan_merfish/jfan_merfish_spotsweeper_keep_B2.npy
+B3,323,23,300,13,22,20,3.0,data/qc/jfan_merfish/jfan_merfish_spotsweeper_keep_B3.npy

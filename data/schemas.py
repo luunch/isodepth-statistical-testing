@@ -31,6 +31,9 @@ SUPPORTED_BLOCK_SHAPES = frozenset({"hexagon", "square"})
 SUPPORTED_SAMPLING_BIAS = frozenset({"uniform", "normal", "anisotropic_normal", "lattice"})
 
 SUPPORTED_EXPRESSION_DISTRIBUTIONS = frozenset({"gaussian", "poisson"})
+SUPPORTED_INPUT_EXPRESSION_REPRESENTATIONS = frozenset(
+    {"raw_counts", "log1p_normalized"}
+)
 
 
 @dataclass
@@ -233,15 +236,9 @@ SUPPORTED_PERMUTATION_METHODS = {
     "block_permutation",
     "binning",
     "visium_pseudobulk",
-    "fourier_spectral_randomization",
-    "joint_truncated_msr",
-    "joint_truncated_rank_msr",
-    "cross_validation",
+    "correlated_null_permutation",
+    "correlated_null_adaptive_permutation",
     "full_retraining",
-    "comparison_perturbation_test",
-    "perturbation_test",
-    "comparison_subsampling_test",
-    "subsampling_test",
 }
 
 SUPPORTED_EXISTENCE_METHODS = {
@@ -249,13 +246,9 @@ SUPPORTED_EXISTENCE_METHODS = {
     "block_permutation",
     "binning",
     "visium_pseudobulk",
-    "fourier_spectral_randomization",
-    "joint_truncated_msr",
-    "joint_truncated_rank_msr",
-    "cross_validation",
+    "correlated_null_permutation",
+    "correlated_null_adaptive_permutation",
 }
-
-MSR_METHODS = frozenset({"joint_truncated_msr", "joint_truncated_rank_msr"})
 
 
 @dataclass
@@ -301,8 +294,20 @@ class DataConfig:
     obs_y_col: Optional[str] = None
     layer: Optional[str] = None
     use_raw: bool = False
+    input_expression_representation: str = "raw_counts"
+    input_normalization_target: Optional[float] = None
+    make_var_names_unique: bool = False
     min_cells_per_gene: int = 0
+    # Minimum percent of cells (0-100) in which a gene must be detected (nonzero).
+    # 0 disables the filter. When min_cells_per_gene is also positive, a gene must
+    # satisfy both. In cell_type="separate" mode the percentage is evaluated inside
+    # each domain, so the implied cell count differs by domain size.
+    min_sparsity_percentage: float = 0.0
     top_var_genes: int = 0
+    # After the usual expression transforms, replace gene columns with this many
+    # leading PCs (cell scores). 0 = off. Separate cell-type mode fits PCA
+    # independently in each subset. Incompatible with data.q.
+    n_expression_pcs: int = 0
     exclude_gene_patterns: Optional[list[str]] = None
     # Restrict analysis to exactly this fixed gene panel (e.g. all genes in a pathway/gene-set
     # of interest) instead of data-driven HVG selection. Every downstream preprocessing
@@ -389,12 +394,69 @@ class DataConfig:
             raise ValueError(f"Unsupported data source '{self.source}'")
         if self.source == "h5ad" and not self.h5ad:
             raise ValueError("data.h5ad is required when data.source='h5ad'")
+        if self.input_expression_representation not in SUPPORTED_INPUT_EXPRESSION_REPRESENTATIONS:
+            raise ValueError(
+                "Unsupported data.input_expression_representation "
+                f"{self.input_expression_representation!r}; expected one of "
+                f"{sorted(SUPPORTED_INPUT_EXPRESSION_REPRESENTATIONS)}"
+            )
+        if self.input_expression_representation != "raw_counts":
+            if self.source != "h5ad":
+                raise ValueError(
+                    "data.input_expression_representation is only supported for h5ad data"
+                )
+            if self.layer is not None or self.use_raw:
+                raise ValueError(
+                    "data.input_expression_representation='log1p_normalized' currently "
+                    "requires data.layer=null and data.use_raw=false"
+                )
+            if self.input_normalization_target is None:
+                raise ValueError(
+                    "data.input_normalization_target is required when "
+                    "data.input_expression_representation='log1p_normalized'"
+                )
+        if (
+            self.input_normalization_target is not None
+            and float(self.input_normalization_target) <= 0.0
+        ):
+            raise ValueError("data.input_normalization_target must be > 0 when provided")
+        if (
+            self.input_expression_representation == "raw_counts"
+            and self.input_normalization_target is not None
+        ):
+            raise ValueError(
+                "data.input_normalization_target is only valid when "
+                "data.input_expression_representation='log1p_normalized'"
+            )
+        if self.make_var_names_unique and self.source != "h5ad":
+            raise ValueError("data.make_var_names_unique is only supported for h5ad data")
         if self.min_cells_per_gene < 0:
             raise ValueError("data.min_cells_per_gene must be >= 0")
+        if self.min_sparsity_percentage is None:
+            self.min_sparsity_percentage = 0.0
+        try:
+            self.min_sparsity_percentage = float(self.min_sparsity_percentage)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "data.min_sparsity_percentage must be a number between 0 and 100"
+            ) from exc
+        if not np.isfinite(self.min_sparsity_percentage) or not (
+            0.0 <= self.min_sparsity_percentage <= 100.0
+        ):
+            raise ValueError(
+                "data.min_sparsity_percentage must be between 0 and 100 "
+                "(percent of cells in which the gene is expressed; 0 disables it)"
+            )
         if self.top_var_genes < 0:
             raise ValueError("data.top_var_genes must be >= 0 (0 means use all genes)")
         if self.top_var_genes > 0 and self.source != "h5ad":
             raise ValueError("data.top_var_genes is only supported when data.source='h5ad'")
+        if self.n_expression_pcs < 0:
+            raise ValueError("data.n_expression_pcs must be >= 0 (0 means keep genes)")
+        if self.n_expression_pcs > 0 and self.source != "h5ad":
+            raise ValueError("data.n_expression_pcs is only supported when data.source='h5ad'")
+        if self.n_expression_pcs > 0 and self.q is not None:
+            raise ValueError("data.n_expression_pcs cannot be combined with data.q")
         if self.exclude_gene_patterns is not None:
             if self.source != "h5ad":
                 raise ValueError("data.exclude_gene_patterns is only supported when data.source='h5ad'")
@@ -866,10 +928,8 @@ class TestConfig:
     metric: str = "nll_gaussian_mse"
     n_perms: int = 100
     train_fraction: float = 0.8
-    n_folds: int = 5
     n_reruns: int = 30
     alpha: float = 0.05
-    n_nulls: int = 50
     epochs: int = 5000
     lr: float = 1e-3
     patience: int = 0
@@ -885,9 +945,6 @@ class TestConfig:
     sgd_cosine_t_max_steps: Optional[int] = None
     max_wall_time_sec: Optional[float] = None
     record_loss_history: bool = True
-    delta: list[float] = field(default_factory=lambda: [0.05])
-    perturb_target: str = "coordinates"
-    subset_fractions: list[float] = field(default_factory=lambda: [0.5, 0.7, 0.9])
     verbose: bool = True
     covariate: Optional[CovariateConfig] = None
     recursive: bool = False
@@ -898,17 +955,48 @@ class TestConfig:
     bin_spot_distance_um: float = 100.0
     visium_spot_distance_um: float = 100.0
     visium_spot_diameter_um: float = 55.0
+    # Override for the fallback (non-synthetic) tissue-membership radius used to decide
+    # which candidate Visium spots overlap tissue. Default heuristic (1.5x median nearest-
+    # neighbor spacing of the dataset's own cells) is tuned for densely-packed full tissue
+    # sections; it is too tight for sparse/scattered cell-type subsets (e.g. a single
+    # immune-cell DBSCAN region) where real gaps between same-type cells are still tissue.
+    # When set, matches the connectivity radius used to define such regions.
+    visium_tissue_radius_um: Optional[float] = None
     coordinate_um_per_unit: Optional[float] = None
     block_jitter: bool = True
     save_permutation_null_comparison: bool = False
-    msr_truncate_um: Optional[float] = None
-    msr_neighbor_radius_um: Optional[float] = None
-    msr_calibration_um: Optional[float] = None
-    msr_shared_rank: bool = False
     moran: bool = False
     moran_neighbor_radius_um: float = 30.0
     gaussian_pretrain_epochs: int = 0
     gaussian_pretrain_freeze_encoder: bool = False
+    variogram_sigma_multiples: list[float] = field(
+        default_factory=lambda: [1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0]
+    )
+    variogram_n_bins: int = 13
+    variogram_n_plot_genes: int = 10
+    variogram_nn_candidates: list[float] = field(
+        default_factory=lambda: [
+            0.0,
+            0.01,
+            0.02,
+            0.03,
+            0.04,
+            0.05,
+            0.1,
+            0.2,
+            0.3,
+            0.4,
+            0.5,
+            0.6,
+            0.7,
+            0.8,
+            0.9,
+        ]
+    )
+    # ``cuda`` is the default matcher. ``sequential`` is the reference loop.
+    # ``cpu`` batches on the CPU. CUDA products stay float64.
+    variogram_backend: str = "cuda"
+    variogram_perm_batch_size: Optional[int] = None
 
     def validate(self) -> "TestConfig":
         if self.method not in SUPPORTED_PERMUTATION_METHODS:
@@ -919,8 +1007,6 @@ class TestConfig:
             raise ValueError(
                 f"Unsupported metric '{self.metric}'. Expected one of {sorted(CANONICAL_METRICS)}"
             )
-        if self.n_nulls <= 0:
-            raise ValueError("test.n_nulls must be > 0")
         if self.train_fraction <= 0.0 or self.train_fraction >= 1.0:
             raise ValueError("test.train_fraction must lie strictly between 0 and 1")
         if self.n_reruns <= 0:
@@ -959,35 +1045,55 @@ class TestConfig:
                 raise ValueError("test.sgd_cosine_t_max_steps must be > 0 when provided")
         if self.max_wall_time_sec is not None and float(self.max_wall_time_sec) <= 0:
             raise ValueError("test.max_wall_time_sec must be > 0 when provided")
-        self.delta = [float(value) for value in self.delta]
-        if not self.delta:
-            raise ValueError("test.delta must contain at least one value")
-        if any(delta <= 0.0 for delta in self.delta):
-            raise ValueError("test.delta entries must be > 0")
-        if self.perturb_target != "coordinates":
-            raise ValueError("test.perturb_target currently only supports 'coordinates'")
-
-        self.subset_fractions = [float(value) for value in self.subset_fractions]
-        if not self.subset_fractions:
-            raise ValueError("test.subset_fractions must contain at least one fraction")
-        if any(fraction <= 0.0 or fraction >= 1.0 for fraction in self.subset_fractions):
-            raise ValueError("test.subset_fractions entries must lie strictly between 0 and 1")
 
         if self.method in {
             "parallel_permutation",
             "block_permutation",
             "binning",
             "visium_pseudobulk",
-            "fourier_spectral_randomization",
-            *MSR_METHODS,
-            "cross_validation",
+            "correlated_null_permutation",
+            "correlated_null_adaptive_permutation",
             "full_retraining",
-            "comparison_perturbation_test",
-            "perturbation_test",
-            "comparison_subsampling_test",
-            "subsampling_test",
         } and self.n_perms <= 0:
             raise ValueError("test.n_perms must be > 0")
+
+        if self.method in {"correlated_null_permutation", "correlated_null_adaptive_permutation"}:
+            if self.metric in {"nll_poisson_mse", "poisson"}:
+                raise ValueError("Correlated Gaussian nulls do not support a Poisson metric")
+            if int(self.variogram_n_bins) <= 0:
+                raise ValueError("test.variogram_n_bins must be > 0")
+            if int(self.variogram_n_plot_genes) <= 0:
+                raise ValueError("test.variogram_n_plot_genes must be > 0")
+        if self.method == "correlated_null_permutation":
+            self.variogram_sigma_multiples = [float(v) for v in self.variogram_sigma_multiples]
+            if not self.variogram_sigma_multiples:
+                raise ValueError("test.variogram_sigma_multiples must be non-empty")
+            if any(v <= 0 for v in self.variogram_sigma_multiples):
+                raise ValueError("test.variogram_sigma_multiples entries must be > 0")
+        if self.method == "correlated_null_adaptive_permutation":
+            self.variogram_nn_candidates = [float(v) for v in self.variogram_nn_candidates]
+            if not self.variogram_nn_candidates:
+                raise ValueError("test.variogram_nn_candidates must be non-empty")
+            if np.sum(np.asarray(self.variogram_nn_candidates) == 0.0) != 1:
+                raise ValueError(
+                    "test.variogram_nn_candidates must contain exactly one nn=0 identity candidate"
+                )
+            if any((v < 0 or v > 1) for v in self.variogram_nn_candidates):
+                raise ValueError("test.variogram_nn_candidates entries must lie in [0, 1]")
+        if self.method in {"correlated_null_permutation", "correlated_null_adaptive_permutation"}:
+            backend = str(self.variogram_backend).strip().lower()
+            if backend == "gpu":
+                backend = "cuda"
+            if backend not in {"sequential", "cpu", "cuda"}:
+                raise ValueError(
+                    "test.variogram_backend must be 'sequential', 'cpu', or 'cuda' "
+                    f"(got {self.variogram_backend!r})"
+                )
+            self.variogram_backend = backend
+            if self.variogram_perm_batch_size is not None:
+                self.variogram_perm_batch_size = int(self.variogram_perm_batch_size)
+                if self.variogram_perm_batch_size <= 0:
+                    raise ValueError("test.variogram_perm_batch_size must be > 0 when provided")
 
         if self.method == "block_permutation":
             if self.block_radius is None:
@@ -1025,6 +1131,8 @@ class TestConfig:
             raise ValueError(
                 "test.coordinate_um_per_unit is required when test.method='visium_pseudobulk'"
             )
+        if self.visium_tissue_radius_um is not None and float(self.visium_tissue_radius_um) <= 0:
+            raise ValueError("test.visium_tissue_radius_um must be > 0 when provided")
         if self.save_permutation_null_comparison and self.method != "block_permutation":
             raise ValueError(
                 "test.save_permutation_null_comparison requires test.method='block_permutation'"
@@ -1032,64 +1140,9 @@ class TestConfig:
         if self.coordinate_um_per_unit is not None and float(self.coordinate_um_per_unit) <= 0:
             raise ValueError("test.coordinate_um_per_unit must be > 0 when provided")
 
-        if self.method in MSR_METHODS:
-            if self.msr_neighbor_radius_um is None:
-                raise ValueError(
-                    "test.msr_neighbor_radius_um (in µm) is required when "
-                    f"test.method='{self.method}'"
-                )
-            if float(self.msr_neighbor_radius_um) <= 0:
-                raise ValueError("test.msr_neighbor_radius_um must be > 0")
-            if self.coordinate_um_per_unit is None:
-                raise ValueError(
-                    "test.coordinate_um_per_unit is required when "
-                    f"test.method='{self.method}' to convert coordinates to µm"
-                )
-        if self.msr_truncate_um is not None and float(self.msr_truncate_um) < 0:
-            raise ValueError("test.msr_truncate_um must be >= 0 when provided")
-        if self.msr_neighbor_radius_um is not None and float(self.msr_neighbor_radius_um) <= 0:
-            raise ValueError("test.msr_neighbor_radius_um must be > 0 when provided")
-        if self.msr_calibration_um is not None and float(self.msr_calibration_um) <= 0:
-            raise ValueError("test.msr_calibration_um must be > 0 when provided")
-
         if self.moran:
             if float(self.moran_neighbor_radius_um) <= 0:
                 raise ValueError("test.moran_neighbor_radius_um must be > 0 when test.moran is true")
-
-        if self.method == "cross_validation":
-            if self.n_folds < 2:
-                raise ValueError("test.n_folds must be >= 2 for cross_validation")
-            if self.metric not in {
-                "nll_gaussian_mse",
-                "nll_poisson_mse",
-                "poisson",
-                "mse",
-            }:
-                raise ValueError(
-                    "test.metric for cross_validation must be one of "
-                    "['mse', 'nll_gaussian_mse', 'nll_poisson_mse']"
-                )
-        if self.method == "comparison_subsampling_test" and self.metric not in {
-            "nll_gaussian_mse",
-            "mse",
-        }:
-            raise ValueError(
-                "test.metric for comparison_subsampling_test must be one of ['mse', 'nll_gaussian_mse']"
-            )
-        if self.method == "perturbation_test" and self.metric not in {
-            "nll_gaussian_mse",
-            "mse",
-        }:
-            raise ValueError(
-                "test.metric for perturbation_test must be one of ['mse', 'nll_gaussian_mse']"
-            )
-        if self.method == "subsampling_test" and self.metric not in {
-            "nll_gaussian_mse",
-            "mse",
-        }:
-            raise ValueError(
-                "test.metric for subsampling_test must be one of ['mse', 'nll_gaussian_mse']"
-            )
 
         if self.max_gradients <= 0:
             raise ValueError("test.max_gradients must be > 0")
@@ -1148,6 +1201,8 @@ class TestConfig:
 class OutputConfig:
     out_dir: str = "results"
     run_name: str = "permutation"
+    # Embed cell-by-gene decoder predictions in result.json. Off by default:
+    # those matrices are unreadable as JSON and dominate the file size.
     save_preds: bool = False
     save_perm_stats: bool = True
 
@@ -1160,15 +1215,45 @@ class OutputConfig:
 
 
 @dataclass
+class BlurredPermutationsConfig:
+    """Optional post-hoc spatially blurred null reference distributions."""
+
+    enabled: bool = True
+    sigmas_um: list[float] = field(default_factory=lambda: [20.0, 50.0])
+    n_per_sigma: int = 20
+    cutoff_mult: float = 4.0
+    within_cell_type: bool = True
+
+    def validate(self) -> "BlurredPermutationsConfig":
+        self.sigmas_um = [float(value) for value in self.sigmas_um]
+        if not self.sigmas_um:
+            raise ValueError("blurred_permutations.sigmas_um must not be empty")
+        if any(value <= 0.0 for value in self.sigmas_um):
+            raise ValueError("blurred_permutations.sigmas_um entries must be > 0")
+        if len(set(self.sigmas_um)) != len(self.sigmas_um):
+            raise ValueError("blurred_permutations.sigmas_um must not contain duplicates")
+        if int(self.n_per_sigma) <= 0:
+            raise ValueError("blurred_permutations.n_per_sigma must be > 0")
+        if float(self.cutoff_mult) <= 0.0:
+            raise ValueError("blurred_permutations.cutoff_mult must be > 0")
+        self.n_per_sigma = int(self.n_per_sigma)
+        self.cutoff_mult = float(self.cutoff_mult)
+        return self
+
+
+@dataclass
 class RunConfig:
     data: DataConfig = field(default_factory=DataConfig)
     test: TestConfig = field(default_factory=TestConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    blurred_permutations: Optional[BlurredPermutationsConfig] = None
 
     def validate(self) -> "RunConfig":
         self.data.validate()
         self.test.validate()
         self.output.validate()
+        if self.blurred_permutations is not None:
+            self.blurred_permutations.validate()
         return self
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1179,9 +1264,9 @@ class RunConfig:
 class TestResult:
     method_name: str
     metric: str
-    p_value: float
-    stat_true: float
-    stat_perm: np.ndarray
+    p_value: Optional[float]
+    stat_true: Optional[float]
+    stat_perm: Optional[np.ndarray]
     runtime_sec: float
     n_cells: int
     n_genes: int
@@ -1189,20 +1274,34 @@ class TestResult:
     artifacts: Dict[str, Any] = field(default_factory=dict)
 
     def validate(self) -> "TestResult":
-        stat_perm = np.asarray(self.stat_perm, dtype=np.float64)
-        if stat_perm.ndim != 1:
-            raise ValueError("TestResult.stat_perm must be a 1D array")
-        if stat_perm.size == 0:
-            raise ValueError("TestResult.stat_perm must contain at least one permutation statistic")
+        self.config = dict(self.config or {})
+        self.artifacts = dict(self.artifacts or {})
+        separate_cell_types = self.artifacts.get("cell_type_mode") == "separate"
 
-        self.stat_perm = stat_perm
-        self.p_value = float(self.p_value)
-        self.stat_true = float(self.stat_true)
+        if self.stat_perm is None:
+            if not separate_cell_types:
+                raise ValueError("TestResult.stat_perm is required unless cell_type_mode='separate'")
+        else:
+            stat_perm = np.asarray(self.stat_perm, dtype=np.float64)
+            if stat_perm.ndim != 1:
+                raise ValueError("TestResult.stat_perm must be a 1D array")
+            if stat_perm.size == 0:
+                raise ValueError("TestResult.stat_perm must contain at least one permutation statistic")
+            self.stat_perm = stat_perm
+
+        if self.p_value is None:
+            if not separate_cell_types:
+                raise ValueError("TestResult.p_value is required unless cell_type_mode='separate'")
+        else:
+            self.p_value = float(self.p_value)
+        if self.stat_true is None:
+            if not separate_cell_types:
+                raise ValueError("TestResult.stat_true is required unless cell_type_mode='separate'")
+        else:
+            self.stat_true = float(self.stat_true)
         self.runtime_sec = float(self.runtime_sec)
         self.n_cells = int(self.n_cells)
         self.n_genes = int(self.n_genes)
-        self.config = dict(self.config or {})
-        self.artifacts = dict(self.artifacts or {})
         return self
 
     def to_json_dict(
@@ -1214,9 +1313,9 @@ class TestResult:
         return {
             "method_name": self.method_name,
             "metric": self.metric,
-            "p_value": float(self.p_value),
-            "stat_true": float(self.stat_true),
-            "stat_perm": [float(x) for x in np.asarray(self.stat_perm).tolist()],
+            "p_value": None if self.p_value is None else float(self.p_value),
+            "stat_true": None if self.stat_true is None else float(self.stat_true),
+            "stat_perm": None if self.stat_perm is None else [float(x) for x in np.asarray(self.stat_perm).tolist()],
             "runtime_sec": float(self.runtime_sec),
             "n_cells": int(self.n_cells),
             "n_genes": int(self.n_genes),
@@ -1278,15 +1377,23 @@ def run_config_from_mapping(mapping: Optional[Mapping[str, Any]]) -> RunConfig:
     test_config = TestConfig(**test_mapping)
     if covariate_raw is not None:
         test_config.covariate = _covariate_config_from_raw(covariate_raw)
+    blurred_raw = mapping.get("blurred_permutations")
+    blurred_config = (
+        None
+        if blurred_raw is None
+        else BlurredPermutationsConfig(**dict(blurred_raw)).validate()
+    )
     return RunConfig(
         data=data_config.validate(),
         test=test_config.validate(),
         output=OutputConfig(**dict(mapping.get("output", {}))),
+        blurred_permutations=blurred_config,
     ).validate()
 
 
 __all__ = [
     "CANONICAL_METRICS",
+    "BlurredPermutationsConfig",
     "CovariateConfig",
     "CovariateWhiteningConfig",
     "SUPPORTED_ENCODER_TYPES",
@@ -1303,6 +1410,9 @@ __all__ = [
     "SUPPORTED_SPATIAL_SHAPES",
     "SUPPORTED_EXPRESSION_DISTRIBUTIONS",
     "SUPPORTED_SYNTHETIC_MODES",
+    "PERMUTATION_BLURRING_BINNING",
+    "PERMUTATION_BLURRING_MODES",
+    "PERMUTATION_BLURRING_NOISE_MODELS",
     "SUPPORTED_PERMUTATION_METHODS",
     "TestConfig",
     "TestResult",

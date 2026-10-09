@@ -15,7 +15,7 @@ from scipy.stats import f as _f_dist
 from scipy.stats import gaussian_kde, linregress, spearmanr
 
 from data.schemas import DatasetBundle, TestResult
-from methods.metrics import metric_prefers_lower
+from methods.metrics import metric_axis_label, metric_prefers_lower
 
 # Exclude points treated as zero expression when ``hide_zero_expression`` is enabled.
 _EXPRESSION_ZERO_EPS = 1e-15
@@ -721,9 +721,24 @@ def save_dataset_triptych(
     if lowest_S is None or highest_S is None:
         return None
 
-    signal = _cell_expression_signal(dataset.A)
-    vmin = float(signal.min())
-    vmax = float(signal.max())
+    # Coordinate nulls keep expression fixed; expression nulls must supply the
+    # selected training targets, since their coordinates are unchanged.
+    null_expression = [result.artifacts.get(key) for key in ("lowest_A", "highest_A")]
+    if result.method_name in {
+        "correlated_null_permutation", "correlated_null_adaptive_permutation",
+    } and any(a is None for a in null_expression):
+        raise ValueError("Expression-null dataset plots require lowest_A and highest_A training targets")
+    expressions = [np.asarray(dataset.A, dtype=np.float32)] + [
+        np.asarray(dataset.A if a is None else a, dtype=np.float32)
+        for a in null_expression
+    ]
+    coordinates = [np.asarray(s, dtype=np.float32) for s in (dataset.S, lowest_S, highest_S)]
+    for expression, coords in zip(expressions, coordinates):
+        if expression.ndim != 2 or expression.shape[0] != coords.shape[0]:
+            raise ValueError("Dataset plot expression rows must match their coordinates")
+    signals = [_cell_expression_signal(a) for a in expressions]
+    vmin = min(float(signal.min()) for signal in signals)
+    vmax = max(float(signal.max()) for signal in signals)
     title_prefix = "True Synthetic Dataset" if dataset.meta.get("source") == "synthetic" else "True Dataset"
     n_cells = int(dataset.S.shape[0])
     title_prefix += f" (n={n_cells})"
@@ -732,7 +747,7 @@ def save_dataset_triptych(
     _plot_spatial_dataset_heatmap(
         axes[0],
         np.asarray(dataset.S, dtype=np.float32),
-        signal,
+        signals[0],
         title_prefix,
         vmin=vmin,
         vmax=vmax,
@@ -740,7 +755,7 @@ def save_dataset_triptych(
     _plot_spatial_dataset_heatmap(
         axes[1],
         np.asarray(lowest_S, dtype=np.float32),
-        signal,
+        signals[1],
         f"Lowest Metric Dataset\n{float(result.artifacts.get('lowest_stat', np.nan)):.4g}",
         subset_mask=result.artifacts.get("lowest_subset_mask"),
         vmin=vmin,
@@ -749,7 +764,7 @@ def save_dataset_triptych(
     _plot_spatial_dataset_heatmap(
         axes[2],
         np.asarray(highest_S, dtype=np.float32),
-        signal,
+        signals[2],
         f"Highest Metric Dataset\n{float(result.artifacts.get('highest_stat', np.nan)):.4g}",
         subset_mask=result.artifacts.get("highest_subset_mask"),
         vmin=vmin,
@@ -759,6 +774,15 @@ def save_dataset_triptych(
     out_path = Path(out_path)
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
+    if any(a is not None for a in null_expression):
+        # Preserve the actual selected targets for later replotting without RNG replay.
+        np.savez_compressed(
+            out_path.with_name(out_path.stem + "_inputs.npz"),
+            true_A=expressions[0], lowest_A=expressions[1], highest_A=expressions[2],
+            true_S=coordinates[0], lowest_S=coordinates[1], highest_S=coordinates[2],
+            lowest_perm_index=result.artifacts.get("lowest_perm_index", -1),
+            highest_perm_index=result.artifacts.get("highest_perm_index", -1),
+        )
     return out_path
 
 
@@ -1643,110 +1667,6 @@ def _save_permutation_triptych(
     return out_path
 
 
-def _save_perturbation_triptych(
-    dataset: DatasetBundle,
-    result: TestResult,
-    out_path: Path,
-    true_isodepth: np.ndarray,
-) -> Path:
-    rows = result.artifacts.get("delta_plot_rows") or []
-    if not rows:
-        fallback_delta = result.artifacts.get("delta", [0.0])
-        if isinstance(fallback_delta, (list, tuple, np.ndarray)):
-            fallback_delta = float(np.asarray(fallback_delta, dtype=np.float64).reshape(-1)[0])
-        rows = [
-            {
-                "delta": float(fallback_delta),
-                "lowest_isodepth": np.asarray(result.artifacts["lowest_isodepth"], dtype=np.float32),
-                "lowest_S": np.asarray(result.artifacts["lowest_S"], dtype=np.float32),
-                "lowest_stat": float(result.artifacts.get("lowest_stat", np.nan)),
-                "highest_isodepth": np.asarray(result.artifacts["highest_isodepth"], dtype=np.float32),
-                "highest_S": np.asarray(result.artifacts["highest_S"], dtype=np.float32),
-                "highest_stat": float(result.artifacts.get("highest_stat", np.nan)),
-            }
-        ]
-
-    n_rows = len(rows)
-    fig, axes = plt.subplots(n_rows, 3, figsize=(18, 5 * n_rows), squeeze=False)
-    spatial = np.asarray(dataset.S, dtype=np.float32)
-    for row_index, row in enumerate(rows):
-        delta = float(row["delta"])
-        _plot_spatial_isodepth(
-            axes[row_index, 0],
-            spatial,
-            true_isodepth,
-            f"Original Isodepth\nDelta = {delta:.4g}",
-        )
-        _plot_spatial_isodepth(
-            axes[row_index, 1],
-            np.asarray(row["lowest_S"], dtype=np.float32),
-            np.asarray(row["lowest_isodepth"], dtype=np.float32),
-            f"Lowest Metric\n{float(row['lowest_stat']):.4g}",
-        )
-        _plot_spatial_isodepth(
-            axes[row_index, 2],
-            np.asarray(row["highest_S"], dtype=np.float32),
-            np.asarray(row["highest_isodepth"], dtype=np.float32),
-            f"Highest Metric\n{float(row['highest_stat']):.4g}",
-        )
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return out_path
-
-
-def _save_subsampling_triptych(
-    dataset: DatasetBundle,
-    result: TestResult,
-    out_path: Path,
-    true_isodepth: np.ndarray,
-) -> Path:
-    rows = result.artifacts.get("fraction_plot_rows") or []
-    if not rows:
-        rows = [
-            {
-                "fraction": float(result.artifacts.get("lowest_subset_fraction", 0.0)),
-                "lowest_isodepth": np.asarray(result.artifacts["lowest_isodepth"], dtype=np.float32),
-                "lowest_mask": result.artifacts.get("lowest_subset_mask"),
-                "lowest_stat": float(result.artifacts.get("lowest_stat", np.nan)),
-                "highest_isodepth": np.asarray(result.artifacts["highest_isodepth"], dtype=np.float32),
-                "highest_mask": result.artifacts.get("highest_subset_mask"),
-                "highest_stat": float(result.artifacts.get("highest_stat", np.nan)),
-            }
-        ]
-
-    n_rows = len(rows)
-    fig, axes = plt.subplots(n_rows, 3, figsize=(18, 5 * n_rows), squeeze=False)
-    spatial = np.asarray(dataset.S, dtype=np.float32)
-    for row_index, row in enumerate(rows):
-        fraction = float(row["fraction"])
-        _plot_spatial_isodepth(
-            axes[row_index, 0],
-            spatial,
-            true_isodepth,
-            f"Full-Data Isodepth\nSubset Fraction = {fraction:.2f}",
-        )
-        _plot_spatial_isodepth(
-            axes[row_index, 1],
-            spatial,
-            np.asarray(row["lowest_isodepth"], dtype=np.float32),
-            f"Lowest Loss\n{float(row['lowest_stat']):.4g}",
-        )
-        _overlay_subsampling(axes[row_index, 1], spatial, row.get("lowest_mask"))
-        _plot_spatial_isodepth(
-            axes[row_index, 2],
-            spatial,
-            np.asarray(row["highest_isodepth"], dtype=np.float32),
-            f"Highest Loss\n{float(row['highest_stat']):.4g}",
-        )
-        _overlay_subsampling(axes[row_index, 2], spatial, row.get("highest_mask"))
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return out_path
-
-
 def save_true_rerun_isodepth_grid(
     dataset: DatasetBundle,
     rerun_isodepths: np.ndarray,
@@ -1862,37 +1782,9 @@ def save_isodepth_triptych(
         or highest_isodepth is None
         or highest_S is None
     ):
-        perturbed_isodepth = result.artifacts.get("perturbed_isodepth")
-        perturbed_S = result.artifacts.get("perturbed_S")
-        if true_isodepth is None or perturbed_isodepth is None or perturbed_S is None:
-            return None
-        out_path = Path(out_path)
-        return _save_perturbation_triptych(
-            dataset,
-            result,
-            out_path,
-            np.asarray(true_isodepth, dtype=np.float32),
-            np.asarray(perturbed_isodepth, dtype=np.float32),
-            np.asarray(perturbed_S, dtype=np.float32),
-            np.asarray(perturbed_isodepth, dtype=np.float32),
-            np.asarray(perturbed_S, dtype=np.float32),
-        )
+        return None
 
     out_path = Path(out_path)
-    if result.method_name in {"comparison_perturbation_test", "perturbation_test"}:
-        return _save_perturbation_triptych(
-            dataset,
-            result,
-            out_path,
-            np.asarray(true_isodepth, dtype=np.float32),
-        )
-    if result.method_name in {"comparison_subsampling_test", "subsampling_test"}:
-        return _save_subsampling_triptych(
-            dataset,
-            result,
-            out_path,
-            np.asarray(true_isodepth, dtype=np.float32),
-        )
     return _save_permutation_triptych(
         dataset,
         result,
@@ -1905,55 +1797,73 @@ def save_isodepth_triptych(
     )
 
 
-def save_metric_distribution_plot(result: TestResult, out_path: str | Path) -> Path:
-    out_path = Path(out_path)
-    if result.method_name in {"comparison_perturbation_test", "perturbation_test"}:
-        delta_summaries = result.artifacts.get("delta_summaries")
-        if isinstance(delta_summaries, dict) and delta_summaries:
-            rows = sorted(
-                (summary for summary in delta_summaries.values() if isinstance(summary, dict)),
-                key=lambda summary: float(summary["delta"]),
-            )
-            fig, axes = plt.subplots(len(rows), 1, figsize=(6, 4 * len(rows)), squeeze=False)
-            for ax, summary in zip(axes[:, 0], rows):
-                stat_perm = np.asarray(summary["null_distribution"], dtype=np.float64)
-                stat_true = float(summary["score_mean"])
-                p_value = float(summary["p_value"])
-                delta = float(summary["delta"])
-                ax.hist(stat_perm, bins=30, color="lightsteelblue", edgecolor="black")
-                ax.axvline(stat_true, color="crimson", linestyle="--", label=f"Observed Mean: {stat_true:.4g}")
-                ax.set_title(f"Delta = {delta:.4g}\np-value = {p_value:.4g}")
-                ax.set_xlabel(result.metric)
-                ax.set_ylabel("Count")
-                ax.legend()
-            fig.tight_layout()
-            fig.savefig(out_path, dpi=200, bbox_inches="tight")
-            plt.close(fig)
-            return out_path
-    if result.method_name in {"comparison_subsampling_test", "subsampling_test"}:
-        fraction_summaries = result.artifacts.get("fraction_summaries")
-        if isinstance(fraction_summaries, dict) and fraction_summaries:
-            rows = sorted(
-                (summary for summary in fraction_summaries.values() if isinstance(summary, dict)),
-                key=lambda summary: float(summary["fraction"]),
-            )
-            fig, axes = plt.subplots(len(rows), 1, figsize=(6, 4 * len(rows)), squeeze=False)
-            for ax, summary in zip(axes[:, 0], rows):
-                stat_perm = np.asarray(summary["null_distribution"], dtype=np.float64)
-                stat_true = float(summary["loss_mean"])
-                p_value = float(summary["p_value"])
-                fraction = float(summary["fraction"])
-                ax.hist(stat_perm, bins=30, color="lightsteelblue", edgecolor="black")
-                ax.axvline(stat_true, color="crimson", linestyle="--", label=f"Observed Mean: {stat_true:.4g}")
-                ax.set_title(f"Fraction = {fraction:.3f}\np-value = {p_value:.4g}")
-                ax.set_xlabel(result.metric)
-                ax.set_ylabel("Count")
-                ax.legend()
-            fig.tight_layout()
-            fig.savefig(out_path, dpi=200, bbox_inches="tight")
-            plt.close(fig)
-            return out_path
+_METRIC_OVERLAY_COLORS = ("darkorange", "mediumorchid", "seagreen", "royalblue")
 
+
+def _metric_overlay_series(
+    overlay_stats: np.ndarray | None,
+    overlay_label: str,
+    overlays: list[tuple[np.ndarray, str] | tuple[np.ndarray, str, str]] | None,
+) -> list[tuple[np.ndarray, str, str]]:
+    series: list[tuple[np.ndarray, str, str]] = []
+    if overlays:
+        for index, item in enumerate(overlays):
+            stats = np.asarray(item[0], dtype=np.float64).reshape(-1)
+            label = str(item[1])
+            color = str(item[2]) if len(item) > 2 else _METRIC_OVERLAY_COLORS[index % len(_METRIC_OVERLAY_COLORS)]
+            if stats.size:
+                series.append((stats, label, color))
+    elif overlay_stats is not None:
+        stats = np.asarray(overlay_stats, dtype=np.float64).reshape(-1)
+        if stats.size:
+            series.append((stats, overlay_label, _METRIC_OVERLAY_COLORS[0]))
+    return series
+
+
+def _draw_metric_overlays(
+    ax,
+    overlay_series: list[tuple[np.ndarray, str, str]],
+    extra_xs: list[float],
+) -> None:
+    """Draw blur-effect-size ticks/means and expand the x-axis to include them."""
+    if not overlay_series:
+        return
+    xs = list(extra_xs)
+    for series_index, (overlay, label, color) in enumerate(overlay_series):
+        ymax = 0.16 + 0.12 * series_index
+        for tick_index, value in enumerate(overlay):
+            ax.axvline(
+                float(value),
+                color=color,
+                alpha=0.5,
+                linewidth=1.0,
+                ymin=0.0,
+                ymax=ymax,
+                label=f"{label} (n={overlay.size})" if tick_index == 0 else None,
+            )
+        overlay_mean = float(np.mean(overlay))
+        ax.axvline(
+            overlay_mean,
+            color=color,
+            linestyle="--",
+            linewidth=1.6,
+            label=f"{label} mean: {overlay_mean:.4g}",
+        )
+        xs.extend([float(np.min(overlay)), float(np.max(overlay))])
+    span = max(xs) - min(xs)
+    margin = 0.03 * span if span > 0 else 1.0
+    ax.set_xlim(min(xs) - margin, max(xs) + margin)
+
+
+def save_metric_distribution_plot(
+    result: TestResult,
+    out_path: str | Path,
+    *,
+    overlay_stats: np.ndarray | None = None,
+    overlay_label: str = "Blurred permutations",
+    overlays: list[tuple[np.ndarray, str] | tuple[np.ndarray, str, str]] | None = None,
+) -> Path:
+    out_path = Path(out_path)
     stat_perm_arr = np.asarray(result.stat_perm, dtype=np.float64)
     stat_cov = result.artifacts.get("stat_covariate")
     p_cov = result.artifacts.get("p_value_covariate")
@@ -1996,122 +1906,19 @@ def save_metric_distribution_plot(result: TestResult, out_path: str | Path) -> P
             label=f"Observed: {result.stat_true:.4g}",
         )
         ax.set_title(f"Null distribution\np-value = {result.p_value:.4g}")
-    ax.set_xlabel(result.metric)
+    overlay_series = _metric_overlay_series(overlay_stats, overlay_label, overlays)
+    extra_xs = [
+        float(np.min(stat_perm_arr)),
+        float(np.max(stat_perm_arr)),
+        float(result.stat_true),
+    ]
+    if has_cov_dual:
+        extra_xs.append(float(stat_cov))
+    _draw_metric_overlays(ax, overlay_series, extra_xs)
+    ax.set_xlabel(metric_axis_label(result.metric))
     ax.set_ylabel("Count")
     ax.legend(loc="upper right", framealpha=0.95)
     fig.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return out_path
-
-
-def save_cross_validation_fold_isodepth_grid(
-    dataset: DatasetBundle,
-    fold_isodepths: list[np.ndarray],
-    out_path: str | Path,
-    *,
-    fold_test_sizes: np.ndarray | None = None,
-) -> Path | None:
-    """Spatial grid of true-model isodepths, one panel per CV fold."""
-    if not fold_isodepths:
-        return None
-
-    panels = [np.asarray(depth, dtype=np.float32).reshape(-1) for depth in fold_isodepths]
-    n_folds = len(panels)
-    if panels[0].shape[0] != dataset.n_cells:
-        raise ValueError(
-            f"fold isodepth length must match dataset.n_cells={dataset.n_cells}, "
-            f"got {panels[0].shape[0]}"
-        )
-
-    n_cols = min(n_folds, 3)
-    n_rows = int(np.ceil(n_folds / n_cols))
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5.5 * n_cols, 4.8 * n_rows), squeeze=False)
-    spatial = np.asarray(dataset.S, dtype=np.float32)
-
-    stacked = np.concatenate(panels, axis=0)
-    vmin = float(np.min(stacked))
-    vmax = float(np.max(stacked))
-    normalize_bounds = (vmin, vmax) if vmax > vmin else None
-
-    for fold_index, depth in enumerate(panels):
-        title = f"Fold {fold_index + 1}"
-        if fold_test_sizes is not None and fold_index < fold_test_sizes.size:
-            title += f" (held-out n={int(fold_test_sizes[fold_index])})"
-        _plot_spatial_isodepth(
-            axes.flat[fold_index],
-            spatial,
-            depth,
-            title,
-            normalize_bounds=normalize_bounds,
-        )
-
-    for axis in axes.flat[n_folds:]:
-        axis.axis("off")
-
-    fig.suptitle("True-model isodepth by cross-validation fold", fontsize=12)
-    fig.tight_layout()
-    out_path = Path(out_path)
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return out_path
-
-
-def save_cross_validation_per_fold_metric_distributions(
-    result: TestResult,
-    out_path: str | Path,
-) -> Path | None:
-    """Per-fold null histograms using fold-local permutation p-values."""
-    if result.method_name != "cross_validation":
-        return None
-
-    per_fold_true = result.artifacts.get("per_fold_true_loss")
-    per_fold_perm = result.artifacts.get("per_fold_perm_loss")
-    per_fold_p = result.artifacts.get("per_fold_p_values")
-    if per_fold_true is None or per_fold_perm is None:
-        return None
-
-    true_losses = np.asarray(per_fold_true, dtype=np.float64).reshape(-1)
-    perm_losses = np.asarray(per_fold_perm, dtype=np.float64)
-    if perm_losses.ndim != 2 or perm_losses.shape[0] != true_losses.size:
-        raise ValueError(
-            "per_fold_perm_loss must have shape (n_folds, n_perms) matching per_fold_true_loss"
-        )
-
-    p_values = (
-        np.asarray(per_fold_p, dtype=np.float64).reshape(-1)
-        if per_fold_p is not None
-        else np.full(true_losses.size, np.nan, dtype=np.float64)
-    )
-
-    n_folds = true_losses.size
-    fig, axes = plt.subplots(n_folds, 1, figsize=(6.4, 3.8 * n_folds), squeeze=False)
-    for fold_index, ax in enumerate(axes[:, 0]):
-        stat_perm = perm_losses[fold_index]
-        stat_true = float(true_losses[fold_index])
-        p_value = float(p_values[fold_index]) if np.isfinite(p_values[fold_index]) else float("nan")
-        ax.hist(
-            stat_perm,
-            bins=30,
-            color="lightsteelblue",
-            edgecolor="black",
-            label="Null (permutations)",
-        )
-        ax.axvline(
-            stat_true,
-            color="crimson",
-            linestyle="--",
-            linewidth=1.5,
-            label=f"Observed: {stat_true:.4g}",
-        )
-        ax.set_title(f"Fold {fold_index + 1}  |  p-value = {p_value:.4g}")
-        ax.set_xlabel(result.metric)
-        ax.set_ylabel("Count")
-        ax.legend(loc="upper right", framealpha=0.95, fontsize=8)
-
-    fig.suptitle("Per-fold null distributions (unweighted permutation tests)", fontsize=12)
-    fig.tight_layout()
-    out_path = Path(out_path)
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
     plt.close(fig)
     return out_path
@@ -2124,6 +1931,7 @@ def save_combined_celltype_metric_distribution(
     *,
     metric: str = "nll_gaussian_mse",
     covariate_label: str = "Covariate",
+    overlays_by_type: dict[str, list[tuple[np.ndarray, str] | tuple[np.ndarray, str, str]]] | None = None,
 ) -> Path:
     """Grid of null-distribution histograms, one panel per cell type."""
     n = len(cell_type_names)
@@ -2148,11 +1956,13 @@ def save_combined_celltype_metric_distribution(
 
         ax.hist(stat_perm, bins=30, color="lightsteelblue", edgecolor="black",
                 label="Null (permutations)")
+        extra_xs = [float(np.min(stat_perm)), float(np.max(stat_perm)), stat_true]
         if has_cov_dual:
             ax.axvline(stat_true, color="crimson", linestyle="--", linewidth=1.5,
                        label=f"Isodepth: {stat_true:.4g}")
             ax.axvline(float(stat_cov), color="teal", linestyle="--", linewidth=1.5,
                        label=f"{covariate_label}: {float(stat_cov):.4g}")
+            extra_xs.append(float(stat_cov))
             ax.set_title(
                 f"{type_name} (n={n_cells})\n"
                 f"p = {p_value:.4g}  |  p (cov) = {float(p_cov):.4g}",
@@ -2162,7 +1972,13 @@ def save_combined_celltype_metric_distribution(
             ax.axvline(stat_true, color="crimson", linestyle="--", linewidth=1.5,
                        label=f"Observed: {stat_true:.4g}")
             ax.set_title(f"{type_name} (n={n_cells})\np = {p_value:.4g}", fontsize=10)
-        ax.set_xlabel(metric, fontsize=9)
+        overlay_series = _metric_overlay_series(
+            None,
+            "Blurred permutations",
+            None if overlays_by_type is None else overlays_by_type.get(type_name),
+        )
+        _draw_metric_overlays(ax, overlay_series, extra_xs)
+        ax.set_xlabel(metric_axis_label(metric), fontsize=9)
         ax.set_ylabel("Count", fontsize=9)
         ax.legend(fontsize=7, loc="upper right", framealpha=0.9)
         ax.tick_params(labelsize=8)
@@ -2432,7 +2248,7 @@ def save_recursive_celltype_metric_distribution_grid(
                 label=f"Observed: {stat_true:.4g}",
             )
             ax.set_title(_recursive_celltype_panel_title(type_name, entry), fontsize=9)
-            ax.set_xlabel(metric, fontsize=8)
+            ax.set_xlabel(metric_axis_label(metric), fontsize=8)
             ax.set_ylabel("Count", fontsize=8)
             ax.legend(fontsize=7, loc="upper right", framealpha=0.9)
             ax.tick_params(labelsize=8)
@@ -2446,65 +2262,6 @@ def save_recursive_celltype_metric_distribution_grid(
     plt.close(fig)
     return out_path
 
-
-def save_subset_fraction_pvalue_plot(result: TestResult, out_path: str | Path) -> Path | None:
-    if result.method_name not in {"comparison_subsampling_test", "subsampling_test"}:
-        return None
-
-    fraction_summaries = result.artifacts.get("fraction_summaries")
-    if not isinstance(fraction_summaries, dict) or not fraction_summaries:
-        return None
-
-    rows = sorted(
-        (summary for summary in fraction_summaries.values() if isinstance(summary, dict)),
-        key=lambda summary: float(summary["fraction"]),
-    )
-    fractions = np.asarray([float(summary["fraction"]) for summary in rows], dtype=np.float64)
-    p_values = np.asarray([float(summary["p_value"]) for summary in rows], dtype=np.float64)
-
-    out_path = Path(out_path)
-    fig, ax = plt.subplots(1, 1, figsize=(6, 5))
-    ax.scatter(fractions, p_values, color="crimson", s=55)
-    ax.plot(fractions, p_values, color="lightcoral", linewidth=1.0, alpha=0.8)
-    ax.set_title("Subset Fraction vs p-value")
-    ax.set_xlabel("Sampling Fraction")
-    ax.set_ylabel("p-value")
-    ax.set_ylim(-0.02, 1.02)
-    ax.grid(alpha=0.25, linewidth=0.5)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return out_path
-
-
-def save_perturbation_delta_pvalue_plot(result: TestResult, out_path: str | Path) -> Path | None:
-    if result.method_name not in {"comparison_perturbation_test", "perturbation_test"}:
-        return None
-
-    delta_summaries = result.artifacts.get("delta_summaries")
-    if not isinstance(delta_summaries, dict) or not delta_summaries:
-        return None
-
-    rows = sorted(
-        (summary for summary in delta_summaries.values() if isinstance(summary, dict)),
-        key=lambda summary: float(summary["delta"]),
-    )
-    deltas = np.asarray([float(summary["delta"]) for summary in rows], dtype=np.float64)
-    p_values = np.asarray([float(summary["p_value"]) for summary in rows], dtype=np.float64)
-
-    out_path = Path(out_path)
-    fig, ax = plt.subplots(1, 1, figsize=(6, 5))
-    ax.scatter(deltas, p_values, color="crimson", s=55)
-    ax.plot(deltas, p_values, color="lightcoral", linewidth=1.0, alpha=0.8)
-    ax.set_title("Perturbation Delta vs p-value")
-    ax.set_xlabel("Delta")
-    ax.set_ylabel("p-value")
-    ax.set_ylim(-0.02, 1.02)
-    ax.grid(alpha=0.25, linewidth=0.5)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return out_path
 
 def _plot_spatial_expression_panel(
     ax,
@@ -3171,6 +2928,48 @@ def _top_genes_by_abs_rho(rhos: np.ndarray, n_top: int) -> np.ndarray:
     return np.argsort(-np.asarray(rhos, dtype=np.float64))[: min(int(n_top), int(rhos.size))]
 
 
+def _gene_ols_slopes(A: np.ndarray, coord: np.ndarray) -> np.ndarray:
+    """OLS slope of every gene column of A on coord. Shape (G,).
+
+    This is the univariate coefficient *b* in ``A_g ≈ a + b · coord``, using
+    observed expression (not a joint decoder that also sees a covariate).
+    """
+    A = np.asarray(A, dtype=np.float64)
+    x = np.asarray(coord, dtype=np.float64).reshape(-1)
+    n, g = A.shape
+    if n < 2 or g == 0:
+        return np.zeros(g, dtype=np.float64)
+    x_c = x - x.mean()
+    ss_x = float(np.dot(x_c, x_c))
+    if ss_x <= 0.0:
+        return np.zeros(g, dtype=np.float64)
+    A_c = A - A.mean(axis=0, keepdims=True)
+    slopes = (x_c @ A_c) / ss_x
+    return np.where(np.isfinite(slopes), slopes, 0.0)
+
+
+def _top_genes_by_abs_slope(
+    slopes: np.ndarray,
+    n_top: int,
+    *,
+    among: np.ndarray | None = None,
+) -> np.ndarray:
+    """Indices of the ``n_top`` genes with largest |OLS slope|, descending.
+
+    When ``among`` is provided, ranking is restricted to those gene indices
+    (e.g. BH-significant genes) and the returned array is a subset of ``among``.
+    """
+    slopes = np.asarray(slopes, dtype=np.float64)
+    mag = np.where(np.isfinite(slopes), np.abs(slopes), -np.inf)
+    if among is not None:
+        among = np.asarray(among, dtype=np.intp)
+        if among.size == 0:
+            return among
+        order = np.argsort(-mag[among])
+        return among[order[: min(int(n_top), int(order.size))]]
+    return np.argsort(-mag)[: min(int(n_top), int(mag.size))]
+
+
 def _decoder_fitted_values(
     A: np.ndarray,
     coord: np.ndarray,
@@ -3222,8 +3021,14 @@ def _top_genes_by_decoder_loss(losses: np.ndarray, n_top: int) -> np.ndarray:
     return np.argsort(safe)[: min(int(n_top), int(safe.size))]
 
 
-def _decoder_loss_annotation(mse: float | None, r2: float | None) -> str:
+def _decoder_loss_annotation(
+    mse: float | None,
+    r2: float | None,
+    slope: float | None = None,
+) -> str:
     bits: list[str] = []
+    if slope is not None and np.isfinite(slope):
+        bits.append(f"b = {float(slope):.3g}")
     if r2 is not None and np.isfinite(r2):
         bits.append(f"decoder R² = {float(r2):.3f}")
     if mse is not None and np.isfinite(mse):
@@ -3381,6 +3186,23 @@ def _save_residual_ratio_outputs(
     return csv_path, plot_out
 
 
+def _per_type_gene_names_for_rss(
+    type_data: dict,
+    n_genes: int,
+    fallback_names: list[str],
+) -> list[str] | None:
+    """Gene names aligned to a per-cell-type residual vector, or None if unusable."""
+    raw = type_data.get("var_names")
+    if raw is not None:
+        names = [str(name) for name in np.asarray(raw, dtype=object).reshape(-1)]
+        if len(names) != n_genes:
+            return None
+        return names
+    if len(fallback_names) == n_genes:
+        return [str(name) for name in fallback_names]
+    return [f"gene_{i}" for i in range(n_genes)]
+
+
 def save_combined_celltype_residual_ratio_outputs(
     per_type_results: dict[str, dict],
     cell_type_names: list[str],
@@ -3396,10 +3218,12 @@ def save_combined_celltype_residual_ratio_outputs(
     Separate cell-type mode fits one coordinate/decoder per cell type.  For a
     global gene-level residual comparison, treat those fits as one piecewise
     function: for each gene, sum RSS across all cell-type subsets before taking
-    ``RSS_covariate / RSS_fitted_coordinate``.
+    ``RSS_covariate / RSS_fitted_coordinate``.  Each subset may keep a different
+    HVG panel, so residuals are aligned by gene name rather than column index.
     """
-    rss_coord: np.ndarray | None = None
-    rss_cov: np.ndarray | None = None
+    rss_coord_acc: dict[str, float] = {}
+    rss_cov_acc: dict[str, float] = {}
+    aligned_gene_names: list[str] = []
     used_cell_types: list[str] = []
     n_cells_total = 0
 
@@ -3419,13 +3243,33 @@ def save_combined_celltype_residual_ratio_outputs(
 
         type_rss_coord = _rss_per_gene(A_arr, coord_arr)
         type_rss_cov = _rss_per_gene(A_arr, cov_arr)
-        rss_coord = type_rss_coord if rss_coord is None else rss_coord + type_rss_coord
-        rss_cov = type_rss_cov if rss_cov is None else rss_cov + type_rss_cov
+        type_gene_names = _per_type_gene_names_for_rss(
+            type_data, int(type_rss_coord.shape[0]), gene_names
+        )
+        if type_gene_names is None:
+            continue
+
+        for gene_name, gene_rss_coord, gene_rss_cov in zip(
+            type_gene_names, type_rss_coord, type_rss_cov
+        ):
+            if gene_name not in rss_coord_acc:
+                rss_coord_acc[gene_name] = 0.0
+                rss_cov_acc[gene_name] = 0.0
+                aligned_gene_names.append(gene_name)
+            rss_coord_acc[gene_name] += float(gene_rss_coord)
+            rss_cov_acc[gene_name] += float(gene_rss_cov)
         used_cell_types.append(str(type_name))
         n_cells_total += int(A_arr.shape[0])
 
-    if rss_coord is None or rss_cov is None or not used_cell_types:
+    if not aligned_gene_names or not used_cell_types:
         return None, None
+
+    rss_coord = np.asarray(
+        [rss_coord_acc[name] for name in aligned_gene_names], dtype=np.float64
+    )
+    rss_cov = np.asarray(
+        [rss_cov_acc[name] for name in aligned_gene_names], dtype=np.float64
+    )
 
     with np.errstate(divide="ignore", invalid="ignore"):
         ratio = np.asarray(rss_cov / rss_coord, dtype=np.float64)
@@ -3451,7 +3295,7 @@ def save_combined_celltype_residual_ratio_outputs(
         for rank, g in enumerate(order, start=1):
             writer.writerow([
                 rank,
-                gene_names[int(g)] if int(g) < len(gene_names) else f"gene_{int(g)}",
+                aligned_gene_names[int(g)],
                 float(rss_cov[int(g)]),
                 float(rss_coord[int(g)]),
                 float(ratio[int(g)]),
@@ -3570,6 +3414,7 @@ def _plot_gene_binned_vs_coord(
     expression_y_label: str = "Expression",
     decoder_mse: float | None = None,
     decoder_r2: float | None = None,
+    decoder_slope: float | None = None,
 ) -> None:
     """Per-bin mean dots + trend curve, with optional per-cell background scatter.
 
@@ -3627,7 +3472,7 @@ def _plot_gene_binned_vs_coord(
         )
 
     title = gene_name
-    loss_ann = _decoder_loss_annotation(decoder_mse, decoder_r2)
+    loss_ann = _decoder_loss_annotation(decoder_mse, decoder_r2, slope=decoder_slope)
     if loss_ann:
         title += f"\n{loss_ann}"
     elif rho is not None:
@@ -3637,6 +3482,30 @@ def _plot_gene_binned_vs_coord(
     ax.set_ylabel(expression_y_label, fontsize=8)
     ax.tick_params(labelsize=7)
     ax.grid(alpha=0.15, linewidth=0.4)
+
+
+def _save_no_significant_genes_plot(
+    out_path: Path,
+    *,
+    q_threshold: float,
+    coord_label: str,
+) -> Path:
+    """Placeholder figure when no genes pass the BH significance cutoff."""
+    fig, ax = plt.subplots(figsize=(6.4, 3.2))
+    ax.axis("off")
+    ax.text(
+        0.5,
+        0.5,
+        f"No genes with BH q < {q_threshold:g}\nvs {coord_label}",
+        ha="center",
+        va="center",
+        fontsize=12,
+    )
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
 
 
 def save_gene_expression_vs_isodepth_plot(
@@ -3656,19 +3525,20 @@ def save_gene_expression_vs_isodepth_plot(
     pvalues: np.ndarray | None = None,
     qvalues: np.ndarray | None = None,
     spatial_S: np.ndarray | None = None,
+    significant_only: bool = True,
 ) -> Path:
     """Top ``n_top_genes`` genes as binned mean expression vs isodepth.
 
-    Genes are ranked by **encoder-decoder reconstruction loss** (per-gene MSE of
-    ``decoder_preds``, or of a polynomial stand-in when ``decoder_df`` is set
-    and predictions are absent).  The companion spatial scatter
+    Genes are ranked by **|OLS slope|** of observed expression on the plotted
+    coordinate (``A_g ≈ a + b · coord``).  When ``decoder_df`` is set (parametric
+    F-test) and ``gene_indices`` is not supplied, panels are further restricted
+    to BH-significant genes (q < ``q_threshold``) unless ``significant_only`` is
+    False.  The companion spatial scatter
     ``<stem>_svg_spatial_expression.png`` uses the **same** top genes.
-    Spearman |ρ| is used only when no decoder fit is available.
 
     ``decoder_preds`` (n_cells, G): when provided the fit curve is the decoder
-    prediction vs isodepth (no rolling-mean smoothing).  ``decoder_df`` still
-    triggers an F-test CSV of significant genes (BH q < q_threshold) at
-    ``<stem>_isodepth_sig_genes.csv``; that list is **not** used to pick panels.
+    prediction vs isodepth (no rolling-mean smoothing).  ``decoder_df`` also
+    writes ``<stem>_isodepth_sig_genes.csv``.
 
     ``spatial_S``: optional (N, 2) spatial coordinates used for the companion
     scatter.  Defaults to ``dataset.S`` when not provided.
@@ -3685,73 +3555,9 @@ def save_gene_expression_vs_isodepth_plot(
 
     rhos = _gene_spearman_rhos(A, coord)
     mse, r2 = _decoder_fit_stats(A, coord, decoder_preds, decoder_df)
-    if gene_indices is None:
-        if mse is not None:
-            top_idx = _top_genes_by_decoder_loss(mse, n_top_genes)
-            title = "Top {n_top} genes by encoder-decoder reconstruction loss"
-        else:
-            top_idx = _top_genes_by_abs_rho(rhos, n_top_genes)
-            title = f"Top {{n_top}} genes by |Spearman r| with {coord_label}"
-    else:
-        top_idx = np.asarray(gene_indices, dtype=np.intp)[: int(n_top_genes)]
-        title = figure_title or f"Selected genes vs {coord_label}"
-    n_top = len(top_idx)
+    slopes = _gene_ols_slopes(A, coord)
 
-    colors = plt.cm.tab10(np.linspace(0.0, 0.9, max(n_top, 1)))
-    fig, axes = plt.subplots(1, n_top, figsize=(4.0 * n_top, 3.6), squeeze=False)
-    pv_arr = np.asarray(pvalues, dtype=np.float64) if pvalues is not None else None
-    qv_arr = np.asarray(qvalues, dtype=np.float64) if qvalues is not None else None
-    expression_y_label = _expression_y_axis_label(dataset.meta)
-
-    for col, gene_idx in enumerate(top_idx):
-        dp = (
-            np.asarray(decoder_preds, dtype=np.float64)[:, gene_idx]
-            if decoder_preds is not None else None
-        )
-        show_rho = None if (pv_arr is not None and qv_arr is not None) else float(rhos[gene_idx])
-        show_mse = None if mse is None else float(mse[gene_idx])
-        show_r2 = None if r2 is None else float(r2[gene_idx])
-        if pv_arr is not None and qv_arr is not None:
-            show_mse = None
-            show_r2 = None
-            show_rho = None
-        _plot_gene_binned_vs_coord(
-            axes[0, col], A[:, gene_idx], coord,
-            gene_names[gene_idx], coord_label,
-            n_bins=n_bins, min_bin_cells=min_bin_cells,
-            rho=show_rho, color=colors[col],
-            decoder_preds=dp,
-            expression_y_label=expression_y_label,
-            decoder_mse=show_mse,
-            decoder_r2=show_r2,
-        )
-        if pv_arr is not None and qv_arr is not None:
-            axes[0, col].set_title(
-                f"{gene_names[gene_idx]}\np={pv_arr[gene_idx]:.2e}  q={qv_arr[gene_idx]:.2e}",
-                fontsize=9,
-            )
-
-    fig.suptitle(title.format(n_top=n_top), fontsize=11)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-
-    stem = out_path.parent / out_path.stem
-    _save_correlation_distribution_plot(
-        Path(f"{stem}_correlation_distribution.png"),
-        [(coord_label, rhos, "steelblue")],
-    )
-
-    S_plot = (
-        np.asarray(spatial_S, dtype=np.float32)
-        if spatial_S is not None
-        else np.asarray(dataset.S, dtype=np.float32)
-    )
-    spatial_out = out_path.parent / (out_path.stem + "_svg_spatial_expression.png")
-
-    # --- F-test significance CSV (parametric decoders) + companion spatial scatter ---
-    # Spatial panels always use the same top_idx as the binned plot (decoder loss,
-    # or an explicit gene_indices override).  F-test hits stay in the CSV only.
+    svg_result = None
     if decoder_df is not None:
         svg_result = compute_isodepth_sig_genes(
             A, gene_names, decoder_preds, decoder_df,
@@ -3767,24 +3573,119 @@ def save_gene_expression_vs_isodepth_plot(
         stale_csv = out_path.parent / (out_path.stem + "_isodepth_sig_genes.csv")
         if stale_csv.exists():
             stale_csv.unlink()
-    if top_idx.size > 0:
-        try:
-            save_svg_spatial_expression_plots(
-                S_plot, A, gene_names,
-                top_idx,
-                spatial_out,
-                rhos=None if mse is not None else rhos,
-                losses=mse,
-                r2s=r2,
-                expression_meta=dataset.meta,
-                suptitle=(
-                    f"Top genes by encoder-decoder loss — {coord_label}"
-                    if mse is not None
-                    else f"Top Gene Spatial Expression — {coord_label}"
-                ),
+
+    if pvalues is None and svg_result is not None:
+        pvalues = svg_result["pvalues"]
+        qvalues = svg_result["qvalues"]
+
+    restrict_to_sig = bool(significant_only) and gene_indices is None and svg_result is not None
+    if gene_indices is None:
+        if restrict_to_sig:
+            top_idx = _top_genes_by_abs_slope(
+                slopes, n_top_genes, among=svg_result["sig_indices"],
             )
-        except Exception:
-            pass
+            title = (
+                f"Top {{n_top}} significant genes by |OLS slope| vs {coord_label}"
+                f" (BH q < {q_threshold:g})"
+            )
+        else:
+            top_idx = _top_genes_by_abs_slope(slopes, n_top_genes)
+            title = f"Top {{n_top}} genes by |OLS slope| vs {coord_label}"
+    else:
+        top_idx = np.asarray(gene_indices, dtype=np.intp)[: int(n_top_genes)]
+        title = figure_title or f"Selected genes vs {coord_label}"
+
+    stem = out_path.parent / out_path.stem
+    S_plot = (
+        np.asarray(spatial_S, dtype=np.float32)
+        if spatial_S is not None
+        else np.asarray(dataset.S, dtype=np.float32)
+    )
+    spatial_out = out_path.parent / (out_path.stem + "_svg_spatial_expression.png")
+    spatial_title = (
+        f"Top significant genes by |OLS slope| — {coord_label}"
+        if restrict_to_sig
+        else f"Top genes by |OLS slope| — {coord_label}"
+    )
+
+    n_top = len(top_idx)
+    if n_top == 0:
+        _save_correlation_distribution_plot(
+            Path(f"{stem}_correlation_distribution.png"),
+            [(coord_label, rhos, "steelblue")],
+        )
+        placeholder_label = coord_label
+        if restrict_to_sig:
+            placeholder_label = f"{coord_label} (BH q < {q_threshold:g})"
+        _save_no_significant_genes_plot(
+            out_path, q_threshold=q_threshold, coord_label=placeholder_label,
+        )
+        _save_no_significant_genes_plot(
+            spatial_out, q_threshold=q_threshold, coord_label=placeholder_label,
+        )
+        return out_path
+
+    colors = plt.cm.tab10(np.linspace(0.0, 0.9, max(n_top, 1)))
+    fig, axes = plt.subplots(1, n_top, figsize=(4.0 * n_top, 3.6), squeeze=False)
+    annotate_pq = restrict_to_sig or (pvalues is not None and qvalues is not None)
+    pv_arr = np.asarray(pvalues, dtype=np.float64) if annotate_pq and pvalues is not None else None
+    qv_arr = np.asarray(qvalues, dtype=np.float64) if annotate_pq and qvalues is not None else None
+    expression_y_label = _expression_y_axis_label(dataset.meta)
+
+    for col, gene_idx in enumerate(top_idx):
+        dp = (
+            np.asarray(decoder_preds, dtype=np.float64)[:, gene_idx]
+            if decoder_preds is not None else None
+        )
+        show_rho = None if (pv_arr is not None and qv_arr is not None) else float(rhos[gene_idx])
+        show_mse = None if mse is None else float(mse[gene_idx])
+        show_r2 = None if r2 is None else float(r2[gene_idx])
+        show_slope = float(slopes[gene_idx])
+        if pv_arr is not None and qv_arr is not None:
+            show_mse = None
+            show_r2 = None
+            show_rho = None
+        _plot_gene_binned_vs_coord(
+            axes[0, col], A[:, gene_idx], coord,
+            gene_names[gene_idx], coord_label,
+            n_bins=n_bins, min_bin_cells=min_bin_cells,
+            rho=show_rho, color=colors[col],
+            decoder_preds=dp,
+            expression_y_label=expression_y_label,
+            decoder_mse=show_mse,
+            decoder_r2=show_r2,
+            decoder_slope=show_slope,
+        )
+        if pv_arr is not None and qv_arr is not None:
+            axes[0, col].set_title(
+                f"{gene_names[gene_idx]}\n"
+                f"b = {show_slope:.3g}  p={pv_arr[gene_idx]:.2e}  q={qv_arr[gene_idx]:.2e}",
+                fontsize=9,
+            )
+
+    fig.suptitle(title.format(n_top=n_top), fontsize=11)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    _save_correlation_distribution_plot(
+        Path(f"{stem}_correlation_distribution.png"),
+        [(coord_label, rhos, "steelblue")],
+    )
+
+    save_svg_spatial_expression_plots(
+        S_plot, A, gene_names,
+        top_idx,
+        spatial_out,
+        pvalues=pv_arr,
+        qvalues=qv_arr,
+        rhos=None if mse is not None else rhos,
+        losses=mse,
+        r2s=r2,
+        slopes=slopes,
+        expression_meta=dataset.meta,
+        suptitle=spatial_title,
+    )
 
     return out_path
 
@@ -3808,15 +3709,15 @@ def save_gene_expression_vs_coordinates_comparison(
 ) -> Path:
     """4-row × n_top_genes comparison grid.
 
-    Row 0: top isodepth-decoder-loss genes vs isodepth
+    Row 0: top |OLS slope| vs isodepth genes vs isodepth
     Row 1: those same genes vs covariate
-    Row 2: top covariate-decoder-loss genes vs covariate
+    Row 2: top |OLS slope| vs covariate genes vs covariate
     Row 3: those same genes vs isodepth
 
-    Gene ranking uses per-gene MSE of the corresponding decoder (``pred_isodepth``
-    / ``pred_covariate``, or a polynomial stand-in).  The companion spatial
-    grid uses the same gene sets.  Spearman |ρ| is only used when no decoder
-    fit is available.
+    Gene ranking uses the absolute OLS slope of observed expression on the
+    corresponding coordinate.  The companion spatial grid uses the same gene
+    sets and is always written.  Decoder MSE / R² remain panel annotations
+    when a fit is available.
 
     When ``pred_isodepth`` / ``pred_covariate`` are provided (model decoder
     predictions, shape ``(n_cells, G)``), the fit curve shows the actual decoder
@@ -3850,30 +3751,26 @@ def save_gene_expression_vs_coordinates_comparison(
     rhos_cov = _gene_spearman_rhos(A, cov)
     mse_iso, r2_iso = _decoder_fit_stats(A, iso, pred_isodepth, decoder_df)
     mse_cov, r2_cov = _decoder_fit_stats(A, cov, pred_covariate, decoder_df)
-    if mse_iso is not None:
-        top_iso = _top_genes_by_decoder_loss(mse_iso, n_top_genes)
-        iso_rank_label = "decoder loss"
-    else:
-        top_iso = _top_genes_by_abs_rho(rhos_iso, n_top_genes)
-        iso_rank_label = "|Spearman r|"
-    if mse_cov is not None:
-        top_cov = _top_genes_by_decoder_loss(mse_cov, n_top_genes)
-        cov_rank_label = "decoder loss"
-    else:
-        top_cov = _top_genes_by_abs_rho(rhos_cov, n_top_genes)
-        cov_rank_label = "|Spearman r|"
+    slopes_iso = _gene_ols_slopes(A, iso)
+    slopes_cov = _gene_ols_slopes(A, cov)
+    top_iso = _top_genes_by_abs_slope(slopes_iso, n_top_genes)
+    top_cov = _top_genes_by_abs_slope(slopes_cov, n_top_genes)
+    iso_rank_label = "|OLS slope|"
+    cov_rank_label = "|OLS slope|"
     n_top = max(len(top_iso), len(top_cov))
+    if n_top == 0:
+        return out_path
 
     iso_colors = plt.cm.Blues(np.linspace(0.45, 0.85, max(len(top_iso), 1)))
     cov_colors = plt.cm.Greens(np.linspace(0.45, 0.85, max(len(top_cov), 1)))
 
-    # (gene_indices, rhos_to_display, coordinate, x_label, colors, pred_array, mse, r2)
+    # (gene_indices, rhos_to_display, coordinate, x_label, colors, pred_array, mse, r2, slopes)
     # pred_array shape: (n_cells, G) or None
     row_specs = [
-        (top_iso, rhos_iso, iso, isodepth_label, iso_colors, pred_isodepth, mse_iso, r2_iso),
-        (top_iso, rhos_cov, cov, covariate_label, iso_colors, pred_covariate, mse_iso, r2_iso),
-        (top_cov, rhos_cov, cov, covariate_label, cov_colors, pred_covariate, mse_cov, r2_cov),
-        (top_cov, rhos_iso, iso, isodepth_label, cov_colors, pred_isodepth, mse_cov, r2_cov),
+        (top_iso, rhos_iso, iso, isodepth_label, iso_colors, pred_isodepth, mse_iso, r2_iso, slopes_iso),
+        (top_iso, rhos_cov, cov, covariate_label, iso_colors, pred_covariate, mse_iso, r2_iso, slopes_cov),
+        (top_cov, rhos_cov, cov, covariate_label, cov_colors, pred_covariate, mse_cov, r2_cov, slopes_cov),
+        (top_cov, rhos_iso, iso, isodepth_label, cov_colors, pred_isodepth, mse_cov, r2_cov, slopes_iso),
     ]
     row_titles = [
         f"Top {len(top_iso)} isodepth genes ({iso_rank_label}) — vs {isodepth_label}",
@@ -3885,7 +3782,7 @@ def save_gene_expression_vs_coordinates_comparison(
     fig, axes = plt.subplots(4, n_top, figsize=(4.0 * n_top, 3.6 * 4), squeeze=False)
     expression_y_label = _expression_y_axis_label(dataset.meta)
 
-    for row_idx, (gene_indices, rhos_for_row, coord, xlabel, colors, preds, mse_arr, r2_arr) in enumerate(row_specs):
+    for row_idx, (gene_indices, rhos_for_row, coord, xlabel, colors, preds, mse_arr, r2_arr, slope_arr) in enumerate(row_specs):
         for col, gene_idx in enumerate(gene_indices):
             dp = (
                 np.asarray(preds, dtype=np.float64)[:, gene_idx]
@@ -3901,6 +3798,7 @@ def save_gene_expression_vs_coordinates_comparison(
                 expression_y_label=expression_y_label,
                 decoder_mse=None if mse_arr is None else float(mse_arr[gene_idx]),
                 decoder_r2=None if r2_arr is None else float(r2_arr[gene_idx]),
+                decoder_slope=float(slope_arr[gene_idx]),
             )
         for col in range(len(gene_indices), n_top):
             axes[row_idx, col].set_visible(False)
@@ -3945,20 +3843,12 @@ def save_gene_expression_vs_coordinates_comparison(
         else np.asarray(dataset.S, dtype=np.float32)
     )
 
-    # Spatial panels use the same decoder-loss gene sets as the binned plot.
-    iso_spatial_label = (
-        f"Top {isodepth_label} genes  (decoder loss)"
-        if mse_iso is not None
-        else f"Top {isodepth_label} genes  (by |Spearman r|)"
-    )
-    cov_spatial_label = (
-        f"Top {covariate_label} genes  (decoder loss)"
-        if mse_cov is not None
-        else f"Top {covariate_label} genes  (by |Spearman r|)"
-    )
+    # Spatial panels use the same |OLS slope| gene sets as the binned plot.
+    iso_spatial_label = f"Top {isodepth_label} genes  (by |OLS slope|)"
+    cov_spatial_label = f"Top {covariate_label} genes  (by |OLS slope|)"
     spatial_row_specs = [
-        (top_iso, mse_iso, r2_iso, None if mse_iso is not None else rhos_iso, iso_spatial_label),
-        (top_cov, mse_cov, r2_cov, None if mse_cov is not None else rhos_cov, cov_spatial_label),
+        (top_iso, mse_iso, r2_iso, slopes_iso, iso_spatial_label),
+        (top_cov, mse_cov, r2_cov, slopes_cov, cov_spatial_label),
     ]
     if decoder_df is not None:
         iso_svg = compute_isodepth_sig_genes(
@@ -3981,66 +3871,59 @@ def save_gene_expression_vs_coordinates_comparison(
     # columns = individual genes.  Each panel shows cells at (x, y) coloured by
     # gene expression, so the spatial pattern is immediately comparable across
     # the two coordinate systems.
-    try:
-        n_cols = int(n_top_genes)
-        n_rows = len(spatial_row_specs)
-        ps = _point_size(S_plot)
-        expr_label = _expression_label(dataset.meta)
+    n_cols = int(n_top_genes)
+    n_rows = len(spatial_row_specs)
+    ps = _point_size(S_plot)
+    expr_label = _expression_label(dataset.meta)
 
-        fig, axes = plt.subplots(
-            n_rows, n_cols,
-            figsize=(4.5 * n_cols, 4.5 * n_rows),
-            squeeze=False,
-        )
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(4.5 * n_cols, 4.5 * n_rows),
+        squeeze=False,
+    )
 
-        for row_idx, (g_indices, mse_arr, r2_arr, rho_arr, row_label) in enumerate(spatial_row_specs):
-            g_indices = np.asarray(g_indices, dtype=np.intp)
-            ms_arr = np.asarray(mse_arr, dtype=np.float64) if mse_arr is not None else None
-            r2_row = np.asarray(r2_arr, dtype=np.float64) if r2_arr is not None else None
-            rh_arr = np.asarray(rho_arr, dtype=np.float64) if rho_arr is not None else None
-            top = g_indices[:n_cols]
+    for row_idx, (g_indices, mse_arr, r2_arr, slope_arr, row_label) in enumerate(spatial_row_specs):
+        g_indices = np.asarray(g_indices, dtype=np.intp)
+        ms_arr = np.asarray(mse_arr, dtype=np.float64) if mse_arr is not None else None
+        r2_row = np.asarray(r2_arr, dtype=np.float64) if r2_arr is not None else None
+        sl_arr = np.asarray(slope_arr, dtype=np.float64)
+        top = g_indices[:n_cols]
 
-            for col, gene_idx in enumerate(top):
-                ax = axes[row_idx, col]
-                expr = A[:, int(gene_idx)]
-                scatter = ax.scatter(
-                    S_plot[:, 0], S_plot[:, 1],
-                    c=expr, cmap="Reds", s=ps,
-                    linewidths=0, alpha=0.9, rasterized=True,
-                )
-                ax.set_aspect("equal")
-                ax.set_xlabel("x", fontsize=7)
-                ax.set_ylabel("y", fontsize=7)
-                gname = gene_names[int(gene_idx)] if int(gene_idx) < len(gene_names) else f"gene_{gene_idx}"
-                if ms_arr is not None:
-                    r2_val = None if r2_row is None else float(r2_row[int(gene_idx)])
-                    ann = _decoder_loss_annotation(float(ms_arr[int(gene_idx)]), r2_val)
-                elif rh_arr is not None:
-                    ann = f"|Spearman r| = {abs(float(rh_arr[int(gene_idx)])):.3f}"
-                else:
-                    ann = ""
-                ax.set_title(f"{gname}\n{ann}" if ann else gname, fontsize=7)
-                plt.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04, label=expr_label)
-
-            for col in range(len(top), n_cols):
-                axes[row_idx, col].set_visible(False)
-
-            axes[row_idx, 0].set_ylabel(
-                f"{row_label}\n\ny", fontsize=7,
+        for col, gene_idx in enumerate(top):
+            ax = axes[row_idx, col]
+            expr = A[:, int(gene_idx)]
+            scatter = ax.scatter(
+                S_plot[:, 0], S_plot[:, 1],
+                c=expr, cmap="Reds", s=ps,
+                linewidths=0, alpha=0.9, rasterized=True,
             )
+            ax.set_aspect("equal")
+            ax.set_xlabel("x", fontsize=7)
+            ax.set_ylabel("y", fontsize=7)
+            gname = gene_names[int(gene_idx)] if int(gene_idx) < len(gene_names) else f"gene_{gene_idx}"
+            r2_val = None if r2_row is None else float(r2_row[int(gene_idx)])
+            mse_val = None if ms_arr is None else float(ms_arr[int(gene_idx)])
+            ann = _decoder_loss_annotation(mse_val, r2_val, slope=float(sl_arr[int(gene_idx)]))
+            ax.set_title(f"{gname}\n{ann}" if ann else gname, fontsize=7)
+            plt.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04, label=expr_label)
 
-        fig.suptitle(
-            f"Spatial expression — {isodepth_label} | {covariate_label}",
-            fontsize=10, y=1.01,
+        for col in range(len(top), n_cols):
+            axes[row_idx, col].set_visible(False)
+
+        axes[row_idx, 0].set_ylabel(
+            f"{row_label}\n\ny", fontsize=7,
         )
-        fig.tight_layout()
-        fig.savefig(
-            Path(f"{stem}_svg_spatial_expression.png"),
-            dpi=200, bbox_inches="tight",
-        )
-        plt.close(fig)
-    except Exception:
-        pass
+
+    fig.suptitle(
+        f"Spatial expression — {isodepth_label} | {covariate_label}",
+        fontsize=10, y=1.01,
+    )
+    fig.tight_layout()
+    fig.savefig(
+        Path(f"{stem}_svg_spatial_expression.png"),
+        dpi=200, bbox_inches="tight",
+    )
+    plt.close(fig)
 
     return out_path
 
@@ -4073,9 +3956,12 @@ def save_svg_spatial_expression_plots(
     rhos: np.ndarray | None = None,
     losses: np.ndarray | None = None,
     r2s: np.ndarray | None = None,
+    slopes: np.ndarray | None = None,
     expression_meta: dict | None = None,
     n_top: int = 5,
     suptitle: str = "",
+    vmin: float | None = None,
+    vmax: float | None = None,
 ) -> Path:
     """Spatial scatter plots for the top ``n_top`` genes colored by expression.
 
@@ -4085,12 +3971,16 @@ def save_svg_spatial_expression_plots(
 
     Gene selection and panel annotation depend on which statistics are supplied:
 
-    * **Parametric decoders** (``pvalues`` and ``qvalues`` provided): genes are
-      ranked by raw F-test p-value (ascending); each panel shows ``p=...  q=...``.
-      ``gene_indices`` should be the significant-gene subset (q < alpha).
-    * **nn decoder** (``pvalues``/``qvalues`` absent, ``rhos`` provided): genes
-      are displayed in the order supplied in ``gene_indices`` (caller ranks by
-      |rho|); each panel shows |Spearman rho|.
+    * **Slope ranking** (``slopes`` provided): genes are displayed in caller
+      order (typically |OLS slope| among a pre-filtered set); each panel shows
+      ``b = ...`` plus decoder R² / MSE when given.  When ``pvalues`` /
+      ``qvalues`` are also supplied they are appended to the annotation.
+    * **Parametric decoders** (``pvalues`` and ``qvalues`` provided, no slopes):
+      genes are ranked by raw F-test p-value (ascending); each panel shows
+      ``p=...  q=...``.  ``gene_indices`` should be the significant-gene subset
+      (q < alpha).
+    * **nn decoder** (no slopes/pvalues, ``rhos`` provided): genes are displayed
+      in the order supplied in ``gene_indices``; each panel shows |Spearman rho|.
 
     Parameters
     ----------
@@ -4099,13 +3989,15 @@ def save_svg_spatial_expression_plots(
     gene_names   : length-G list of gene name strings.
     gene_indices : gene indices (into G columns of A) to consider.
     out_path     : destination PNG path.
-    pvalues      : (G,) raw F-test p-values — ranking/annotation when no losses.
+    pvalues      : (G,) raw F-test p-values — ranking/annotation when no slopes.
     qvalues      : (G,) BH q-values — used for annotation only.
-    rhos         : (G,) |Spearman rho| values — used when losses/pvalues absent.
-    losses       : (G,) per-gene decoder MSE — preferred ranking/annotation.
-    r2s          : (G,) per-gene decoder R² — annotation when losses are set.
+    rhos         : (G,) |Spearman rho| values — used when slopes/pvalues absent.
+    losses       : (G,) per-gene decoder MSE — annotation when slopes are set.
+    r2s          : (G,) per-gene decoder R² — annotation when slopes/losses set.
+    slopes       : (G,) per-gene OLS slopes — preferred ranking/annotation.
     n_top        : maximum panels to display (default 5).
     suptitle     : optional figure super-title.
+    vmin, vmax   : optional shared color limits; omit for per-gene auto-scale.
     """
     out_path = Path(out_path)
     S = np.asarray(S, dtype=np.float32)
@@ -4121,11 +4013,12 @@ def save_svg_spatial_expression_plots(
     rho_arr = np.asarray(rhos, dtype=np.float64) if rhos is not None else None
     loss_arr = np.asarray(losses, dtype=np.float64) if losses is not None else None
     r2_arr = np.asarray(r2s, dtype=np.float64) if r2s is not None else None
+    slope_arr = np.asarray(slopes, dtype=np.float64) if slopes is not None else None
 
-    # Ranking: decoder loss, else F-test p-value, else caller order
-    if loss_arr is not None:
-        order = np.argsort(loss_arr[gene_indices])
-        top_indices = gene_indices[order[: int(n_top)]]
+    # Display in caller order when slopes are supplied (1D plot already ranked
+    # by |OLS slope|).  Otherwise F-test p-value, else caller order.
+    if slope_arr is not None:
+        top_indices = gene_indices[: int(n_top)]
     elif pv_arr is not None:
         order = np.argsort(pv_arr[gene_indices])
         top_indices = gene_indices[order[: int(n_top)]]
@@ -4141,8 +4034,7 @@ def save_svg_spatial_expression_plots(
     for col, gene_idx in enumerate(top_indices):
         ax = axes_flat[col]
         expr = A[:, int(gene_idx)]
-        scatter = ax.scatter(
-            S[:, 0], S[:, 1],
+        scatter_kwargs: dict[str, Any] = dict(
             c=expr,
             cmap="Reds",
             s=ps,
@@ -4150,19 +4042,28 @@ def save_svg_spatial_expression_plots(
             alpha=0.9,
             rasterized=True,
         )
+        if vmin is not None:
+            scatter_kwargs["vmin"] = float(vmin)
+        if vmax is not None:
+            scatter_kwargs["vmax"] = float(vmax)
+        scatter = ax.scatter(S[:, 0], S[:, 1], **scatter_kwargs)
         ax.set_aspect("equal")
         ax.set_xlabel("x", fontsize=8)
         ax.set_ylabel("y", fontsize=8)
         gname = gene_names[int(gene_idx)] if int(gene_idx) < len(gene_names) else f"gene_{gene_idx}"
-        if loss_arr is not None:
+        slope_val = None if slope_arr is None else float(slope_arr[int(gene_idx)])
+        bits: list[str] = []
+        if slope_arr is not None or loss_arr is not None:
             r2_val = None if r2_arr is None else float(r2_arr[int(gene_idx)])
-            annotation = _decoder_loss_annotation(float(loss_arr[int(gene_idx)]), r2_val)
-        elif pv_arr is not None and qv_arr is not None:
-            annotation = f"p={pv_arr[int(gene_idx)]:.2e}  q={qv_arr[int(gene_idx)]:.2e}"
-        elif rho_arr is not None:
-            annotation = f"|Spearman r| = {abs(float(rho_arr[int(gene_idx)])):.3f}"
-        else:
-            annotation = ""
+            mse_val = None if loss_arr is None else float(loss_arr[int(gene_idx)])
+            ann = _decoder_loss_annotation(mse_val, r2_val, slope=slope_val)
+            if ann:
+                bits.append(ann)
+        if pv_arr is not None and qv_arr is not None:
+            bits.append(f"p={pv_arr[int(gene_idx)]:.2e}  q={qv_arr[int(gene_idx)]:.2e}")
+        elif rho_arr is not None and slope_arr is None:
+            bits.append(f"|Spearman r| = {abs(float(rho_arr[int(gene_idx)])):.3f}")
+        annotation = "  ".join(bits)
         ax.set_title(f"{gname}\n{annotation}" if annotation else gname, fontsize=8)
         plt.colorbar(scatter, ax=ax, fraction=0.046, pad=0.04, label=expr_label)
 
@@ -4404,8 +4305,9 @@ def save_visium_pseudobulk_overlay(
     """Original cells with Visium hex lattice and circular capture footprints.
 
     Grey points are cells that fall in the inter-spot gaps. Coloured points are
-    aggregated into a spot. Solid hexes + circles are occupied captures; dashed
-    hexes are in-tissue spots that received no cells.
+    aggregated into a spot. Solid hexes + circles are occupied captures (hexes
+    may hang past the tissue mask). Dashed hexes overlap tissue but received no
+    cells.
     """
     from matplotlib.patches import Circle
 
@@ -4584,193 +4486,6 @@ def save_permutation_null_comparison(
     if run_name:
         title_parts[0] = f"Permutation null comparison — {run_name}"
     fig.suptitle(title_parts[0], fontsize=11)
-    fig.tight_layout()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return out_path
-
-
-def save_msr_surrogate_example_plot(
-    dataset: "DatasetBundle",
-    result: "TestResult",
-    out_path: "str | Path",
-    *,
-    n_genes: int = 5,
-) -> "Path | None":
-    """Two-row spatial scatter: real expression (row 1) vs MSR surrogate (row 2).
-
-    Genes are selected by descending absolute Spearman correlation with the
-    true isodepth, giving the most spatially structured genes.
-
-    Parameters
-    ----------
-    dataset : DatasetBundle with the real expression matrix (``dataset.A``).
-    result : TestResult with ``artifacts["msr_surrogate_example"]`` and
-             ``artifacts["true_isodepth"]``.
-    out_path : destination path for the PNG.
-    n_genes : number of top genes to display (default 5).
-    """
-    A_surr = result.artifacts.get("msr_surrogate_example")
-    true_isodepth = result.artifacts.get("true_isodepth")
-    if A_surr is None or true_isodepth is None:
-        return None
-
-    out_path = Path(out_path)
-    A_real = np.asarray(dataset.A, dtype=np.float32)
-    A_surr = np.asarray(A_surr, dtype=np.float32)
-    isodepth = np.asarray(true_isodepth, dtype=np.float32).reshape(-1)
-    S = np.asarray(dataset.S, dtype=np.float32)
-    G = A_real.shape[1]
-    n_genes = min(int(n_genes), G)
-
-    # rank genes by |Spearman r| with isodepth
-    rhos = np.array(
-        [float(abs(spearmanr(isodepth, A_real[:, g]).statistic)) for g in range(G)],
-        dtype=np.float32,
-    )
-    top_indices = np.argsort(rhos)[::-1][:n_genes]
-
-    gene_names = dataset.meta.get("var_names") or dataset.meta.get("gene_names", [])
-    ps = _point_size(S)
-    color_limits = []
-    for g_idx in top_indices:
-        combined = np.concatenate(
-            [A_real[:, int(g_idx)], A_surr[:, int(g_idx)]]
-        )
-        vmin, vmax = float(combined.min()), float(combined.max())
-        if vmax <= vmin:
-            vmax = vmin + 1e-8
-        color_limits.append((vmin, vmax))
-
-    fig, axes = plt.subplots(2, n_genes, figsize=(4.5 * n_genes, 8.0))
-    if n_genes == 1:
-        axes = axes.reshape(2, 1)
-
-    row_labels = ["Real expression", "MSR surrogate"]
-    row_data = [A_real, A_surr]
-
-    for row, (label, A_row) in enumerate(zip(row_labels, row_data)):
-        for col, g_idx in enumerate(top_indices):
-            ax = axes[row, col]
-            expr = A_row[:, int(g_idx)]
-            vmin, vmax = color_limits[col]
-            sc = ax.scatter(
-                S[:, 0], S[:, 1],
-                c=expr,
-                cmap="Reds",
-                vmin=vmin, vmax=vmax,
-                s=ps,
-                linewidths=0,
-                alpha=0.9,
-                rasterized=True,
-            )
-            ax.set_aspect("equal")
-            ax.set_xlabel("x", fontsize=7)
-            ax.tick_params(labelsize=6)
-            plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-            if row == 0:
-                gname = (
-                    gene_names[int(g_idx)]
-                    if int(g_idx) < len(gene_names)
-                    else f"gene_{g_idx}"
-                )
-                ax.set_title(f"{gname}\n|r|={rhos[int(g_idx)]:.3f}", fontsize=8)
-            if col == 0:
-                ax.set_ylabel(f"{label}\n\ny", fontsize=7)
-            else:
-                ax.set_ylabel("y", fontsize=7)
-
-    fig.suptitle(
-        "MSR surrogate example — real vs surrogate expression (top genes by Spearman |r|)",
-        fontsize=10,
-    )
-    fig.tight_layout()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    return out_path
-
-
-def save_fourier_surrogate_example_plot(
-    dataset: "DatasetBundle",
-    result: "TestResult",
-    out_path: "str | Path",
-    *,
-    n_genes: int = 5,
-) -> "Path | None":
-    """Two-row spatial scatter: real expression vs Fourier phase-randomized surrogate."""
-    A_surr = result.artifacts.get("fourier_surrogate_example")
-    true_isodepth = result.artifacts.get("true_isodepth")
-    if A_surr is None or true_isodepth is None:
-        return None
-
-    out_path = Path(out_path)
-    A_real = np.asarray(dataset.A, dtype=np.float32)
-    A_surr = np.asarray(A_surr, dtype=np.float32)
-    isodepth = np.asarray(true_isodepth, dtype=np.float32).reshape(-1)
-    S = np.asarray(dataset.S, dtype=np.float32)
-    G = A_real.shape[1]
-    n_genes = min(int(n_genes), G)
-
-    rhos = np.array(
-        [float(abs(spearmanr(isodepth, A_real[:, g]).statistic)) for g in range(G)],
-        dtype=np.float32,
-    )
-    top_indices = np.argsort(rhos)[::-1][:n_genes]
-    gene_names = dataset.meta.get("var_names") or dataset.meta.get("gene_names", [])
-    ps = _point_size(S)
-    color_limits = []
-    for g_idx in top_indices:
-        combined = np.concatenate([A_real[:, int(g_idx)], A_surr[:, int(g_idx)]])
-        vmin, vmax = float(combined.min()), float(combined.max())
-        if vmax <= vmin:
-            vmax = vmin + 1e-8
-        color_limits.append((vmin, vmax))
-
-    fig, axes = plt.subplots(2, n_genes, figsize=(4.5 * n_genes, 8.0))
-    if n_genes == 1:
-        axes = axes.reshape(2, 1)
-
-    row_labels = ["Real expression", "Fourier surrogate"]
-    row_data = [A_real, A_surr]
-    for row, (label, A_row) in enumerate(zip(row_labels, row_data)):
-        for col, g_idx in enumerate(top_indices):
-            ax = axes[row, col]
-            expr = A_row[:, int(g_idx)]
-            vmin, vmax = color_limits[col]
-            sc = ax.scatter(
-                S[:, 0],
-                S[:, 1],
-                c=expr,
-                cmap="Reds",
-                vmin=vmin,
-                vmax=vmax,
-                s=ps,
-                linewidths=0,
-                alpha=0.9,
-                rasterized=True,
-            )
-            ax.set_aspect("equal")
-            ax.set_xlabel("x", fontsize=7)
-            ax.tick_params(labelsize=6)
-            plt.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-            if row == 0:
-                gname = (
-                    gene_names[int(g_idx)]
-                    if int(g_idx) < len(gene_names)
-                    else f"gene_{g_idx}"
-                )
-                ax.set_title(f"{gname}\n|r|={rhos[int(g_idx)]:.3f}", fontsize=8)
-            if col == 0:
-                ax.set_ylabel(f"{label}\n\ny", fontsize=7)
-            else:
-                ax.set_ylabel("y", fontsize=7)
-
-    fig.suptitle(
-        "Fourier spectral randomization — real vs phase-randomized expression",
-        fontsize=10,
-    )
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -4972,8 +4687,8 @@ def _pvalue_trajectory_from_slots(
     that fixed trajectory's loss at each epoch, so this traces how the *actual*
     kept models ranked against each other over the course of training, rather than
     re-selecting the best rerun independently at every epoch. For
-    ``nll_gaussian_mse`` the recorded history is MSE, which is rank-equivalent to
-    the Gaussian-NLL test statistic.
+    ``nll_gaussian_mse`` both the recorded history and the null-distribution
+    statistic are MSE (rank-equivalent to homoscedastic Gaussian NLL).
     """
     per_slot = np.asarray(per_slot, dtype=np.float64)
     if per_slot.ndim != 2 or per_slot.shape[0] == 0 or per_slot.shape[1] == 0:
@@ -4997,7 +4712,9 @@ def save_loss_curve_plot(
     *,
     title: str | None = None,
 ) -> Path | None:
-    """Save training loss vs epoch; faded permutation curves behind the true curve.
+    """Save training metric vs epoch; faded permutation curves behind the true curve.
+
+    The y-axis uses :func:`metric_axis_label` (MSE for ``nll_gaussian_mse``).
 
     When per-slot loss history is available, the plotted "True" curve and the
     permutation curves both use the min-over-reruns selection at each epoch
@@ -5034,10 +4751,11 @@ def save_loss_curve_plot(
         ax.plot([], [], color="0.55", alpha=min(0.8, alpha * 4.0), linewidth=1.2, label=f"Permutations (n={n_perms})")
 
     true_label = "True (best rerun)" if perm_curves is not None or per_slot is not None else "True"
+    axis = metric_axis_label(result.metric)
     ax.plot(epochs, losses, color="steelblue", linewidth=1.8, zorder=3, label=true_label)
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("Train loss")
-    ax.set_title(title or "Training loss by epoch")
+    ax.set_ylabel(f"Train {axis}")
+    ax.set_title(title or f"Training {axis} by epoch")
     ax.grid(alpha=0.25, linewidth=0.6)
 
     p_traj = (
@@ -5069,5 +4787,245 @@ def save_loss_curve_plot(
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return out_path
+
+
+def save_variogram_matching_plots(
+    diagnostics: dict[str, Any],
+    out_dir: "str | Path",
+) -> dict[str, str]:
+    """Write variogram-matching figures into ``out_dir / variogram-matching``."""
+    if not diagnostics:
+        return {}
+    out_dir = Path(out_dir)
+    vm_dir = out_dir / "variogram-matching"
+    vm_dir.mkdir(parents=True, exist_ok=True)
+    paths: dict[str, str] = {}
+
+    lag_centers = np.asarray(diagnostics["lag_centers"], dtype=np.float64)
+    max_dist = float(diagnostics["max_dist"])
+    coords = np.asarray(diagnostics["coords"], dtype=np.float64)
+    gene_names = list(diagnostics["plot_gene_names"])
+    n_plot = len(gene_names)
+    n_cols = 5
+    n_rows = int(np.ceil(n_plot / n_cols))
+
+    variogram_real = np.asarray(diagnostics["variogram_real"], dtype=np.float64)
+    variogram_permuted = np.asarray(diagnostics["variogram_permuted"], dtype=np.float64)
+    variogram_final = np.asarray(diagnostics["variogram_final"], dtype=np.float64)
+    fitted = np.asarray(diagnostics["fitted_variograms_candidates"], dtype=np.float64)
+    algorithm_version = int(diagnostics.get("algorithm_version", 2))
+    realized_candidates = diagnostics.get("realized_variograms_candidates")
+    plot_realized = algorithm_version >= 3 and realized_candidates is not None
+    if plot_realized:
+        realized_candidates = np.asarray(realized_candidates, dtype=np.float64)
+    blur_mode = str(diagnostics.get("variogram_blur_mode", "uniform"))
+    if "candidate_labels" in diagnostics:
+        candidates = np.asarray(diagnostics["candidate_labels"], dtype=np.float64)
+    elif blur_mode == "adaptive":
+        candidates = np.asarray(diagnostics["nn_candidates"], dtype=np.float64)
+    else:
+        candidates = np.asarray(diagnostics["sigma_multiples"], dtype=np.float64)
+    if "best_candidate_per_plot_gene" in diagnostics:
+        best_cand = np.asarray(diagnostics["best_candidate_per_plot_gene"], dtype=np.float64)
+    elif blur_mode == "adaptive":
+        best_cand = np.asarray(diagnostics["best_nn_per_plot_gene"], dtype=np.float64)
+    else:
+        best_cand = np.asarray(diagnostics["best_multiplier_per_plot_gene"], dtype=np.float64)
+    cand_label = "nn" if blur_mode == "adaptive" else "d"
+    title_suffix = "nn" if blur_mode == "adaptive" else "sigma"
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 4 * n_rows), constrained_layout=True)
+    axes_flat = np.atleast_1d(axes).ravel()
+    colors = plt.colormaps["viridis"](np.linspace(0, 1, len(candidates)))
+    for j, (ax, gene) in enumerate(zip(axes_flat[:n_plot], gene_names)):
+        for k, value in enumerate(candidates):
+            if plot_realized:
+                ax.plot(
+                    lag_centers,
+                    realized_candidates[k, :, j],
+                    color=colors[k],
+                    linewidth=1.6,
+                    label=f"{cand_label}={value:g}",
+                )
+                ax.plot(
+                    lag_centers,
+                    fitted[k, :, j],
+                    color=colors[k],
+                    linewidth=1.0,
+                    linestyle=":",
+                    label=("Theoretical fit" if k == 0 else None),
+                )
+            else:
+                ax.plot(
+                    lag_centers,
+                    fitted[k, :, j],
+                    color=colors[k],
+                    linewidth=1.2,
+                    label=f"{cand_label}={value:g}",
+                )
+        ax.plot(
+            lag_centers, variogram_real[:, j], "o-", color="firebrick",
+            linewidth=2.2, markersize=4, label="Real",
+        )
+        ax.plot(
+            lag_centers, variogram_permuted[:, j], "s--", color="slategray",
+            markersize=3, label="Permuted",
+        )
+        ax.set(
+            title=f"{gene} | best {cand_label}={best_cand[j]:g}",
+            xlabel="Distance (bin midpoint)",
+            ylabel="Semivariance",
+            xlim=(0, max_dist),
+        )
+        ax.set_ylim(bottom=0)
+        ax.grid(alpha=0.2)
+    for ax in axes_flat[n_plot:]:
+        ax.axis("off")
+    handles, labels = axes_flat[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="outside lower center", ncol=6, frameon=False)
+    if plot_realized:
+        family = "Adaptive locfit nn" if blur_mode == "adaptive" else "Uniform Gaussian bandwidth"
+        cand_title = (
+            f"{family} candidates — realized final-surrogate variograms "
+            "(dotted: coefficient fit)"
+        )
+    else:
+        cand_title = (
+            "Adaptive locfit nn candidates — coefficient-fit variograms "
+            f"(algorithm version {algorithm_version})"
+            if blur_mode == "adaptive"
+            else "Uniform Gaussian bandwidth candidates — coefficient-fit variograms "
+            f"(algorithm version {algorithm_version})"
+        )
+    fig.suptitle(cand_title, fontsize=16)
+    cand_path = vm_dir / "variogram_candidates.png"
+    fig.savefig(cand_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    paths["variogram_candidates"] = str(cand_path)
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 4 * n_rows), constrained_layout=True)
+    axes_flat = np.atleast_1d(axes).ravel()
+    for j, (ax, gene) in enumerate(zip(axes_flat[:n_plot], gene_names)):
+        ax.plot(lag_centers, variogram_real[:, j], "o-", color="firebrick", label="Real")
+        ax.plot(
+            lag_centers, variogram_permuted[:, j], "s--", color="slategray", label="Permuted"
+        )
+        ax.plot(
+            lag_centers, variogram_final[:, j], "^-", color="teal", label="Final surrogate"
+        )
+        ax.set(
+            title=f"{gene} | optimal {title_suffix}={best_cand[j]:g}",
+            xlabel="Distance (bin midpoint)",
+            ylabel="Semivariance",
+            xlim=(0, max_dist),
+        )
+        ax.set_ylim(bottom=0)
+        ax.grid(alpha=0.2)
+        ax.legend(frameon=False, fontsize=8)
+    for ax in axes_flat[n_plot:]:
+        ax.axis("off")
+    final_scale = (
+        "surrogate on input expression scale"
+        if diagnostics.get("variance_matching") == "input_gene_moments"
+        else "z-scored surrogate"
+    )
+    fig.suptitle(f"Best variogram match — final {final_scale} (perm slot 1)", fontsize=16)
+    best_path = vm_dir / "variogram_best_match.png"
+    fig.savefig(best_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    paths["variogram_best_match"] = str(best_path)
+
+    x_true = np.asarray(diagnostics["X_true"], dtype=np.float64)
+    x_perm = np.asarray(diagnostics["X_permuted"], dtype=np.float64)
+    y_blur = np.asarray(diagnostics["Y_blurred_best"], dtype=np.float64)
+    x_final = np.asarray(diagnostics["X_final"], dtype=np.float64)
+    spatial_min = coords.min(axis=0)
+    spatial_max = coords.max(axis=0)
+    spatial_pad = 0.03 * (spatial_max - spatial_min)
+
+    for start in range(0, n_plot, 5):
+        chunk = range(start, min(start + 5, n_plot))
+        fig, axes = plt.subplots(
+            len(chunk), 4, figsize=(22, 4.2 * len(chunk)),
+            constrained_layout=True, squeeze=False,
+        )
+        for row, j in enumerate(chunk):
+            fields = (x_true[:, j], x_perm[:, j], y_blur[:, j], x_final[:, j])
+            blur_tag = f"{cand_label}={best_cand[j]:g}"
+            labels = (
+                "True",
+                "Permuted",
+                f"Blurred ({blur_tag})",
+                "Final surrogate",
+            )
+            shared_min = min(float(fields[k].min()) for k in (0, 1, 3))
+            shared_max = max(float(fields[k].max()) for k in (0, 1, 3))
+            for column, (ax, field, label) in enumerate(zip(axes[row], fields, labels)):
+                vmin, vmax = (
+                    (float(field.min()), float(field.max())) if column == 2
+                    else (shared_min, shared_max)
+                )
+                if vmax <= vmin:
+                    vmax = vmin + 1e-12
+                points = ax.scatter(
+                    coords[:, 0], coords[:, 1], c=field, cmap="Reds",
+                    vmin=vmin, vmax=vmax, s=5, linewidths=0, rasterized=True,
+                )
+                ax.set(
+                    title=f"{gene_names[j]} — {label}",
+                    xlabel="Spatial x", ylabel="Spatial y",
+                    xlim=(spatial_min[0] - spatial_pad[0], spatial_max[0] + spatial_pad[0]),
+                    ylim=(spatial_min[1] - spatial_pad[1], spatial_max[1] + spatial_pad[1]),
+                )
+                ax.set_aspect("equal", adjustable="box")
+                fig.colorbar(
+                    points, ax=ax, shrink=0.8, pad=0.025,
+                    label=("Raw blur (own scale)" if column == 2 else "Expression scale (shared)"),
+                )
+        fig.suptitle(
+            "True, permutation, best blur, and final surrogate (perm slot 1)",
+            fontsize=16,
+        )
+        spatial_name = f"spatial_genes_{start + 1:02d}-{min(start + 5, n_plot):02d}.png"
+        spatial_path = vm_dir / spatial_name
+        fig.savefig(spatial_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        paths[spatial_name.replace(".png", "")] = str(spatial_path)
+
+    csv_path = vm_dir / "selected_sigma_summary.csv"
+    intercept = np.asarray(diagnostics["intercept_best_plot"], dtype=np.float64)
+    slope = np.asarray(diagnostics["slope_best_plot"], dtype=np.float64)
+    sse = np.asarray(diagnostics["sse_best_plot"], dtype=np.float64)
+    with csv_path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        col_name = "optimal_nn" if blur_mode == "adaptive" else "optimal_multiplier"
+        coefficient_sse = diagnostics.get("coefficient_sse_best_plot")
+        header = ["gene", col_name, "intercept", "slope", "selection_SSE"]
+        if coefficient_sse is not None:
+            header.append("coefficient_SSE")
+            coefficient_sse = np.asarray(coefficient_sse, dtype=np.float64)
+        writer.writerow(header)
+        for j, gene in enumerate(gene_names):
+            row = [gene, best_cand[j], intercept[j], slope[j], sse[j]]
+            if coefficient_sse is not None:
+                row.append(coefficient_sse[j])
+            writer.writerow(row)
+        writer.writerow([])
+        writer.writerow(["selection_counts_across_all_genes_and_perms"])
+        count_cols = np.asarray(
+            diagnostics.get("selection_counts_columns", candidates), dtype=np.float64
+        )
+        counts = np.asarray(diagnostics["selection_counts"], dtype=np.int64)
+        writer.writerow(["multiplier"] + [str(m) for m in count_cols])
+        writer.writerow(
+            ["total_selections"] + [int(counts[:, k].sum()) for k in range(len(count_cols))]
+        )
+    paths["selected_sigma_summary"] = str(csv_path)
+    # Keep numerical diagnostics so fit quality and marginal variance can be
+    # checked later without regenerating random surrogates from a newer method.
+    diagnostics_path = vm_dir / "diagnostics.npz"
+    np.savez_compressed(diagnostics_path, **diagnostics)
+    paths["diagnostics"] = str(diagnostics_path)
+    return paths
 
 

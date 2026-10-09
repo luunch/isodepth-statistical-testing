@@ -10,6 +10,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 
+from experiments.core.study_spec import add_spec_argument
 from experiments.studies.kernel_noise.study import (
     KernelNoiseStudySpec,
     analysis_dir_for_spec,
@@ -281,7 +282,7 @@ def analyze_kernel_noise_study(spec_path: str | Path, *, plots_only: bool = Fals
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Analyze kernel-noise study outputs.")
-    parser.add_argument("--spec", required=True, help="Path to configs/experiments/kernel_noise_study.json")
+    add_spec_argument(parser, help="Path to configs/experiments/kernel_noise_study.json")
     parser.add_argument(
         "--plots-only",
         action="store_true",

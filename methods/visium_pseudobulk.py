@@ -6,9 +6,13 @@ spots spaced ``test.visium_spot_distance_um`` apart (default 100 µm), matching 
 10x Visium array geometry. Only points within ``test.visium_spot_diameter_um / 2``
 (default 27.5 µm, i.e. a 55 µm-diameter spot) of a spot center are aggregated into
 that spot; cells that fall in the gaps between spots are dropped, exactly as they
-would be for a real Visium capture area. Spots whose full circular footprint would
-extend outside the tissue mask are discarded up front to avoid edge artifacts from
-partially-covered boundary spots.
+would be for a real Visium capture area.
+
+The hex lattice *overtiles* the tissue mask: a candidate spot is kept if any part
+of its capture circle overlaps tissue, even when the hex/circle hangs off the
+mask. A cell is captured iff it lands in some 55 µm circle. Empty overlapping
+hexes (no cell in the circle) stay in the overlay but are not emitted as
+pseudospots.
 """
 from __future__ import annotations
 
@@ -124,19 +128,22 @@ def _circle_sample_points(center_xy: np.ndarray, radius: float, n_samples: int =
     return np.concatenate([center_xy[:, None, :], boundary], axis=1)  # (n_spots, n_samples+1, 2)
 
 
-def _spots_fully_in_tissue(
+def _spots_overlapping_tissue(
     centers_native: np.ndarray,
     *,
     spot_radius_native: float,
     membership_fn,
 ) -> np.ndarray:
-    """Boolean mask: True where every sampled point of the spot's circle is in tissue."""
+    """Boolean mask: True where any sampled point of the spot's circle is in tissue.
+
+    This overtills the mask: hexes/circles may hang past the tissue boundary.
+    """
     sample_points = _circle_sample_points(centers_native, spot_radius_native)
     n_spots, n_points, _ = sample_points.shape
     flat = sample_points.reshape(n_spots * n_points, 2)
     in_tissue_flat = membership_fn(flat)
     in_tissue = np.asarray(in_tissue_flat, dtype=bool).reshape(n_spots, n_points)
-    return in_tissue.all(axis=1)
+    return in_tissue.any(axis=1)
 
 
 def _aggregate_vectors(
@@ -181,7 +188,9 @@ def _expression_preprocessing_from_meta(dataset: DatasetBundle, config: TestConf
         pp.setdefault("log1p", bool(dataset.meta.get("log1p", True)))
         pp.setdefault("standardize_expression", bool(dataset.meta.get("standardize_expression", True)))
     pp.setdefault("min_cells_per_gene", int(dataset.meta.get("min_cells_per_gene", 0)))
+    pp.setdefault("min_sparsity_percentage", float(dataset.meta.get("min_sparsity_percentage", 0.0)))
     pp.setdefault("top_var_genes", int(dataset.meta.get("top_var_genes", 0)))
+    pp.setdefault("n_expression_pcs", int(dataset.meta.get("n_expression_pcs", 0)))
     pp.setdefault("q", dataset.meta.get("q"))
     pp.setdefault("seed", int(dataset.meta.get("seed", config.seed)))
     return pp
@@ -204,10 +213,12 @@ def _transform_pseudobulk_expression(
     transformed, transform_meta = apply_expression_transforms(
         A_sum,
         min_cells_per_gene=int(pp.get("min_cells_per_gene", 0)),
+        min_sparsity_percentage=float(pp.get("min_sparsity_percentage", 0.0)),
         normalize_total=bool(pp.get("normalize_total", True)),
         log1p=bool(pp.get("log1p", True)),
         standardize_expression=bool(pp.get("standardize_expression", True)),
         q=pp.get("q"),
+        n_expression_pcs=int(pp.get("n_expression_pcs", 0) or 0),
         seed=int(pp.get("seed", config.seed)),
         return_metadata=True,
     )
@@ -234,9 +245,10 @@ def build_visium_pseudobulk_dataset(
     """Aggregate cells into a Visium-style array of fixed-diameter circular pseudospots.
 
     Cells that fall outside every spot's circle (the inter-spot gaps) are dropped.
-    Spots whose full circular footprint would extend past the tissue mask are dropped
-    up front. Cell-type modes keep types as separate pseudospots via a ``(cell_type,
-    spot_id)`` grouping key, matching ``methods.binning``.
+    The hex lattice overtills the tissue: spots whose circles hang past the mask
+    are kept if they still overlap tissue, and a cell is captured iff it falls in
+    a circle. Cell-type modes keep types as separate pseudospots via a
+    ``(cell_type, spot_id)`` grouping key, matching ``methods.binning``.
     """
     dataset.validate()
     config.validate()
@@ -259,11 +271,14 @@ def build_visium_pseudobulk_dataset(
         seed=int(config.seed),
         spacing_um=spacing_um,
     )
+    # Pad by one capture radius so lattice centers can sit outside the cell bbox
+    # and still catch edge cells (overtile / overhang).
+    overtile_pad_um = float(spot_radius_um)
     q_range, r_range = _qr_range_for_bbox(
-        x_min=float(S_um[:, 0].min()) - origin_um[0],
-        x_max=float(S_um[:, 0].max()) - origin_um[0],
-        y_min=float(S_um[:, 1].min()) - origin_um[1],
-        y_max=float(S_um[:, 1].max()) - origin_um[1],
+        x_min=float(S_um[:, 0].min()) - origin_um[0] - overtile_pad_um,
+        x_max=float(S_um[:, 0].max()) - origin_um[0] + overtile_pad_um,
+        y_min=float(S_um[:, 1].min()) - origin_um[1] - overtile_pad_um,
+        y_max=float(S_um[:, 1].max()) - origin_um[1] + overtile_pad_um,
         radius_units=radius_units_um,
     )
     candidate_centers_um = _hex_lattice_centers(
@@ -277,24 +292,26 @@ def build_visium_pseudobulk_dataset(
     if membership_fn is not None:
         candidate_centers_native = candidate_centers_um / float(um_per_unit)
         spot_radius_native = spot_radius_um / float(um_per_unit)
-        in_tissue = _spots_fully_in_tissue(
+        overlaps_tissue = _spots_overlapping_tissue(
             candidate_centers_native,
             spot_radius_native=spot_radius_native,
             membership_fn=membership_fn,
         )
     else:
-        density_membership_fn = _density_tissue_membership_fn(S_um)
-        in_tissue = _spots_fully_in_tissue(
+        density_membership_fn = _density_tissue_membership_fn(
+            S_um, radius_um=config.visium_tissue_radius_um
+        )
+        overlaps_tissue = _spots_overlapping_tissue(
             candidate_centers_um,
             spot_radius_native=spot_radius_um,
             membership_fn=density_membership_fn,
         )
-    valid_centers_um = candidate_centers_um[in_tissue]
+    valid_centers_um = candidate_centers_um[overlaps_tissue]
 
     if valid_centers_um.shape[0] == 0:
         raise ValueError(
-            "test.method='visium_pseudobulk' found no spot whose full circular footprint "
-            "fits inside the tissue mask; check visium_spot_distance_um/visium_spot_diameter_um "
+            "test.method='visium_pseudobulk' found no spot whose capture circle "
+            "overlaps the tissue mask; check visium_spot_distance_um/visium_spot_diameter_um "
             "relative to the tissue extent."
         )
 
@@ -356,6 +373,7 @@ def build_visium_pseudobulk_dataset(
         "original_n_cells": int(dataset.n_cells),
         "n_candidate_spots": int(candidate_centers_um.shape[0]),
         "n_spots_in_tissue": n_original_spots,
+        "overtile": True,
         "n_pseudospots": int(n_bins),
         "n_cells_dropped_in_gaps": n_dropped_cells,
         "fraction_cells_dropped_in_gaps": float(n_dropped_cells) / float(dataset.n_cells),
@@ -398,6 +416,8 @@ def build_visium_pseudobulk_dataset(
         meta["normalize_total"] = bool(transform_meta.get("normalize_total", False))
         meta["log1p"] = bool(transform_meta.get("log1p", False))
         meta["standardize_expression"] = bool(transform_meta.get("standardize_expression", False))
+        meta.setdefault("n_genes_input", int(A_sum.shape[1]))
+        meta["n_genes_kept"] = int(np.asarray(transform_meta["gene_keep_mask"]).sum())
 
     if var_names is not None:
         meta["var_names"] = list(var_names)

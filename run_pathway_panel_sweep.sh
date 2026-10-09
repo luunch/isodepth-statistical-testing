@@ -3,7 +3,7 @@
 #SBATCH --mem=64G
 #SBATCH --time=1-00:00:00
 #SBATCH --gres=gpu:1
-#SBATCH --partition=a100
+#SBATCH --partition=l40s
 #SBATCH --cpus-per-task=4
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ajain71@jh.edu

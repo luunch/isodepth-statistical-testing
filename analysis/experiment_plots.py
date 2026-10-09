@@ -6,6 +6,8 @@ from typing import Iterable, Mapping
 import matplotlib.pyplot as plt
 import numpy as np
 
+from methods.metrics import metric_axis_label
+
 
 def _sort_sigma(values: Iterable[float]) -> list[float]:
     return sorted({float(value) for value in values})
@@ -312,12 +314,14 @@ def save_repeat_true_loss_plot(
     rows: Iterable[Mapping[str, object]],
     out_path: str | Path,
     *,
-    title: str = "True Loss by Repeat",
+    metric: str = "nll_gaussian_mse",
+    title: str | None = None,
 ) -> Path | None:
     ordered_rows = sorted(rows, key=lambda row: int(row["repeat_index"]))
     if not ordered_rows:
         return None
 
+    axis = metric_axis_label(metric)
     repeat_index = np.asarray([int(row["repeat_index"]) for row in ordered_rows], dtype=np.int64)
     losses = np.asarray([float(row["stat_true"]) for row in ordered_rows], dtype=np.float64)
 
@@ -325,9 +329,9 @@ def save_repeat_true_loss_plot(
     fig, ax = plt.subplots(1, 1, figsize=(8, 5))
     ax.plot(repeat_index, losses, color="darkorange", linewidth=1.3, alpha=0.9)
     ax.scatter(repeat_index, losses, color="black", s=40, zorder=3)
-    ax.set_title(title)
+    ax.set_title(title or f"True {axis} by Repeat")
     ax.set_xlabel("Repeat Index")
-    ax.set_ylabel("True Loss")
+    ax.set_ylabel(f"True {axis}")
     ax.grid(alpha=0.25, linewidth=0.5)
     fig.tight_layout()
     fig.savefig(out_path, dpi=200, bbox_inches="tight")
@@ -340,7 +344,8 @@ def save_repeat_null_boxplot(
     per_run_rows: Iterable[Mapping[str, object]],
     out_path: str | Path,
     *,
-    title: str = "Null Loss Distributions by Repeat",
+    metric: str = "nll_gaussian_mse",
+    title: str | None = None,
 ) -> Path | None:
     ordered_run_rows = sorted(per_run_rows, key=lambda row: int(row["repeat_index"]))
     if not ordered_run_rows:
@@ -362,12 +367,13 @@ def save_repeat_null_boxplot(
         patch.set_facecolor("lightsteelblue")
         patch.set_alpha(0.7)
 
+    axis = metric_axis_label(metric)
     true_losses = np.asarray([float(row["stat_true"]) for row in ordered_run_rows], dtype=np.float64)
-    ax.scatter(positions, true_losses, color="crimson", s=40, zorder=3, label="True Loss")
+    ax.scatter(positions, true_losses, color="crimson", s=40, zorder=3, label=f"True {axis}")
     ax.plot(positions, true_losses, color="crimson", linewidth=1.0, alpha=0.7)
-    ax.set_title(title)
+    ax.set_title(title or f"Null {axis} Distributions by Repeat")
     ax.set_xlabel("Repeat Index")
-    ax.set_ylabel("Loss")
+    ax.set_ylabel(axis)
     ax.grid(axis="y", alpha=0.25, linewidth=0.5)
     ax.legend()
     fig.tight_layout()
@@ -381,7 +387,8 @@ def save_repeat_null_density_overlay(
     per_run_rows: Iterable[Mapping[str, object]],
     out_path: str | Path,
     *,
-    title: str = "Null Loss Density Overlay",
+    metric: str = "nll_gaussian_mse",
+    title: str | None = None,
 ) -> Path | None:
     ordered_run_rows = sorted(per_run_rows, key=lambda row: int(row["repeat_index"]))
     if not ordered_run_rows:
@@ -414,8 +421,9 @@ def save_repeat_null_density_overlay(
         ax.plot(centers, density, color=color, linewidth=1.0, alpha=0.45)
         ax.axvline(float(row["stat_true"]), color=color, linestyle="--", linewidth=0.8, alpha=0.45)
 
-    ax.set_title(title)
-    ax.set_xlabel("Loss")
+    axis = metric_axis_label(metric)
+    ax.set_title(title or f"Null {axis} Density Overlay")
+    ax.set_xlabel(axis)
     ax.set_ylabel("Density")
     ax.grid(alpha=0.25, linewidth=0.5)
     fig.tight_layout()

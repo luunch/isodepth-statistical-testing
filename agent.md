@@ -1184,7 +1184,7 @@ total_counts association (rho=0.48).
 
 ## Xia2019 MERFISH U2OS linear-decoder existence test + Hallmark GSEA (2026-08-10)
 
-Run: `results/jfan_merfish/260810_jfan_merfish_linear_decoder/` (`configs/jfan_merfish.json`,
+Run: `results/jfan_merfish/260810_jfan_merfish_linear_decoder/` (`configs/jfanmerfish/jfan_raw_pooled_coord_perm.json`,
 Xia et al. 2019 U2OS MERFISH, n=1368 cells, G=10050 genes after preprocess, linear decoder,
 `n_perms=99`, `n_reruns=30`).
 
@@ -1206,7 +1206,7 @@ Legacy obs-correlation methods remain via `--score-method spearman|pearson`.
 Jointly trained GD `pred_true` was far from the MSE optimum for the frozen latent
 (slopes ~3% of OLS scale, ~55% sign agreement; median Pearson(obs, pred)≈0.007), which
 is why the original F-test SVG list was empty. Canonical outputs now come from
-`python -m scripts.posthoc.refit_linear_decoder_analyses configs/jfan_merfish.json <result.json> --gmt data/gmt/h.all.v2026.1.Hs.symbols.gmt`
+`python -m scripts.posthoc.refit_linear_decoder_analyses configs/jfanmerfish/jfan_raw_pooled_coord_perm.json <result.json> --gmt data/gmt/h.all.v2026.1.Hs.symbols.gmt`
 (`fit_closed_form_decoder` → `*_pred_true_ols_refit.npz` + regenerated plot/SVG/GSEA).
 MSE mean-only=1.000 / gd=0.999907 / **ols=0.996665**; sig genes **0 → 2348** (q<0.05);
 decoder-score GSEA still **0 pathways at q<0.05** (best: E2F_TARGETS NES=-1.296, p=0.012,
@@ -1229,6 +1229,8 @@ noisy/shrunk estimator, not a real biological "the decoder can't fit these genes
 reusing the same `fit_closed_form_decoder` call as `refit_linear_decoder_analyses.py` above —
 confirmed numerically identical output (same NES/p/q to the decimal) on this run.
 
+**Training-time OLS (2026-09-16):** The post-hoc refit did not fix encoder training. Hippocampus thin CA2 (`mouse_hippocampus_coordinate_separate_gaussian_linear_p499_thin`, 414 cells) is the exhibit: GD train MSE plateaus at 1.0 (intercept-only), isodepth collapses to ~0.26–0.34, SVG list empty, yet the OLS-refit test is p=0.002 because `stat_true=0.99691` vs perm mean ~0.9974 (null std ~1e-5). The training p-value trajectory on that loss curve goes *up* toward 0.5 as both true and null hit the mean predictor. Fix: for `nll_gaussian_mse` + linear/quadratic (no concatenated covariate), each training forward solves OLS on `z.detach()` and applies those weights to `z`, so the encoder sees an exact linear head. Rerun selection uses the same OLS loss. `decoder="nn"` and loss-difference `h(d,n)` stay on joint Adam. Training loss uses `closed_form_gaussian_mse_torch` (``XᵀY`` against shared ``(N, G)`` targets) so it never materializes ``(M, N, G)`` predictions; that extra tensor was OOMing CA1 into 2 chunks and ~2.5s/epoch.
+
 Math note: for a 1-D **linear** decoder, closed-form-refit decoder score is an exact monotonic
 transform of raw `Pearson(obs, isodepth)` (verified rank-corr=1.0) — i.e. once GD noise is
 removed, "decoder-based" ranking *is* direct-correlation ranking. It is not identical to
@@ -1239,7 +1241,7 @@ decoder-consistent/Pearson view) — read the Spearman-based hit list as a rank-
 artifact in this weak-signal regime, not a robust finding.
 
 **Expression variogram true vs coordinate-permutation null (2026-08-11):**
-`python -m scripts.posthoc.plot_expression_variogram_true_vs_perm configs/jfan_merfish.json <result.json>`
+`python -m scripts.posthoc.plot_expression_variogram_true_vs_perm configs/jfanmerfish/jfan_raw_pooled_coord_perm.json <result.json>`
 → `{stem}_expression_variogram_true_vs_perm.{png,csv}` in the run dir. Gene-pooled empirical
 semivariogram γ(d)=1−c(d) on z-scored A, all unordered cell pairs, shared distance bins; null uses
 the same `_build_permuted_coordinate_batch` shuffles as the existence test (`test.seed`). For this
@@ -1249,17 +1251,27 @@ band. So there *is* real (if weak, gene-pooled) spatial structure vs label-shuff
 NLL test to reject — but the absolute effect is small and short-range, consistent with local
 technical/packing structure rather than a tissue-scale expression gradient.
 
-## Gene expression vs isodepth + spatial companion: rank by encoder-decoder loss (2026-08-23)
+## Gene expression vs isodepth + spatial companion: rank by |OLS slope| among BH-significant genes (2026-09-04)
 
-The binned `*_gene_expression_vs_isodepth.png` and companion
-`*_svg_spatial_expression.png` now show the **same top 5 genes**, ranked by
-per-gene MSE of `pred_true` (full encoder-decoder reconstruction).  Panel
-annotations are decoder R² / MSE.  Spearman |ρ| is only the fallback when no
-decoder fit exists.  The F-test CSV is still written for parametric decoders
-but is **not** used to pick those panels (floored p-values were selecting a
-different gene set than the scatter).  Comparison plots rank isodepth rows by
-`pred_true` MSE and covariate rows by `pred_true_covariate` MSE, and the
-spatial grid uses those same two lists.
+The binned `*_gene_expression_vs_isodepth.png` (1D) and companion
+`*_svg_spatial_expression.png` (2D spatial scatter) show the **same top 5
+genes**, ranked by **|OLS slope|** of observed expression on the plotted
+coordinate (`A_g ≈ a + b · coord`).  When a parametric decoder is used
+(`decoder_df` set, linear/quadratic F-test), panels are restricted to
+**BH-significant genes (q < 0.05)** and then sorted by |OLS slope|; each panel
+annotates signed `b` plus F-test p/q.  If no gene passes BH, both PNGs are
+placeholder figures rather than non-significant genes.  Pass
+`significant_only=False` to restore the old all-gene |OLS slope| ranking.
+NN decoders (no F-test) still rank all genes by |OLS slope|.
+
+The F-test CSV (`*_isodepth_sig_genes.csv`) is still written for parametric
+decoders.  Comparison (4-row covariate) plots are unchanged: they still rank
+by |OLS slope| without a significance filter.
+
+Previous (2026-08-27) ranking used |OLS slope| over **all** genes and did not
+require significance; F-test hits stayed in the CSV only.  CalicoST
+`existence_permutation` gene-vs-isodepth graphs were regenerated after this
+change.
 
 ## Inclusion-survey selected DBSCAN clusters (2026-08-24, corrected)
 
@@ -1334,12 +1346,14 @@ still see `n`. True NLL is only 0.90σ below the perm mean (45/249 nulls ≤ tru
 Sibling cluster 0 on the same clone (`panel01`, n=239) has the same jagged
 decoder (tumor still dominates `pred_true`) but z=19.9 / p=0.004 — small extra
 spatial signal is detectable at larger n, not here. Do not rank genes by joint
-`pred_true` MSE if the question is “which genes follow isodepth.”
+`pred_true` MSE if the question is “which genes follow isodepth.” (As of
+2026-08-27 the 1D/2D gene plots rank by |OLS slope| of expression on isodepth,
+which avoids this trap.)
 
 ## Xia2019 MERFISH Visium-style pseudobulk (2026-08-25)
 
-Config: `configs/jfan_merfish_visium_pseudobulk.json`. Same Xia et al. 2019 U2OS
-h5ad and training recipe as `configs/jfan_merfish.json`, but
+Config: `configs/jfanmerfish/jfan_raw_pooled_visium_p99.json`. Same Xia et al. 2019 U2OS
+h5ad and training recipe as `configs/jfanmerfish/jfan_raw_pooled_coord_perm.json`, but
 `test.method=visium_pseudobulk` (100 µm pitch / 55 µm circles). Native
 `obsm['spatial']` is already microns (`obs` has `x_microns`/`y_microns`, bbox
 ~3.2 mm), so `coordinate_um_per_unit=1.0`. Cultured monolayer is sparse (median
@@ -1347,8 +1361,22 @@ NN ~45 µm), so a 55 µm Visium spot typically captures 1 cell (max 3); dry-run
 gave 347 occupied pseudospots from 1368 cells (~71% dropped in inter-spot gaps).
 `run_permutation.py` loads raw counts and applies CPM/log1p/z-score after
 aggregation. Overlay is written automatically as `{run}_overlay.png`.
-499-perm sibling: `configs/jfan_merfish_visium_pseudobulk_p499.json`
+499-perm sibling: `configs/jfanmerfish/jfan_raw_pooled_visium_p499.json`
 (`n_perms=499`, `epochs=2000`, run `260825_jfan_merfish_visium_pseudobulk_p499`).
+Generic sbatch wrapper: `sbatch run_config.sh configs/jfanmerfish/jfan_raw_pooled_visium_p499.json`
+(`CONFIG` is required; same run_name as the existing result folder, so a
+resubmit overwrites `results/jfan_merfish/260825_jfan_merfish_visium_pseudobulk_p499/`).
+
+**End-of-training OLS decoder (2026-08-26):** Gaussian `linear`/`quadratic` slots now
+get `fit_closed_form_decoder` after the best rerun is chosen, for **every** slot
+(true + permutations), matching Poisson IRLS. Joint Adam is unchanged during
+training; only the finalized `pred_true` / `stat_true` / `stat_perm` use OLS.
+Loss-difference `h(d, n)` models keep the GD head (concatenated covariate). This
+Visium run's GD gene-expression / metric plots were archived as `*_gd_decoder.*`
+before rerunning `configs/jfanmerfish/jfan_raw_pooled_visium_p99.json`. The GD decoder
+here had ~4% of the OLS slope (TNS3 Pearson −0.24 vs plotted \(R^2=0.005\)); OLS
+makes those black lines the actual least-squares fit. Encoder isodepth is the
+same object (training loop unchanged).
 
 ## `p (covariate)` in hallmark pathway sweep + HVG3000 covariate is miscalibrated to 1.0 across the board (2026-08-26)
 
@@ -1401,4 +1429,548 @@ ones — harmless since the pathway sweep overrides `run_name` per-pathway anywa
 path) is independent of this change and still applies even with only `tumor_proportion`
 whitened. Have NOT yet re-run the HVG3000 reference or the pathway sweep with these edited
 configs — configs only, no new results yet as of this note.
+
+**2026-08-26: same `log1p_total_counts` drop for HT268B1 clone 1, and deleted the old
+two-covariate sweep outputs.** Same change in
+`configs/calicost/HT268B1_slice1_U1_loss_difference_clone1_hypoxia_genes_tumor_logcounts.json`
+and `..._gt0p7_tumor_logcounts_3000hvg.json` (`covariate_whitening_obs_key` →
+`"calicost_tumor_proportion"`; `run_name` `..._tumor_logcounts` → `..._tumor_prop_only`).
+Deleted the incorrect `loss-difference` + HVG3000-covariate outputs so they cannot be reused:
+
+- `results/experiments/hallmark_pathway_sweep_clone2_hvg3000_covariate/`
+- `results/experiments/hallmark_pathway_sweep_ht268b1_clone1_hvg3000_covariate/`
+- HVG3000 refs: `results/calicost/HT306P1_S1H1Fc2U1Z1Bs1/loss_diff_clone2_linear_gt0p7_cropy_tumor_logcounts_3000hvg_r30/`
+  and `results/calicost/HT268B1-Th1K3Fc2U1Z1Bs1/loss_diff_clone1_gt0p7_linear_tumor_logcounts_3000hvg/`
+
+Resubmit both from the repo root:
+
+```
+sbatch --export=ALL,SPEC=configs/experiments/hallmark_pathway_sweep_clone2_hvg3000_covariate_study.json \
+  run_pathway_panel_sweep.sh
+sbatch --export=ALL,SPEC=configs/experiments/hallmark_pathway_sweep_ht268b1_clone1_hvg3000_covariate_study.json \
+  run_pathway_panel_sweep.sh
+```
+
+## Inclusion existence sweep results (2026-08-26)
+
+12/12 selected DBSCAN clusters finished under
+`results/calicost/cohort_survey/gt1clone/inclusion_gt0p7_qc60/existence/`
+(249 perms; min p = 0.004). **11/12 reject at α=0.05; 9/12 sit at the p floor.**
+Only non-significant run: panel 02 HT112C1 U1 clone 1 cluster 1 (n=67, p=0.184,
+z=0.90). Weak rejects: panel 06 (p=0.032, n=69) and panel 07 (p=0.012, n=139).
+Every non-HT112C1 cluster hits p=0.004, including the smallest (panel 21, n=53).
+
+## Dropping `log1p_total_counts` from whitening makes both hallmark sweeps 50/50 significant on one shared library-size axis (2026-08-26)
+
+Both `hallmark_pathway_sweep_{ht268b1_clone1,clone2}_hvg3000_covariate` were re-run after
+reverting `covariate_whitening_obs_key` to `"calicost_tumor_proportion"` only (see the
+config-change note above). The result is **not** a mild shift — it is the depth confound
+returning and saturating the test:
+
+| | clone1 (HT268B1, n=426) | clone2 (HT306P1, n=125) |
+|---|---|---|
+| significant (BH q<0.05), 2-covariate → 1-covariate | 22/50 → **50/50** | 34/50 → **50/50** |
+| p-values now | all 50 at floor 0.004 | all 50 at floor 0.004 |
+| z = (null_mean − stat_true)/null_sd | 9.6 – 19.6 | 5.0 – 7.1 |
+| `stat_true` < `null_min` | 50/50 | 50/50 |
+| pairwise off-diagonal \|rho\| in `isodepth_spearman_matrix.csv` | mean 0.84, min 0.70 (was mean 0.23, max 0.53) | mean 0.94, min 0.82 (was mean 0.84) |
+| \|rho(pathway isodepth, `log1p_total_counts`)\| | mean 0.63, range 0.56–0.67 | mean 0.94, range 0.85–0.96 |
+| \|rho(pathway isodepth, `calicost_tumor_proportion`)\| | mean 0.18 (still whitened) | mean 0.18 |
+
+The matched HVG3000 reference axis itself moved the same way for clone1:
+`rho(iso, log1p_total_counts)` = **0.61** with tumor-prop-only whitening
+(`loss_diff_clone1_gt0p7_linear_tumor_prop_only_3000hvg`) vs **0.17** with the old
+`[tumor_proportion, log1p_total_counts]` whitening (`loss_diff_clone1_gt0p7_linear_tumor_logcounts`,
+still on disk — useful as the direct before/after comparator since the sweep outputs were deleted).
+Clone2 reference: −0.955.
+
+Reproduce the correlation check by un-standardizing `S` from `{run}/1.0/1.0_isodepths.npz` with
+`coord_mean`/`coord_std` and `cKDTree`-matching into the source h5ad's `obs`
+(max residual ~2.6e-2 raw px, unambiguous) — same technique as the clone-2 QC section above.
+
+Interpretation: with library size unmodeled, every 200-gene panel recovers essentially the *same*
+spatial axis, and that axis is the sequencing-depth/tissue-quality gradient. This is the expected
+outcome given the already-documented random-gene-panel control (20/30 random 200-gene panels were
+"significant" on clone2 *even with* `log1p_total_counts` whitened) — removing the covariate simply
+pushes that miscalibration to 100%. **The one-covariate sweeps should be read as a positive control
+for the confound, not as biology; do not report 50/50 as a pathway result.**
+
+Two secondary consequences of the same change:
+- `p_value_covariate_all_genes` flipped from **1.0 in 50/50** (both sweeps, documented above) to
+  0.004 in **40/50** (clone1) and **49/50** (clone2). Partly real (one shared axis now explains
+  every panel), partly because the `_train_covariate_artifacts` asymmetry — `n` never concatenated
+  on the covariate path — is now a much smaller handicap: the omitted `n` is just tumor_proportion
+  (\|rho\|~0.18) instead of tumor_proportion + log-counts.
+- The new HVG3000 references were submitted with **`test.n_perms: 1`**, so their own p-values
+  (clone1 reports `p=0.5`) are meaningless — they exist only to supply the reference isodepth for
+  the `hvg3000_isodepth` covariate. Don't compare that 0.5 against the old
+  `tumor_logcounts` reference's p=0.052 (249 perms).
+
+## Inclusion existence: standard permutation sibling of loss-difference (2026-08-27)
+
+Same 12 DBSCAN clusters as `configs/calicost/inclusion_gt0p7_qc60/` (same
+`obs_indices` `.npy` files), but **no** `data.covariate_whitening`. That is the
+standard coordinate-permutation existence test (`h(d)` only) vs the original
+`covariate_whitening: "loss-difference"` runs that concatenate tumor proportion
+into `h(d, n)`. Everything else is copied (3000 HVG, linear decoder, 249 perms,
+30 reruns, 1000 epochs). Configs:
+`configs/calicost/inclusion_gt0p7_qc60_permutation/`. Output:
+`results/calicost/cohort_survey/gt1clone/inclusion_gt0p7_qc60/existence_permutation/`
+(sibling of `existence/`, so the loss-difference results are not overwritten).
+Submit: `sbatch run_inclusion_gt0p7_qc60_permutation.sh`.
+
+**Blurred-permutation effect-size overlays (2026-09-14, removed from these plots 2026-10-02):** 10/20 µm × 20 had been drawn on all 12 `existence_permutation` null histograms (50 µm dropped after the first pass — Visium NN ≈ 85 µm, so 50 µm dominated the axis). Those lines are off the per-clone and combined metric plots again, and `blurred_permutations` is gone from `configs/calicost/inclusion_gt0p7_qc60_permutation/` and from `run_inclusion_gt0p7_qc60_permutation.sh`. The `*_blurred_perm_losses.json` sidecars and `*_metric_distribution_pre_blur_overlay.png` (old NLL axis) are still on disk. Cohort figure from that pass: `results/calicost/cohort_survey/gt1clone/inclusion_gt0p7_qc60/existence_permutation_blur_effect_size.png`.
+
+**What those permutation isodepths actually track (2026-08-27):** all 12 finished
+and reject the coordinate-shuffle null (11/12 at p=0.004; panel 06 p=0.044;
+panel 07 p=0.012; panel 21 p=0.008). That spatial structure is real versus
+label-shuffle, but it is mostly **not** a tissue-depth/hypoxia axis. With no
+covariate whitening, the 1-D encoder recovers the dominant spatially smooth
+HVG module, which on Visium is usually %MT, library size, or ribo:
+
+- Panel 12 (HT265 clone 2, n=566): ρ(iso, %MT)=+0.77, top 5 all `MT-*`, 9/20
+  MT, gene-axis alignment with %MT = 0.92.
+- Panel 01 (HT112 U1 clone 1): top 5 all `MT-ND*`/`MT-CYB`; ρ(iso, %MT)=−0.48.
+- Panel 24 (HT306 clone 2 — same clone as the earlier library-size confound):
+  ρ(iso, log1p total counts)=**−0.91**, R²=0.83; MT-ND4/MT-CYB still in top 5.
+- Panel 11: ρ(iso, log counts)=−0.68, top genes RPS18/RPS20/GAS5.
+- Panel 05: top genes ACTB/ACTG1/KRT18, but gene-axis alignment with %MT = −0.77
+  and R²(%MT+depth)=0.48 — QC axis even when MT is not the steepest single gene.
+- Panel 18: ρ(iso, log counts)=+0.56; top gene RPL22 plus ISGs.
+
+|OLS slope| ranking on z-scored A is the same as |Pearson r|, so a latent that
+is collinear with %MT will put the ~5–13 HVG mitochondrial genes at the top of
+the gene plots. That is expected, not independent biology.
+
+Cleaner exceptions: panel 04 (MUC2/AGR2/PHGR1 goblet/secretory; ρ vs %MT and
+vs depth both ~0; R²=0.01) and, more weakly, panels 06/07 (epithelial/Paneth/Ig;
+p=0.044/0.012). Numbers:
+`results/calicost/cohort_survey/gt1clone/inclusion_gt0p7_qc60/existence_permutation/_isodepth_qc_diagnosis.json`.
+
+Grouped |Spearman ρ| bar chart of those same three covariates vs permutation
+isodepth (one trio per panel, y in [0, 1]):
+`results/calicost/cohort_survey/gt1clone/inclusion_gt0p7_qc60/existence_permutation/isodepth_covariate_spearman_abs.png`
+(regenerate with `python scripts/posthoc/plot_inclusion_permutation_isodepth_covariate_rho.py`).
+|ρ| vs total counts equals |ρ| vs log1p total counts (Spearman is rank-based).
+
+The three inclusion metric contact sheets (tumor_prop / pct_mt / total_counts)
+show only the 12 existence-test clusters, cropped to each cluster on a square
+axis (same viridis 0–1 colorbar as isodepth). No whole-tissue background.
+
+## CosMx Visium-pseudospot overlays (2026-08-27)
+
+**Do not overlay on the full CosMx section or a padded bbox of mixed cell
+types.** Restrict to one previously annotated cell-type region via its
+`obs_indices` `.npy`, plot those cells first, then run the Visium overlay on
+exactly that subset. Script: `scripts/posthoc/plot_cosmx_visium_overlays.py`.
+Output: `results/cosmx_visium_pseudobulk_overlays/cosmx_*_region_{cells,overlay}.png`.
+
+The hex lattice **overtiles** the tissue: a candidate spot is kept if any
+part of its 55 µm circle overlaps the mask (hexes may hang off the blob).
+A cell is captured iff it lands in a circle. Remaining grey points are the
+true Visium inter-spot gaps (~71-73% of area at 100 µm pitch), not dropped
+edge spots.
+
+**Second bug (found after "overtile" alone still looked too sparse):** the
+non-synthetic (density-based) tissue-membership fallback in
+`_density_tissue_membership_fn` defaults to `radius_um = 1.5 * median NN
+distance` of the dataset's own cells. That's tuned for dense, confluent full
+tissue sections, but is far too tight for a single sparse/scattered
+cell-type region (e.g. neutrophils, B-cells): median NN was ~5-6 µm for
+these regions vs. the DBSCAN `eps` (~22-25 µm =
+`percentile(nn_dist,90)*3.0`, see `scripts/data_prep/
+segment_cosmx_celltype_regions.py`) actually used to define them as one
+spatially-contiguous component in the first place. Using the tight default
+punched holes through legitimate tissue between same-type cells, so only
+~25 of a ~286-candidate lattice passed even after overtiling.
+
+Fix: added `test.visium_tissue_radius_um` (optional override) to
+`TestConfig`/`build_visium_pseudobulk_dataset`
+(`methods/visium_pseudobulk.py`) that replaces the `1.5*median_nn` default
+when set. `scripts/posthoc/plot_cosmx_visium_overlays.py` now computes this
+per-region as `percentile(nn_dist,90)*3.0` (matching the DBSCAN segmentation
+exactly) and passes it through. Result: hex lattice now fully tiles each
+region's bounding box (c88 24 occupied+6 empty, c35 23+9, c22 10+2 — was
+2-4 total before either fix).
+
+**Ran the actual visium_pseudobulk existence test** (not just the plotting
+dummy) end-to-end on all 3 regions with real counts (957-960 genes),
+production settings (`nll_poisson_mse`, 99 perms, 500 epochs, 10 reruns),
+matching `visium_tissue_radius_um` per region. New configs:
+`configs/cosmx_celltype_regions/cosmx_{luad_9_r2_neutrophil_c88,
+luad_9_r1_neutrophil_c35,luad_5_r3_b_cell_c22}_visium_pseudobulk.json`.
+Results in `results/cosmx_celltype_regions/cosmx_*_visium_pseudobulk_poisson/`:
+c88 p=0.04 (24 pseudospots), c35 p=0.11 (23), c22 p=0.38 (10 — likely
+underpowered, too few spots). No GPU in this interactive shell
+(`torch.cuda.is_available()` False here even though configs say
+`"device": "cuda"`); ran via `python run_permutation.py --config ... --device cpu`.
+Each run took ~2m45s-2m55s wall clock on CPU despite `epochs=500` x
+`(1+99 perms)*10 reruns` because the trainer vectorizes all
+reruns/perms as one batched forward pass (`parallel_permutation` inner
+method) — full production settings are cheap enough to smoke-test on CPU
+for datasets this small (10-24 pseudospots, <1000 genes), no need to
+reduce epochs/perms/reruns first.
+
+## MERFISH nearest-neighbor spacing (2026-08-31)
+
+KDTree k=2 on `obsm["spatial"]` (already µm, `coordinate_um_per_unit=1`) for every
+spot.
+
+**JFan Xia2019 U2OS** (`data/h5ad/merfish_xia2019_u2os.h5ad`, n=1368, 3 batches
+B1/B2/B3 = 645/400/323 sharing the same ~3.2 mm coordinate frame):
+- Pooled all-spots NN: median **45.4 µm**, mean 47.7, Q1–Q3 29.3–64.8, min 2.17,
+  max 135.1, std 24.1. This is what the pipeline sees and matches the earlier
+  visium-pseudobulk “median NN ~45 µm” note.
+- 92% of those nearest neighbors are a cell from a **different batch** (overlay
+  artifact). Same-batch NN: median **97.5 µm**, mean 102.5, min 45.9, max 334.
+  Per-batch medians: B1 88.5, B2 106.5, B3 112.2.
+
+**Hypothalamus RCTD slice** (`data/h5ad/merfish_hypothalamus_rctd.h5ad`, n=6111,
+one ~1.8×1.8 mm slice, no batch overlay): median **12.5 µm**, mean 13.2,
+Q1–Q3 9.3–16.4, min 2.78, max 68.8, std 5.18, mode ~10.5 µm. Same coordinates
+as `merfish_hypothalamus.h5ad`.
+
+**Scale verification (2026-08-31):** Hypothalamus units are microns with high
+confidence. Coords are byte-identical to squidpy/Moffitt 2018 Animal 1 female
+naive **Bregma +0.01** (`Centroid_X`/`Centroid_Y`; n=6111). Bbox 1.790×1.791 mm
+matches the paper’s 1.8×1.8 mm FOV; no expansion microscopy. JFan
+`x_microns`/`obsm["spatial"]` are microns (not pixels/mm): 1368 cells / 3
+batches match Xia et al. PNAS 2019; per-batch bbox ~3.16 mm is consistent with
+Fig. 6C/D 500 µm scale bars; same-batch min NN 46–56 µm matches U2OS soma
+exclusion. Residual caveat: the experiment used ~2× expansion (paper: “expansion
+factor is only ∼2 in each dimension”; 4.2 µm expanded z = 2 µm pre-expansion).
+Figures and z-depth are reported in pre-expansion µm; treat `x_microns` as
+pre-expansion biological microns unless a deposited-file README says otherwise.
+Pooled JFan NN (median 45 µm) remains an overlay artifact, not a unit error.
+
+**JFan per-batch existence configs (2026-08-31):** Pooled run used all 1368 cells
+(B1+B2+B3 overlaid). Same linear-decoder recipe as `configs/jfanmerfish/jfan_raw_pooled_coord_perm.json`,
+one imaging batch each: `configs/jfanmerfish/jfan_raw_B1_coord_perm.json` (n=645), `jfan_raw_B2_coord_perm.json` (n=400), `jfan_raw_B3_coord_perm.json` (n=323). Filter is `data.obs_filters.batch`. Original
+99-perm outputs:
+`results/jfan_merfish/260831_jfan_merfish_linear_decoder_B{1,2,3}`.
+
+**JFan per-batch 499-perm rerun (2026-09-04):** Same three configs, `test.n_perms`
+bumped 99 → 499. New `output.run_name` so they do not overwrite the 99-perm
+dirs: `260904_jfan_merfish_linear_decoder_B{1,2,3}_p499`. Submit:
+`sbatch run_config.sh configs/jfanmerfish/jfan_raw_B1_coord_perm.json` (and B2/B3).
+
+**JFan 20/50 µm blurred-permutation overlay (2026-09-04):** Post-hoc
+effect-size reference on the existing 499-perm folders (does not recompute
+p-values). Blurs the first 20 coordinate permutations (`test.seed=42`) with
+Gaussian Nadaraya–Watson kernels at **20 µm (orange)** and **50 µm (purple)**,
+retrains those 20 slots per bandwidth with the original linear-decoder
+hyperparameters, and overlays both on `{run}_metric_distribution.png`.
+Sidecar `{run}_blurred_perm_losses.json` stores an `overlays` list (legacy
+single-σ files are migrated on read). Original plot copied once to
+`{run}_metric_distribution_pre_blur_overlay.png`.
+`python scripts/posthoc/overlay_blurred_perm_losses.py` or
+`sbatch scripts/posthoc/run_overlay_blurred_perm_losses.sh`. Historical
+10/20/50 µm separate-mode runs (hippocampus CA1/CA2/CA3, hypothalamus
+separate) rewrite each `{type}_metric_distribution.png` **and**
+`{run}_combined_metric_distribution.png`. The combined grid used to be
+skipped whenever there was more than one overlay target. Overlay redraws
+keep the covariate dual line.
+
+**Visium hex overlay on hypothalamus (2026-08-31):** Same 100 µm pitch / 55 µm
+capture geometry as `visium_pseudobulk`, anchored at the tissue lower-left
+(`block_jitter=false`). Plots in
+`results/merfish_hypothalamus_visium_overlay/`: full-slice
+`hypothalamus_visium_hex_overlay.png` and a 500×500 µm zoom. 6111 cells → 357
+occupied spots (389 in-tissue hexes), 73% of cells dropped in inter-spot gaps,
+median 5 cells/spot (min 1, max 12). Confirms native MERFISH spacing is cell
+scale (~12.5 µm), not Visium 100 µm.
+
+**Gaussian null distributions use MSE, not NLL (2026-09-10):** `test.metric:
+"nll_gaussian_mse"` still trains with squared error, but evaluation
+(`compute_metric`, masked trainers, subsampling) now *reports* MSE instead of
+homoscedastic Gaussian NLL `(n/2) log(2π MSE) + n/2`. Ranking and p-values are
+unchanged because NLL is strictly increasing in MSE at fixed n. Null-plot
+x-labels go through `methods.metrics.metric_axis_label` ("MSE"). Tests:
+`tests/test_gaussian_mse_null_ordering.py`. Existing result JSONs written
+before this change still store NLL-scale `stat_true`/`stat_perm`; do not
+relabel those plots as MSE without converting. Poisson NLL is unchanged.
+
+**Historical hypothalamus/hippocampus 499-perm reruns (2026-09-10):** New
+non-overwriting configs, same linear-Gaussian recipe as current CalicoST/JFan
+(`n_perms=499`, `epochs=1000`, `n_reruns=30`, `sgd_batch_size=128`,
+`decoder=linear`, `patience=0`, CUDA) plus config-driven 10/20/50 µm × 20
+blurred-permutation overlays (`blurred_permutations`). Submit with
+`sbatch run_config.sh <config>` — `run_config.sh` runs `run_permutation.py`
+then `scripts/posthoc/overlay_blurred_perm_losses.py --from-config` (no-op if
+the blur block is missing/disabled). Overlay p-values are unchanged; the 60
+extra losses are effect-size references only. Together/separate overlay
+training matches the main run (shared encoder vs independent per-type
+preprocessing). Hippocampus stored `X` is `log1p(CPM-10k)`: set
+`input_expression_representation=log1p_normalized`,
+`input_normalization_target=10000`, `make_var_names_unique=true`, then the
+usual CPM-1e6 → log1p → z-score path.
+
+- `configs/hypothalamus/hypothalamus_midline_together_gaussian_linear_p499.json`
+- `configs/hypothalamus/hypothalamus_midline_separate_gaussian_linear_p499.json`
+  (drops types with <30 cells)
+- `configs/hippocampus/mouse_hippocampus_coordinate_separate_gaussian_linear_p499.json`
+  (CA1/CA2/CA3, obs covariate `coordinate`, `coordinate_um_per_unit=0.2738242950835738`)
+  This morphogam file is a **thick** CA selection (4860 cells). The cleaner Visium HD
+  ribbon is `data/h5ad/hippocampal_pyramidal.h5ad` (5315 cells; used by
+  `visium_hd_hippocampal_block_perm_r24um`). Thin sibling:
+  `configs/hippocampus/mouse_hippocampus_coordinate_separate_gaussian_linear_p499_thin.json`
+  → `data/h5ad/hippocampal_pyramidal_thin_ca_morphogam.h5ad` (same 5315-cell ribbon,
+  morphogam `cell_type`/`coordinate` transferred by barcode then spatial KNN).
+  Rebuild with `python scripts/data_prep/build_hippocampus_thin_ribbon_h5ad.py`.
+  Preview: `configs/hippocampus/thin_ribbon_preview.png`. Do not overwrite the thick
+  p499 folder; thin outputs go to
+  `results/hippocampus/mouse_hippocampus_coordinate_separate_gaussian_linear_p499_thin/`.
+
+- **New convention: `notebooks/adhoc_experiments/` for interactive diagnostics** (2026-09-23).
+  **Notebook execution gotcha**: `%matplotlib inline` must be placed *after* importing
+  `experiments.configuration` (or anything importing it), not before — that module chain
+  imports `analysis/cosmx_region_context.py`, which calls `matplotlib.use("Agg")` at import
+  time (for headless script use), silently clobbering the inline backend set earlier and
+  making `plt.show()` produce no output in the executed `.ipynb`. Env setup: `isodepth_env`
+  had no jupyter/ipykernel; installed via
+  `pip install ipykernel nbclient nbconvert` + `python -m ipykernel install --user --name isodepth_env`,
+  then executed with
+  `jupyter nbconvert --to notebook --execute --inplace --ExecutePreprocessor.kernel_name=isodepth_env <nb>`.
+  Note the repo's real result/notebook paths resolve under `/weka/scratch/jhu/uchitra1/users/ajain71/...`
+  even though the login-node path is `/home/jhu/ajain71/scratch_uchitra1/users/ajain71/...` (same
+  filesystem via different mount points) — `nbconvert --execute` writing there needed
+  full/unsandboxed filesystem permissions in the sandboxed shell tool even though the target
+  files were already owned by the same user with `rw` perms (plain `python script.py` runs
+  writing the same path did not hit this, only the nbconvert-launched kernel subprocess did).
+
+**spCorr hippocampus rebuild (2026-09-30 failed; continued 2026-10-01 from saved BANKSY):**
+`datasets/spatial-RNA/visiumhd/mouse_hippocampus/spcorr_hippocampus_preprocess.ipynb`
+starts from the 8 µm matrix (393,543 spots). The local `spcorr_nb_run.sh` run died
+in BANKSY neighborhood chunk 1/5 (`Rscript` exit -9). Do not rerun that cell.
+`banksy_outputs/` is empty (`savefig=False`). The April 7 executed notebook
+`banksy_processing_out.ipynb` already has the full-gene clustering: lambda 0.8,
+20 PCs, Leiden resolutions 0.7/0.75/0.8 → 28/29/32 domains, kept 0.8.
+Labels are `obs['banksy_cluster']` in `mouse_brain_banksy_ALL_GENES.h5ad`
+(393,543 × 19,059, raw counts). That clustering is 32 domains, not 31, and no
+domain pair sums to 5,910. Domains 23 (CA1 markers, 5,619) and 28 (CA3 markers,
+3,742) are one curve; 86 disconnected spots were dropped.
+`continue_spcorr_from_saved_banksy.py` then applies the notebook's CA argmax
+(log1p CPM-1e4; Pvrl3 is absent, Nectin3 is used) and MorphoGAM `CurveFinder`
+defaults, flipping `t` so mean CA1 < mean CA3.
+Outputs, same folder: `spcorr_hippocampus_ca_allgenes.h5ad` (9,275 × 19,059),
+`spcorr_hippocampus_ca_counts.h5ad` (9,275 × 641), `spcorr_pyramidal_spots.csv`,
+`spcorr_banksy_meta.json`, `spcorr_hippocampus_ca_overview.png`.
+This is not the paper object (5,910 spots, 964 genes). Argmax ties go to CA1:
+5,281/9,275 spots have all three scores at 0 and are labeled CA1, so the CA1
+count (7,437) is mostly empty bins. Nonzero-score calls are CA1 2,156, CA2 626,
+CA3 1,212. `t` still tracks the curve (domain 23 median 0.26, domain 28 median 0.74).
+The older HVG `mouse_brain_banksy.h5ad` cluster 23 (5,315 spots) sits inside this
+pair (`pyrimidal_hippocampus.ipynb`, then DBSCAN). R 4.5.1 needs `module load GCC/13.2.0`
+before `R/4.5.1-gfbf-2023b`, plus ImageMagick and GMP. Packages live in
+`~/R/x86_64-pc-linux-gnu-library/4.5`. DropletUtils `read10xCounts` needs
+`col.names=TRUE`.
+
+**Quadratic OLS Gram singularity (2026-09-29):**
+`configs/hypothalamus/hypothalamus_midline_separate_gaussian_linear_p499.json` is named
+linear, but the JSON on disk sets `"decoder": "quadratic"`. Cell-type-separate training
+of Inhibitory (2357 cells) died around epoch 451/500 with
+`torch.linalg.solve: (Batch element 95): The solver failed because the input matrix is singular`
+inside `_solve_ols_beta`. Quadratic features are `[z, z**2]` then per-feature standardized
+plus an intercept. A collapsed slot (constant `z`) or a slot where `z**2` is an affine
+function of `z` makes `XᵀX + 1e-6 I` numerically singular in float32: the absolute ridge
+is ~1e-6 while Gram diagonals are ~N, so the condition number sits below cuSOLVER's
+rcond cutoff and the whole batched solve aborts. Flooring small diagonals does not fix
+the collinear case (diagonals are large; one eigenvalue is ~0). A larger relative ridge
+would change healthy slots and the float64 lstsq tests. `_solve_ols_beta` still tries
+`torch.linalg.solve` first and, on `torch.linalg.LinAlgError`, returns
+`pinv(gram) @ xty` (min-norm, finite). The function is not `torch.compile`d, so the
+except path is live. Do not rerun the multi-hour GPU job unless asked.
+
+**JFan B2 linear p499 with cosine decay has a stable p-value (2026-09-29, second pass):**
+Same folder, regenerated ~13:48 with `sgd_cosine_lr_decay=true`, `sgd_cosine_eta_min=0`,
+`T_max` = epochs × steps/epoch, `lr=0.001`, `sgd_batch_size=128` still on. True best
+rerun last improved at epoch 93 (MSE 0.9913) and is flat thereafter; 26/30 true reruns
+are flat over the last 50 epochs. Red p-value plateaus at 0.321 from epoch 450–500
+(official `(1+#nulls ≤ observed)/(1+n_perms)` = 0.324). Zero rank crossings in the last
+50 epochs. Two nulls sit within 1e-4 of the observed loss, so a few more steps could
+flip a count (~0.004 in p) but not the call. Late flatness is partly the cosine
+schedule driving Adam's step size to 0; the true model stalled while the learning rate
+was still near its start. The earlier no-cosine pass in this same folder ended at
+p≈0.69 with nulls still descending at epoch 500 — that history was overwritten.
+Sept 4 `*_metric_distribution_pre_blur_overlay.png` remains the original NLL histogram
+(p=0.038) and does not match this MSE result.
+
+**JFan B1/B2/B3 cosine SGD (2026-09-29):**
+`configs/jfanmerfish/jfan_raw_B{1,2,3}_coord_perm.json` set `test.sgd_cosine_lr_decay`
+true. `eta_min` stays 0 and `sgd_cosine_t_max_steps` stays unset, so
+`CosineAnnealingLR` uses `T_max = epochs * ceil(n_cells / sgd_batch_size)` and
+anneals `lr=0.001` to 0 over the full minibatch run. `output.run_name` is still
+`260904_jfan_merfish_linear_decoder_B{1,2,3}_p499`, which already holds the
+cosine-off results — a resubmit writes into those folders.
+
+**Xia/Fan 2019 clustering preprocessing (2026-09-29, executed):**
+`notebooks/adhoc_experiments/jfan_u2os_fan2019_preprocess.ipynb` rebuilt the
+pooled (B1+B2+B3) matrix: CPM 1e6, `log1p`, ComBat on `obs['batch']`, GAM
+variance~mean (`GAM_DF=5`), top 1598 genes by adjusted variance, PCA to 30.
+Output `data/h5ad/merfish_xia2019_u2os_fan2019.h5ad` is 1368 × 1598.
+`X` is already `(combat - mean) / sqrt(fitted variance)`. Do not CPM, log1p, or
+z-score it again (`standardize_expression` would replace her fitted-SD scale
+with unit observed variance). Every source gene was already in ≥10 cells, so
+`MIN_CELLS=10` dropped nothing. Chi-square p<0.05 calls 2750 genes and BH
+q<0.05 calls 2451; 1598 is the rank cut. New PC1 vs published `X_pca` PC1 has
+Pearson **−0.964** (sign arbitrary). 30 new PCs explain 46.9% of OD-gene
+variance. Published PCs are in `obsm['X_pca_published']`.
+
+Pooled existence config, matching the cells ComBat and the 1598-gene set were
+fit on: `configs/jfanmerfish/jfan_fan2019_pooled_coord_perm.json`
+(`260930_jfan_merfish_fan2019_all_batches_p249`, 1368 cells, no `obs_filters`).
+Same linear-Gaussian recipe (249 perms, 500 epochs, 30 reruns) and normalization
+off. The three batches still share one coordinate frame, so this spatial test
+sees the overlaid monolayers. Per-batch siblings remain at
+`configs/jfanmerfish/jfan_fan2019_B{1,2,3}_coord_perm.json`.
+
+**Fan2019 per-batch runs are more significant because the loss is no longer an equal vote across 10,050 z-scored genes (2026-09-30):**
+`260930_jfan_merfish_fan2019_B{1,2,3}_p249` vs cosine z-score runs
+`260904_jfan_merfish_linear_decoder_B{1,2,3}_p499` (B1 old folder was
+re-run at 1000 epochs the same morning, p still 0.004).
+
+| batch | z-score p (z) | Fan2019 p (z) |
+|---|---|---|
+| B1 | 0.004 (8.2) | 0.004 (28.9) |
+| B2 | 0.324 (0.05) | 0.008 (3.8) |
+| B3 | 0.70 (−0.5) | 0.172 (0.94) |
+
+Fan `X` keeps only the 1598 overdispersed genes and does not z-score, so MSE
+weights genes by leftover variance (median var 1.68, max 36; top 50 genes are
+18% of total variance). Top isodepth genes become cell-cycle
+(CDC6, E2F1, GTSE1, BUB1B, CENPF, MCM10), the sibling-cell spatial structure.
+The old equal-weight 10,050-gene average dilutes that. F-test SVG counts went
+*down* (B1 1861→610), so the existence-test gap grew while the gene list got
+shorter. Absolute MSE is not comparable (Fan stat_true ≈ 2.73 vs z-score ≈ 0.99).
+
+**B1 cell-cycle together config (2026-09-30, not submitted):**
+`configs/jfanmerfish/jfan_raw_B1_cellcycle_coord_perm.json`. Same raw
+B1 recipe as `jfan_raw_B1_coord_perm.json` (CPM/log1p/z-score, linear, cosine,
+249 perms, 1000 epochs) with `cell_type=together` and
+`cell_type_key=cell_cycle_phase`. Shared encoder, per-stage linear decoder.
+B1 counts: G1 269, G1/S 167, G2/M 130, M 69, S 10. `min_cells_per_celltype=5`
+keeps S. Run name `260930_jfan_merfish_B1_cellcycle_together_p249`.
+
+**result.json omits decoder predictions unless `output.save_preds` is true (2026-09-30):**
+`save_standardized_outputs` used to embed `pred_true` (and covariate / Freedman–Lane
+prediction matrices) even when `save_preds` was false. That was ~6.5e6 floats and
+187 MB of the B1 z-score `*_result.json`. `_method_artifact_keys_for_json` now
+drops `pred_true`, `pred_true_covariate`, `pred_true_full_iso`, and
+`freedman_lane_pred` unless `save_preds` is true. Plots still read those arrays
+from the in-memory `TestResult` during the same run. Separate-cell-type
+`*_isodepths.npz` still stores `pred_true` for offline plot regen. Already-written
+result JSON files are unchanged.
+
+**CalicoST standard existence-permutation montage (2026-10-02):** Same 12 panels, under `existence_permutation/`. `existence_permutation_isodepth_pvalue_summary.png` uses the same tile layout. Panels at or under 0.05: 01, 03, 04, 05, 06 (0.024), 07, 11, 12, 18, 24, all at the 0.004 floor except 06. Not significant: 02 (0.672), 21 (0.208).
+
+## `correlated_null_permutation` variogram-matched null (2026-10-06)
+
+Config key `test.method: correlated_null_permutation`. Candidate blur bandwidths are
+`test.variogram_sigma_multiples` times the median nearest-neighbor distance on **raw**
+(unstandardized) coordinates, with a plain Gaussian kernel
+(`exp(-d²/(2σ²))`, row-normalized — same convention as `methods/spatial_blur.py`, not
+the locfit `/2.5` convention from `notebooks/variogram_matching.ipynb`).
+
+The matching loop prints a tqdm bar (`variogram matching`, or
+`variogram matching: <cell type>` in separate mode), one tick per permutation.
+It follows `test.verbose` the same way training bars do (`--quiet` hides it).
+
+Per perm slot: joint row shuffle of standardized `A`, blur, pick σ̂ by minimizing OLS
+variogram fit SSE `γ_X ≈ a γ_Y + b` over geoR-style bins (Q25 max.dist, 13 bins default),
+then `X' = sqrt(|a|) Y_{σ̂} + sqrt(|b|) R` with `R = W X / sqrt(N)` and `W` i.i.d.
+`N(0,1)` so each row of `R` has covariance `XᵀX/N` (unit diagonal when `A` is
+gene-z-scored). Re-z-score columns before GASTON. Negative OLS `a`/`b` use `|·|`
+(STCompare-style). Training uses fixed `S` and `a_batched` nulls,
+including loss-difference `fixed_covariate_values`. Memory: `(n_perms+1)×N×G` float32
+for `a_batched`. Diagnostics plots land in `variogram-matching/` under the run output
+dir (not serialized in `result.json`).
+
+**First hypothalamus separate run (2026-10-06)** —
+`results/hypothalamus/hypothalamus_correlated_null_separate_gaussian_linear_p249`. Name says
+p249 but `test.n_perms=99` (p floor 0.01). Only the three densest types reject (Astrocytes
+1081, Excitatory 1322, Inhibitory 2357; z ≈ −5 to −6). Sparse types skew to p≈1
+(Fibroblast and Mature oligodendrocyte 1.00, Unstable 0.97, Endothelial 0.93): the null
+fits *better* than the data. Cause: σ grid is a multiple of the per-type median NN distance
+(17 µm Inhibitory vs 50–124 µm sparse types), so 12×NN reaches 600–1500 µm, close to the
+1.8 mm tissue size. Small-n variograms are noisy (selection SSE 1–5 vs ~1e-3 for dense
+types). The OLS fit then returns tiny or negative intercepts and slopes up to 1e4, and the
+`|a|`/`|b|` fallback hides this. The surrogate becomes a near-global smooth field (in
+`Mature_oligodendrocyte/variogram-matching/variogram_best_match.png` the surrogate
+semivariance is ~0.1 while the real one is ~1), which a linear isodepth fits trivially. For
+dense types the opposite holds: the largest blur (~200–280 µm) plus the Q25 (~540 µm)
+variogram window cannot produce tissue-scale trends, so the null may be too easy to reject.
+p-values are not comparable across cell densities until the null is calibrated.
+
+**JFan Fan2019 B1/B2/B3 adaptive correlated null (2026-10-06, not submitted):**
+Latest per-batch matrix is `data/h5ad/merfish_xia2019_u2os_fan2019.h5ad` filtered by
+`obs['batch']` (B1 645, B2 400, B3 323). Expression is already CPM 1e6 / log1p /
+ComBat / fitted-SD scaled on the 1598 overdispersed genes, so
+`normalize_total`, `log1p`, and `standardize_expression` stay false. Each config
+is one replicate, so coordinates are that monolayer only. Method matches the
+hypothalamus adaptive config (`correlated_null_adaptive_permutation`, nn
+candidates 0–0.9, 13 bins). Training matches the Fan2019 existence runs
+(linear Gaussian, cosine, 249 perms, 500 epochs, 30 reruns).
+Configs: `configs/jfanmerfish/jfan_fan2019_B{1,2,3}_correlated_null.json`.
+Submit each with `sbatch run_config.sh <config>`.
+
+**Batched variogram matching (2026-10-08):** `test.variogram_backend` defaults to
+`cuda`. `sequential` is the reference loop and `cpu` is the CPU batch. A config
+that omits the key uses the GPU. A process that has already started keeps the backend it loaded.
+`test.variogram_perm_batch_size` overrides the batch. The library entry points take
+the same arguments (`backend`, `perm_batch_size`). Sequential code stays in
+`methods/correlated_null_permutation.py`. The batched path is
+`methods/variogram_matching_accel.py`.
+
+The fit is unchanged: each permutation × gene still picks its own bandwidth and its
+own nonnegative `a`, `b`, including the nn=0 identity score. Draws stay on the NumPy
+generator, one row permutation then one N×N Gaussian matrix, then the deterministic
+work is batched. Adaptive weights are built once per candidate (about 47 MB for B1's 14
+positive nn values). If that cache would exceed 512 MB they are built in cell blocks,
+applied to the whole permutation batch, and dropped. Candidates are scored one at a
+time so the full candidates × permutations × cells × genes array is never stored.
+CUDA products are float64. Surrogates stay float32.
+
+On CPU, the default batch size is 1. SciPy's sparse variogram products got slower
+as the column count grew (B1, 32 perms: 1.02 s/perm at batch 1, 2.57 s at batch 8,
+1.94 s at batch 32). Weight reuse is the CPU win, about 1.2× versus the reference.
+CUDA is flat from batch 8 through 32, so the GPU default is the 256 MB expression
+budget (32 permutations on B1).
+
+Fan2019 B1 check (645 cells, 1598 genes, 15 nn candidates, 13 bins, seed 42, L40S),
+8 permutations at batch 8, against the sequential path: permutations and noise
+identical, 0 bandwidth mismatches out of 12,784, candidate variograms and fit SSE
+within 6e-15, float32 surrogates identical. Same result on an earlier 2-permutation
+check. Component times, per permutation: sequential (8 perms) smooth 0.14 s,
+variogram 1.03 s, fit 0.004 s, total 1.23 s. CUDA batch 32 (32 perms) smooth 0.018 s,
+variogram 0.025 s, fit 0.004 s, total 0.076 s, about 16×. A 249-permutation surrogate
+build is about 5 minutes sequential and about 20 seconds on this GPU. Float64 GPU
+speed is hardware-dependent; this L40S was faster than the CPU. Bit-for-bit identity
+is not guaranteed when the product order or the device changes. The three Fan2019
+adaptive configs set `variogram_backend` to `cuda`. Set it back to `sequential` to
+compare.
+
+**`correlated_null_smooth_noise_study` FPR diagnosis (2026-10-07):** Results
+(`results/experiments/correlated_null_smooth_noise_study`, run 2026-10-06 13:25, before
+the NNLS variogram fit landed at 17:37, so they use the old `|a|`/`|b|` mixing). FPR is
+5/10, 2/10, and 0/10 at blur σ 15/30/45 µm. The selected σ matches on average (median NN
+≈7 µm, so multiples 2/4/6–8). Null mean minus true stat is the same +0.0043 at 15 and 30 µm,
+but the null SD grows with σ (0.0027 / 0.0084 / 0.0140). The number of independent
+patches scales as ~(L/σ)², so the null gets tighter at short σ and a fixed small
+roughness bias in the surrogate shows up as rejections. Sources of that bias: the
+grid point under the true σ (2×NN≈14 µm) is picked almost always at 15 µm; negative OLS
+intercepts turned into extra nugget noise via `|b|` (86% of genes at 15 µm, 67% at 30 µm,
+32% at 45 µm); and only ~1–2 of 13 variogram bins (Q25 ≈ 300+ µm window) resolve a 15 µm
+correlation. At 45 µm, about a third of picks are 8×NN (smoother), so the null fits better
+and p-values skew high. Re-run with the NNLS fit and a finer or log-spaced σ grid.
+
+**Maynard DLPFC 151673 adaptive correlated null (2026-10-07, config only, not submitted):**
+All 12 Visium sections are downloaded as separate raw-count h5ads
+(`data/h5ad/151507.h5ad` … `151676.h5ad`). The only config kept is the canonical slide
+**151673** (`obs['Region']`, unlabeled spots are real NaNs). `151507` is the odd file:
+its layer column is `sce.layer_guess`, not `Region`. `151669`–`151672` have no Layer1 or Layer2.
+`cell_type: "separate"` runs each present layer on its own.
+Config: `configs/maynard_dlpfc/maynard_dlpfc_151673_correlated_null_adaptive_separate_gaussian_linear_p249.json`.
+Count recipe matches the other Visium DLPFC runs (1000 HVGs, library-size, log1p, z-score).
+Method matches the hypothalamus separate adaptive config (linear Gaussian, 249 perms,
+500 epochs, 10 reruns, nn candidates 0–0.9). Submit with `sbatch run_config.sh <config>`.
 

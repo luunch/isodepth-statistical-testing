@@ -12,11 +12,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from data.h5ad_loader import preprocess_celltype_subset
 from data.transforms import (
     _CPM_TARGET,
     apply_expression_transforms,
     apply_expression_transforms_by_celltype,
     celltype_expression_residuals,
+    expressed_cells_required,
     filter_genes_by_min_cells,
     normalize_total_expression,
     zscore_covariate,
@@ -49,6 +51,72 @@ class TestBasicTransforms(unittest.TestCase):
         filtered = filter_genes_by_min_cells(a, min_cells_per_gene=2)
         self.assertEqual(filtered.shape, (3, 2))
         np.testing.assert_allclose(filtered, a[:, [0, 2]])
+
+    def test_both_support_constraints_must_hold(self) -> None:
+        # 20 cells. min_cells=8 is stricter than 20% (4 cells). A gene expressed
+        # in 6 cells clears the percentage and fails the count; one expressed in
+        # 8 cells clears both.
+        both = np.zeros((20, 3), dtype=np.float32)
+        both[:6, 0] = 1.0
+        both[:8, 1] = 1.0
+        both[:3, 2] = 1.0
+        filtered = filter_genes_by_min_cells(
+            both, min_cells_per_gene=8, min_sparsity_percentage=20.0
+        )
+        self.assertEqual(filtered.shape, (20, 1))
+        np.testing.assert_allclose(filtered[:, 0], both[:, 1])
+
+        # 30% requires 6 cells, which is stricter than min_cells=4. Five
+        # expressing cells clear the count and fail the percentage.
+        percentage_only = np.zeros((20, 2), dtype=np.float32)
+        percentage_only[:5, 0] = 1.0
+        percentage_only[:6, 1] = 1.0
+        filtered_pct = filter_genes_by_min_cells(
+            percentage_only, min_cells_per_gene=4, min_sparsity_percentage=30.0
+        )
+        self.assertEqual(filtered_pct.shape, (20, 1))
+        np.testing.assert_allclose(filtered_pct[:, 0], percentage_only[:, 1])
+        self.assertEqual(
+            expressed_cells_required(20, min_cells_per_gene=8, min_sparsity_percentage=20.0),
+            8,
+        )
+        self.assertEqual(
+            expressed_cells_required(20, min_cells_per_gene=4, min_sparsity_percentage=30.0),
+            6,
+        )
+
+    def test_sparsity_percentage_uses_each_domains_cell_count(self) -> None:
+        # Same gene, expressed in 5 cells. 20% plus min_cells=4 keeps it in a
+        # 10-cell domain (required 4) and drops it in a 100-cell domain (required 20).
+        small = np.zeros((10, 1), dtype=np.float32)
+        small[:5, 0] = 1.0
+        large = np.zeros((100, 1), dtype=np.float32)
+        large[:5, 0] = 1.0
+        self.assertEqual(
+            expressed_cells_required(10, min_cells_per_gene=4, min_sparsity_percentage=20.0),
+            4,
+        )
+        self.assertEqual(
+            expressed_cells_required(100, min_cells_per_gene=4, min_sparsity_percentage=20.0),
+            20,
+        )
+        kept_small, names_small, _ = preprocess_celltype_subset(
+            small,
+            ["gene_a"],
+            min_cells_per_gene=4,
+            min_sparsity_percentage=20.0,
+            standardize_expression=False,
+        )
+        self.assertEqual(names_small, ["gene_a"])
+        self.assertEqual(kept_small.shape, (10, 1))
+        with self.assertRaises(ValueError):
+            preprocess_celltype_subset(
+                large,
+                ["gene_a"],
+                min_cells_per_gene=4,
+                min_sparsity_percentage=20.0,
+                standardize_expression=False,
+            )
 
     def test_log1p_runs_before_standardization(self) -> None:
         counts = np.asarray(

@@ -180,26 +180,29 @@ def assemble_separate_loss_difference_artifacts(
     dataset: DatasetBundle,
     per_type_results: dict[str, dict],
 ) -> dict[str, object]:
-    """Aggregate per-cell-type loss-difference diagnostics into one artifact."""
+    """Keep loss-difference diagnostics keyed by cell type.
+
+    Separate cell-type analyses are independent regions, so their metric
+    vectors must not be averaged into a synthetic joint result.
+    """
     if not dataset_uses_loss_difference_whitening(dataset):
         return {}
 
     values = covariate_whitening_values(dataset)
     obs_key = covariate_whitening_obs_key(dataset)
-    joint_metrics: list[np.ndarray] = []
-    for type_data in per_type_results.values():
+    joint_metrics_by_type: dict[str, np.ndarray] = {}
+    for type_name, type_data in per_type_results.items():
         joint = type_data.get("loss_difference_joint_metrics")
         if joint is None:
             continue
-        joint_metrics.append(np.asarray(joint, dtype=np.float64))
+        joint_metrics_by_type[str(type_name)] = np.asarray(joint, dtype=np.float64)
 
-    if not joint_metrics:
+    if not joint_metrics_by_type:
         return {}
 
-    joint_mean = np.stack(joint_metrics, axis=0).mean(axis=0)
     return {
         "loss_difference_obs_key": obs_key,
         "loss_difference_covariate_values": values,
         "loss_difference_covariate_latent": zscore_covariate(values),
-        "loss_difference_joint_metrics": joint_mean,
+        "loss_difference_joint_metrics_by_cell_type": joint_metrics_by_type,
     }

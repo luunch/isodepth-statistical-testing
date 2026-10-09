@@ -1,0 +1,35 @@
+{
+  "data": {
+    "source": "h5ad",
+    "h5ad": "data/h5ad/merfish_xia2019_u2os_fan2019.h5ad",
+    "spatial_key": "spatial",
+    "min_cells_per_gene": 0,
+    "min_cells_per_celltype": 5,
+    "standardize_expression": false,
+    "standardize_coordinates": true,
+    "normalize_total": false,
+    "log1p": false,
+    "use_raw": false,
+    "seed": 0
+  },
+  "test": {
+    "method": "parallel_permutation",
+    "metric": "nll_gaussian_mse",
+    "n_perms": 249,
+    "epochs": 500,
+    "n_reruns": 30,
+    "sgd_batch_size": 128,
+    "sgd_cosine_lr_decay": true,
+    "lr": 0.001,
+    "seed": 42,
+    "device": "cuda",
+    "decoder": "linear",
+    "verbose": true
+  },
+  "output": {
+    "out_dir": "results/jfan_merfish",
+    "run_name": "260930_jfan_merfish_fan2019_all_batches_p249",
+    "save_preds": false,
+    "save_perm_stats": true
+  }
+}

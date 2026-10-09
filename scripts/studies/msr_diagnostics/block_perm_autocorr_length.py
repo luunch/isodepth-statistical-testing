@@ -4,7 +4,7 @@ Block-permutation null vs true global Moran's I (kernel noise).
 For a cached kernel-noise dataset (default: generative ρ=30 µm), computes
 Moran's I per gene on true coordinates and on each of ~100 block-permutation
 coordinate layouts (expression fixed). Spatial weights: inverse-distance within
-``--neighbor-radius`` µm (same convention as MSR).
+``--neighbor-radius`` µm (inverse-distance weights).
 
 Outputs a histogram of null mean Moran's I (mean across genes) with the true value marked.
 
@@ -35,7 +35,8 @@ from data import raw_coordinates_from_standardized
 from experiments.kernel_noise_study import load_dataset_cache
 from methods.block_permutation import block_stats, build_block_permuted_coordinate_batch
 from methods.moran import DEFAULT_MORAN_NEIGHBOR_RADIUS_UM
-from scripts.studies.msr_diagnostics.msr_null_smoke_test import SEED
+
+SEED = 42
 
 DEFAULT_DATASET = "d30_delta0p01_seed1"
 OUTDIR = REPO / "results/msr_null_smoke"

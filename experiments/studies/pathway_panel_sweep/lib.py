@@ -14,6 +14,13 @@ from data.schemas import RunConfig, SUPPORTED_EXISTENCE_METHODS, TestResult, run
 from data.transforms import zscore_covariate
 from experiments.configuration import build_run_config
 from experiments.core.paths import repo_root
+from experiments.core.study_spec import (
+    analysis_dir_for_output,
+    common_study_fields,
+    load_spec,
+    manifest_path_for_output,
+    resolve_repo_path as _resolve_repo_path,
+)
 from experiments.core.study_io import load_result_payload, scan_result_json_paths, write_csv
 from experiments.studies.random_gene_panel_null.lib import _surviving_gene_count_from_result
 from methods.metrics import canonicalize_metric_name, compute_metric, permutation_p_value
@@ -91,13 +98,6 @@ class PathwayPanelCondition:
     gene_list: list[str]
 
 
-def _resolve_repo_path(path_value: str | Path) -> Path:
-    path = Path(path_value)
-    if path.is_absolute():
-        return path.resolve()
-    return (REPO_ROOT / path).resolve()
-
-
 def load_gmt_gene_sets(gmt_path: str | Path) -> dict[str, list[str]]:
     """Load GMT file; returns pathway -> sorted gene symbol list."""
     path = Path(gmt_path)
@@ -119,16 +119,15 @@ def load_gmt_gene_sets(gmt_path: str | Path) -> dict[str, list[str]]:
 
 
 def load_pathway_panel_sweep_spec(path: str | Path) -> PathwayPanelSweepSpec:
-    spec_path = Path(path).resolve()
-    with open(spec_path, "r", encoding="utf-8") as handle:
-        payload = json.load(handle)
+    payload = load_spec(path)
+    experiment_name, base_config, output_root = common_study_fields(payload)
 
     hvg3000_config = payload.get("hvg3000_config")
     hvg3000_result_json = payload.get("hvg3000_result_json")
     spec = PathwayPanelSweepSpec(
-        experiment_name=str(payload["experiment_name"]),
-        base_config=_resolve_repo_path(payload["base_config"]),
-        output_root=_resolve_repo_path(payload["output_root"]),
+        experiment_name=experiment_name,
+        base_config=base_config,
+        output_root=output_root,
         gmt_path=_resolve_repo_path(payload["gmt_path"]),
         n_perms=int(payload.get("n_perms", 249)),
         n_reruns=int(payload.get("n_reruns", 30)),
@@ -300,11 +299,11 @@ def run_hvg3000_reference(spec: PathwayPanelSweepSpec) -> Path:
 
 
 def manifest_path_for_spec(spec: PathwayPanelSweepSpec) -> Path:
-    return spec.output_root / "manifest.json"
+    return manifest_path_for_output(spec.output_root)
 
 
 def analysis_dir_for_spec(spec: PathwayPanelSweepSpec) -> Path:
-    return spec.output_root / "analysis"
+    return analysis_dir_for_output(spec.output_root)
 
 
 def load_manifest_entries(path: str | Path) -> dict[Path, dict[str, Any]]:

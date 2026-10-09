@@ -8,7 +8,7 @@ and asks whether real spatial structure in A exceeds what random labelings produ
 
 Usage:
   python -m scripts.posthoc.plot_expression_variogram_true_vs_perm \\
-      configs/jfan_merfish.json \\
+      configs/jfanmerfish/jfan_raw_pooled_coord_perm.json \\
       results/jfan_merfish/260810_jfan_merfish_linear_decoder/260810_jfan_merfish_linear_decoder_result.json
 """
 from __future__ import annotations

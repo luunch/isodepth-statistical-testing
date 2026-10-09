@@ -88,7 +88,8 @@ def _select_hvg_mask(adata: ad.AnnData, n_top: int) -> np.ndarray:
     if sc is None:
         return _seurat_hvg_mask_from_counts(adata.X, int(n_top))
 
-    tmp = ad.AnnData(adata.X)
+    # AnnData may share X; Scanpy normalization/log1p mutate it in place.
+    tmp = ad.AnnData(adata.X.copy())
     tmp.var_names = adata.var_names.copy()
     tmp.obs_names = adata.obs_names.copy()
     sc.pp.normalize_total(tmp, target_sum=1e4)
@@ -117,22 +118,27 @@ def preprocess_celltype_subset(
     var_names: Optional[list[str]],
     *,
     min_cells_per_gene: int = 0,
+    min_sparsity_percentage: float = 0.0,
     top_var_genes: int = 0,
     normalize_total: bool = False,
     log1p: bool = False,
     standardize_expression: bool = True,
     q: Optional[int] = None,
+    n_expression_pcs: int = 0,
     seed: int = 0,
+    gene_counts: Optional[dict[str, int]] = None,
 ) -> tuple[np.ndarray, list[str], str]:
     """Apply the full expression-preprocessing pipeline to one cell-type subset.
 
     Mirrors the global ordering used by :func:`load_h5ad_dataset` (HVG selection on
     raw counts, then gene filtering + normalize/log1p/standardize/q), but every
-    statistic (HVG dispersion, ``min_cells_per_gene`` support, per-gene z-score
+    statistic (HVG dispersion, ``min_cells_per_gene`` support,
+    ``min_sparsity_percentage`` of this subset, per-gene z-score
     mean/std, Poisson low-rank factorization) is computed *within this subset only*.
 
     Returns ``(A_c, var_names_c, feature_space)`` where ``var_names_c`` are the
-    surviving gene names (or Poisson-latent feature names when ``q`` is set).
+    surviving gene names (or Poisson-latent / PC feature names when ``q`` /
+    ``n_expression_pcs`` is set).
     """
     counts = np.asarray(counts, dtype=np.float32)
     n_genes_full = counts.shape[1]
@@ -154,15 +160,20 @@ def preprocess_celltype_subset(
     transformed, transform_meta = apply_expression_transforms(
         work,
         min_cells_per_gene=min_cells_per_gene,
+        min_sparsity_percentage=min_sparsity_percentage,
         normalize_total=normalize_total,
         log1p=log1p,
         standardize_expression=standardize_expression,
         q=q,
+        n_expression_pcs=n_expression_pcs,
         seed=seed,
         return_metadata=True,
     )
     keep_mask = np.asarray(transform_meta["gene_keep_mask"], dtype=bool)
     surviving = surviving[keep_mask]
+    if gene_counts is not None:
+        gene_counts["n_genes_input"] = int(n_genes_full)
+        gene_counts["n_genes_kept"] = int(surviving.size)
 
     feature_space = str(transform_meta["representation"])
     if "feature_names" in transform_meta:
@@ -228,6 +239,68 @@ def _extract_expression(
     if x.ndim != 2:
         raise ValueError(f"Expression matrix must be 2D, got shape {x.shape}")
     return x
+
+
+def _restore_linear_normalized_expression(
+    adata: ad.AnnData,
+    *,
+    representation: str,
+    normalization_target: Optional[float],
+) -> tuple[ad.AnnData, dict]:
+    """Restore linear normalized values from a stored ``log1p`` matrix."""
+    if representation == "raw_counts":
+        return adata, {
+            "input_expression_representation": "raw_counts",
+            "input_normalization_target": None,
+            "restored_linear_expression": False,
+        }
+    if representation != "log1p_normalized":
+        raise ValueError(f"Unsupported input expression representation {representation!r}")
+    if normalization_target is None:
+        raise ValueError(
+            "input_normalization_target is required for log1p_normalized expression"
+        )
+
+    x = adata.X
+    if sp.issparse(x):
+        restored = x.copy()
+        restored.data = np.expm1(np.asarray(restored.data, dtype=np.float64)).astype(
+            np.float32
+        )
+        values = restored.data
+        row_totals = np.asarray(restored.sum(axis=1)).reshape(-1)
+    else:
+        restored = np.expm1(np.asarray(x, dtype=np.float64)).astype(np.float32)
+        values = restored.reshape(-1)
+        row_totals = restored.sum(axis=1)
+    if not np.all(np.isfinite(values)) or np.any(values < -1e-6):
+        raise ValueError(
+            "data.input_expression_representation='log1p_normalized' requires "
+            "finite, non-negative values after expm1"
+        )
+
+    target = float(normalization_target)
+    positive = row_totals > 0
+    max_relative_error = (
+        float(np.max(np.abs(row_totals[positive] - target) / target))
+        if positive.any()
+        else 0.0
+    )
+    if max_relative_error > 1e-3:
+        warnings.warn(
+            "Restored linear expression row totals do not match "
+            f"data.input_normalization_target={target:g}; maximum relative "
+            f"error is {max_relative_error:.3g}. Configured normalize_total "
+            "will still rescale each row."
+        )
+
+    adata.X = restored
+    return adata, {
+        "input_expression_representation": "log1p_normalized",
+        "input_normalization_target": target,
+        "restored_linear_expression": True,
+        "restored_row_total_max_relative_error": max_relative_error,
+    }
 
 
 MOSTA_BIN50_UM_PER_UNIT = 25.0  # Stereo-seq bin50: 50 DNBs × 0.5 µm/DNB pitch
@@ -558,8 +631,13 @@ def load_h5ad_dataset(
     obs_y_col: Optional[str] = None,
     layer: Optional[str] = None,
     use_raw: bool = False,
+    input_expression_representation: str = "raw_counts",
+    input_normalization_target: Optional[float] = None,
+    make_var_names_unique: bool = False,
     min_cells_per_gene: int = 0,
+    min_sparsity_percentage: float = 0.0,
     top_var_genes: int = 0,
+    n_expression_pcs: int = 0,
     exclude_gene_patterns: Optional[list[str]] = None,
     gene_list: Optional[list[str]] = None,
     normalize_total: bool = False,
@@ -593,6 +671,14 @@ def load_h5ad_dataset(
         adata = _safe_read_h5ad(h5ad_path)
     if getattr(adata, "isbacked", False):
         adata = adata.to_memory()
+    if make_var_names_unique and not adata.var_names.is_unique:
+        adata.var_names_make_unique()
+    adata, input_expression_meta = _restore_linear_normalized_expression(
+        adata,
+        representation=input_expression_representation,
+        normalization_target=input_normalization_target,
+    )
+    n_genes_input = int(adata.n_vars)
     adata, gene_exclusion_meta = _apply_gene_exclusions(adata, exclude_gene_patterns)
     adata, gene_list_meta = _apply_gene_list_filter(adata, gene_list)
     # In cell_type="separate" mode every expression statistic (HVG dispersion,
@@ -750,6 +836,7 @@ def load_h5ad_dataset(
             a,
             cell_type_labels,
             min_cells_per_gene=min_cells_per_gene,
+            min_sparsity_percentage=min_sparsity_percentage,
             log1p=log1p,
             standardize_expression=standardize_expression,
             q=q,
@@ -760,10 +847,12 @@ def load_h5ad_dataset(
         a, transform_meta = apply_expression_transforms(
             a,
             min_cells_per_gene=min_cells_per_gene,
+            min_sparsity_percentage=min_sparsity_percentage,
             normalize_total=normalize_total,
             log1p=log1p,
             standardize_expression=standardize_expression,
             q=q,
+            n_expression_pcs=n_expression_pcs,
             seed=seed,
             return_metadata=True,
         )
@@ -789,9 +878,22 @@ def load_h5ad_dataset(
         "obs_y_col": obs_y_col,
         "layer": layer,
         "use_raw": use_raw,
+        "input_expression_representation": input_expression_meta[
+            "input_expression_representation"
+        ],
+        "input_normalization_target": input_expression_meta[
+            "input_normalization_target"
+        ],
+        "restored_linear_expression": bool(
+            input_expression_meta["restored_linear_expression"]
+        ),
+        "make_var_names_unique": bool(make_var_names_unique),
         "cell_type_key": str(cell_type_key),
         "min_cells_per_gene": int(min_cells_per_gene),
+        "min_sparsity_percentage": float(min_sparsity_percentage),
         "top_var_genes": int(top_var_genes),
+        "n_genes_input": int(n_genes_input),
+        "n_expression_pcs": int(n_expression_pcs),
         "exclude_gene_patterns": gene_exclusion_meta["exclude_gene_patterns"],
         "excluded_gene_count": int(gene_exclusion_meta["excluded_gene_count"]),
         "excluded_gene_names": list(gene_exclusion_meta["excluded_gene_names"]),
@@ -808,6 +910,8 @@ def load_h5ad_dataset(
         "feature_space": str(transform_meta["representation"]),
         "var_names": feature_names,
     }
+    if not defer_preprocessing:
+        meta["n_genes_kept"] = int(keep_mask.sum())
     if coordinate_um_per_unit is not None:
         meta["coordinate_um_per_unit"] = float(coordinate_um_per_unit)
     if transform_meta.get("q_by_celltype"):
@@ -817,13 +921,19 @@ def load_h5ad_dataset(
         # the permutation code does not otherwise see).
         meta["separate_preprocessing"] = {
             "min_cells_per_gene": int(min_cells_per_gene),
+            "min_sparsity_percentage": float(min_sparsity_percentage),
             "top_var_genes": int(top_var_genes),
             "normalize_total": bool(normalize_total),
             "log1p": bool(log1p),
             "standardize_expression": bool(standardize_expression),
             "q": None if q is None else int(q),
+            "n_expression_pcs": int(n_expression_pcs),
             "seed": int(seed),
         }
+    if "restored_row_total_max_relative_error" in input_expression_meta:
+        meta["restored_row_total_max_relative_error"] = float(
+            input_expression_meta["restored_row_total_max_relative_error"]
+        )
     if cell_type_labels is not None and cell_type_names is not None:
         meta["cell_type_labels"] = cell_type_labels
         meta["cell_type_names"] = cell_type_names
@@ -869,8 +979,13 @@ def load_dataset_from_config(
         obs_y_col=config.obs_y_col,
         layer=config.layer,
         use_raw=config.use_raw,
+        input_expression_representation=config.input_expression_representation,
+        input_normalization_target=config.input_normalization_target,
+        make_var_names_unique=config.make_var_names_unique,
         min_cells_per_gene=config.min_cells_per_gene,
+        min_sparsity_percentage=config.min_sparsity_percentage,
         top_var_genes=config.top_var_genes,
+        n_expression_pcs=config.n_expression_pcs,
         exclude_gene_patterns=config.exclude_gene_patterns,
         gene_list=config.gene_list,
         normalize_total=config.normalize_total,

@@ -5,26 +5,75 @@ from typing import Any
 import numpy as np
 
 
+def expressed_cells_required(
+    n_cells: int,
+    *,
+    min_cells_per_gene: int = 0,
+    min_sparsity_percentage: float = 0.0,
+) -> int:
+    """Minimum number of expressing cells a gene must have in one domain.
+
+    ``min_sparsity_percentage`` is a percent of rows in that domain (``5`` means
+    5 percent; ``0`` disables it). When both constraints are positive, both must
+    hold, so the required count is the larger of the two. In
+    ``cell_type="separate"`` mode each domain has its own ``n_cells``, so the
+    same percentage becomes a different absolute count.
+    """
+    n_rows = int(n_cells)
+    min_cells = int(min_cells_per_gene)
+    pct = float(min_sparsity_percentage)
+    if min_cells < 0:
+        raise ValueError(f"min_cells_per_gene must be >= 0, got {min_cells_per_gene}")
+    if not np.isfinite(pct) or pct < 0.0 or pct > 100.0:
+        raise ValueError(
+            "min_sparsity_percentage must be between 0 and 100, "
+            f"got {min_sparsity_percentage}"
+        )
+    required = min_cells if min_cells > 0 else 0
+    if pct > 0.0 and n_rows > 0:
+        from_percentage = int(np.ceil((pct / 100.0) * n_rows - 1e-12))
+        required = max(required, from_percentage)
+    return int(required)
+
+
 def _filter_genes_by_min_cells(
     a: np.ndarray,
     min_cells_per_gene: int = 0,
+    min_sparsity_percentage: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     a_np = np.asarray(a, dtype=np.float32)
-    if min_cells_per_gene <= 0:
+    required = expressed_cells_required(
+        a_np.shape[0],
+        min_cells_per_gene=min_cells_per_gene,
+        min_sparsity_percentage=min_sparsity_percentage,
+    )
+    if required <= 0:
         keep = np.ones(a_np.shape[1], dtype=bool)
         return a_np, keep
 
     nonzero_per_gene = (a_np != 0).sum(axis=0)
-    keep = nonzero_per_gene >= min_cells_per_gene
+    keep = nonzero_per_gene >= required
     if keep.sum() == 0:
         raise ValueError(
-            "Filtering removed all genes. Lower min_cells_per_gene or choose another matrix/layer."
+            "Filtering removed all genes. Lower min_cells_per_gene and/or "
+            "min_sparsity_percentage, or choose another matrix/layer. "
+            f"(n_cells={a_np.shape[0]}, min_cells_per_gene={int(min_cells_per_gene)}, "
+            f"min_sparsity_percentage={float(min_sparsity_percentage)}, "
+            f"required_expressing_cells={required})"
         )
     return np.asarray(a_np[:, keep], dtype=np.float32), keep
 
 
-def filter_genes_by_min_cells(a: np.ndarray, min_cells_per_gene: int = 0) -> np.ndarray:
-    filtered, _ = _filter_genes_by_min_cells(a, min_cells_per_gene=min_cells_per_gene)
+def filter_genes_by_min_cells(
+    a: np.ndarray,
+    min_cells_per_gene: int = 0,
+    min_sparsity_percentage: float = 0.0,
+) -> np.ndarray:
+    filtered, _ = _filter_genes_by_min_cells(
+        a,
+        min_cells_per_gene=min_cells_per_gene,
+        min_sparsity_percentage=min_sparsity_percentage,
+    )
     return filtered
 
 
@@ -32,6 +81,42 @@ def _zscore_expression(a: np.ndarray) -> np.ndarray:
     mu = a.mean(axis=0, keepdims=True)
     sigma = a.std(axis=0, keepdims=True)
     return np.asarray((a - mu) / (sigma + 1e-8), dtype=np.float32)
+
+
+def project_expression_pcs(a: np.ndarray, n_pcs: int) -> tuple[np.ndarray, dict[str, Any]]:
+    """Replace gene columns with the leading principal components (cell scores).
+
+    Columns are mean-centered. The number of components is ``min(n_pcs, N-1, G)``.
+    Scores are ``U S`` from the SVD of the centered matrix (not whitened).
+    """
+    x = np.asarray(a, dtype=np.float64)
+    if x.ndim != 2:
+        raise ValueError(f"project_expression_pcs expects a 2-D matrix, got shape {x.shape}")
+    n_cells, n_genes = x.shape
+    n_requested = int(n_pcs)
+    if n_requested <= 0:
+        raise ValueError(f"n_pcs must be > 0, got {n_pcs}")
+    x = x - x.mean(axis=0, keepdims=True)
+    max_rank = int(min(max(n_cells - 1, 0), n_genes))
+    n_keep = min(n_requested, max_rank)
+    if n_keep < 1:
+        raise ValueError(
+            f"data.n_expression_pcs={n_requested} but the expression matrix "
+            f"has rank {max_rank} (n_cells={n_cells}, n_genes={n_genes})"
+        )
+    u, s, _vt = np.linalg.svd(x, full_matrices=False)
+    scores = u[:, :n_keep] * s[:n_keep]
+    total_ss = float(np.sum(s ** 2))
+    explained = (
+        (s[:n_keep] ** 2) / total_ss if total_ss > 0.0 else np.zeros(n_keep, dtype=np.float64)
+    )
+    return np.asarray(scores, dtype=np.float32), {
+        "representation": "expression_pcs",
+        "n_expression_pcs": int(n_keep),
+        "n_expression_pcs_requested": n_requested,
+        "explained_variance_ratio": explained.astype(np.float64).tolist(),
+        "feature_names": [f"PC{i + 1}" for i in range(n_keep)],
+    }
 
 
 def total_counts_covariate_values(A: np.ndarray) -> np.ndarray:
@@ -272,17 +357,30 @@ def apply_expression_transforms(
     a: np.ndarray,
     *,
     min_cells_per_gene: int = 0,
+    min_sparsity_percentage: float = 0.0,
     normalize_total: bool = False,
     log1p: bool = False,
     standardize_expression: bool = True,
     q: int | None = None,
+    n_expression_pcs: int = 0,
     seed: int = 0,
     return_metadata: bool = False,
 ) -> np.ndarray | tuple[np.ndarray, dict[str, Any]]:
-    transformed, keep_mask = _filter_genes_by_min_cells(a, min_cells_per_gene=min_cells_per_gene)
+    transformed, keep_mask = _filter_genes_by_min_cells(
+        a,
+        min_cells_per_gene=min_cells_per_gene,
+        min_sparsity_percentage=min_sparsity_percentage,
+    )
     metadata: dict[str, Any] = {
         "gene_keep_mask": keep_mask,
         "representation": "gene_expression",
+        "min_cells_per_gene": int(min_cells_per_gene),
+        "min_sparsity_percentage": float(min_sparsity_percentage),
+        "min_expressed_cells_required": expressed_cells_required(
+            np.asarray(a).shape[0],
+            min_cells_per_gene=min_cells_per_gene,
+            min_sparsity_percentage=min_sparsity_percentage,
+        ),
     }
 
     if log1p and q is not None:
@@ -292,6 +390,8 @@ def apply_expression_transforms(
             "normalize_total cannot be combined with q because the Poisson low-rank "
             "factorization handles library size via a size-factor offset, not by rescaling counts"
         )
+    if int(n_expression_pcs or 0) > 0 and q is not None:
+        raise ValueError("data.n_expression_pcs cannot be combined with data.q")
 
     if normalize_total:
         transformed = normalize_total_expression(transformed)
@@ -314,6 +414,12 @@ def apply_expression_transforms(
     if standardize_expression:
         transformed = _zscore_expression(transformed)
 
+    if int(n_expression_pcs or 0) > 0:
+        transformed, pca_meta = project_expression_pcs(transformed, int(n_expression_pcs))
+        metadata.update(pca_meta)
+        if standardize_expression:
+            transformed = _zscore_expression(transformed)
+
     transformed = np.asarray(transformed, dtype=np.float32)
     if return_metadata:
         metadata["normalize_total"] = bool(normalize_total)
@@ -328,6 +434,7 @@ def apply_expression_transforms_by_celltype(
     cell_type_labels: np.ndarray,
     *,
     min_cells_per_gene: int = 0,
+    min_sparsity_percentage: float = 0.0,
     normalize_total: bool = False,
     log1p: bool = False,
     standardize_expression: bool = True,
@@ -349,7 +456,11 @@ def apply_expression_transforms_by_celltype(
             "factorization handles library size via a size-factor offset, not by rescaling counts"
         )
 
-    filtered, keep_mask = _filter_genes_by_min_cells(a, min_cells_per_gene=min_cells_per_gene)
+    filtered, keep_mask = _filter_genes_by_min_cells(
+        a,
+        min_cells_per_gene=min_cells_per_gene,
+        min_sparsity_percentage=min_sparsity_percentage,
+    )
     labels = np.asarray(cell_type_labels, dtype=np.int64)
     if labels.shape[0] != filtered.shape[0]:
         raise ValueError(
@@ -382,6 +493,13 @@ def apply_expression_transforms_by_celltype(
         "feature_names": [f"poisson_latent_{idx + 1}" for idx in range(latent_dim)],
         "log1p": bool(log1p),
         "standardize_expression": bool(standardize_expression),
+        "min_cells_per_gene": int(min_cells_per_gene),
+        "min_sparsity_percentage": float(min_sparsity_percentage),
+        "min_expressed_cells_required": expressed_cells_required(
+            np.asarray(a).shape[0],
+            min_cells_per_gene=min_cells_per_gene,
+            min_sparsity_percentage=min_sparsity_percentage,
+        ),
     }
     transformed = np.asarray(transformed, dtype=np.float32)
     if return_metadata:

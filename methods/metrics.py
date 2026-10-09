@@ -49,6 +49,49 @@ def metric_prefers_lower(metric: str) -> bool:
     return canonicalize_metric_name(metric) in {"nll_gaussian_mse", "nll_poisson_mse", "mse"}
 
 
+_METRIC_AXIS_LABELS = {
+    "nll_gaussian_mse": "MSE",
+    "mse": "MSE",
+    "nll_poisson_mse": "Poisson NLL",
+    "pearson_corr_mean": "Pearson r",
+    "spearman_corr_mean": "Spearman \u03c1",
+}
+
+
+def metric_axis_label(metric: str) -> str:
+    """Human-readable axis label for null-distribution plots."""
+    return _METRIC_AXIS_LABELS.get(canonicalize_metric_name(metric), metric)
+
+
+def gaussian_nll_from_mse(
+    mse: np.ndarray | float,
+    n_total: float,
+) -> np.ndarray:
+    """Homoscedastic Gaussian NLL from MSE: ``(n/2) log(2π MSE) + n/2``.
+
+    Strictly increasing in ``mse`` for fixed ``n_total``, so argsort(NLL) matches
+    argsort(MSE). Kept for rank-equivalence checks; evaluation of
+    ``nll_gaussian_mse`` reports MSE itself.
+    """
+    mse_arr = np.asarray(mse, dtype=np.float64)
+    n = np.asarray(n_total, dtype=np.float64)
+    return (n / 2.0) * np.log(2.0 * np.pi * mse_arr + 1e-12) + (n / 2.0)
+
+
+def gaussian_mse_from_nll(
+    nll: np.ndarray | float,
+    n_total: float,
+) -> np.ndarray:
+    """Inverse of ``gaussian_nll_from_mse``: ``MSE = exp(2 NLL / n - 1) / (2π)``.
+
+    Used to overlay current MSE-scale blur losses on pre-2026-09-10 result
+    JSONs that still store total Gaussian NLL.
+    """
+    nll_arr = np.asarray(nll, dtype=np.float64)
+    n = np.asarray(n_total, dtype=np.float64)
+    return np.exp(2.0 * nll_arr / n - 1.0) / (2.0 * np.pi)
+
+
 def permutation_p_value(metric: str, stat_true: float, stat_perm: np.ndarray) -> float:
     stat_perm = np.asarray(stat_perm, dtype=np.float64)
     if metric_prefers_lower(metric):
@@ -104,11 +147,11 @@ def compute_metric(
         raise ValueError(f"y_true and y_pred must match shapes, got {y_true.shape} vs {y_pred.shape}")
 
     mse = float(np.mean((y_pred - y_true) ** 2))
-    if metric == "mse":
+    if metric in {"mse", "nll_gaussian_mse"}:
+        # ``nll_gaussian_mse`` is scored as MSE. Gaussian NLL is a strictly
+        # increasing function of MSE at fixed n, so permutation ranking is
+        # unchanged; MSE is the quantity plotted on the null distribution.
         return mse
-    if metric == "nll_gaussian_mse":
-        n_total = y_true.shape[0] * y_true.shape[1]
-        return float((n_total / 2) * np.log(2 * np.pi * mse + 1e-12) + (n_total / 2))
     if metric == "nll_poisson_mse":
         # Poisson NLL: mean(sf * exp(y_pred) - y_true * y_pred)
         # Default size factors: per-cell row sum of y_true.

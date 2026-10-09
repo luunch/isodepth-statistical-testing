@@ -12,11 +12,10 @@
     },
     "obs_drop_na": [
       "calicost_clone_label",
-      "calicost_tumor_proportion",
-      "log1p_total_counts"
+      "calicost_tumor_proportion"
     ],
     "covariate_whitening": "loss-difference",
-    "covariate_whitening_obs_key": ["calicost_tumor_proportion", "log1p_total_counts"],
+    "covariate_whitening_obs_key": "calicost_tumor_proportion",
     "min_cells_per_gene": 3,
     "min_cells_per_celltype": 30,
     "top_var_genes": 0,
@@ -77,7 +76,7 @@
   },
   "output": {
     "out_dir": "results/calicost/HT268B1-Th1K3Fc2U1Z1Bs1",
-    "run_name": "loss_diff_clone1_gt0p7_hypoxia_genes_tumor_logcounts",
+    "run_name": "loss_diff_clone1_gt0p7_hypoxia_genes_tumor_prop_only",
     "save_preds": false,
     "save_perm_stats": true
   }

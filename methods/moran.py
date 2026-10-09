@@ -1,4 +1,4 @@
-"""Global Moran's I diagnostics for permutation / MSR null slots."""
+"""Global Moran's I diagnostics for permutation null slots."""
 from __future__ import annotations
 
 import warnings

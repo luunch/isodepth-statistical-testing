@@ -39,7 +39,7 @@ Flat `experiments/<name>.py` files are **shims** that re-export from the nested 
 | `data_prep/` | h5ad builders, DeLeakage, CosMx segmentation, MOSTA download |
 | `regen/` | Plot regeneration from finished runs |
 | `posthoc/` | True-vs-null diagnostics on finished runs |
-| `studies/<topic>/` | Topic-scoped drivers (cosmx, dlpfc_layer3, msr_diagnostics, …) |
+| `studies/<topic>/` | Topic-scoped drivers (cosmx, dlpfc_layer3, …) |
 
 Top-level `scripts/<name>.py` shims remain only where other code still does `from scripts.<name> import …`.
 
@@ -58,5 +58,5 @@ Top-level `scripts/<name>.py` shims remain only where other code still does `fro
 Kernel-noise null one-shots and ad-hoc diags removed in the cleanup commit:
 
 - `_diag.py`, `_diag2.py`
-- `kernel_noise_{four_null,block_parallel,cholesky_null,variogram_null,spgp_450ep,spgp_parallel,rank_msr,joint_trunc_msr,joint_trunc_aclength,joint_trunc_r30_delta05,multiscale_gene_cov_null}.py`
-- `joint_trunc_{rank_msr_smoke,partial_rank_smoke,msr_positive_controls}.py`
+- `kernel_noise_{four_null,block_parallel,cholesky_null,variogram_null,spgp_450ep,spgp_parallel,joint_trunc_aclength,joint_trunc_r30_delta05,multiscale_gene_cov_null}.py`
+- `joint_trunc_partial_rank_smoke.py`

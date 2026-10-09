@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import replace
+from typing import Any
 
 import numpy as np
 import torch
@@ -21,7 +23,6 @@ from methods.freedman_lane import (
     whiten_expression_freedman_lane,
     _covariate_whitening_obs_key,
 )
-from methods.fourier import build_fourier_spectral_randomization_surrogates_from_meta
 from data.schemas import DatasetBundle, TestConfig, TestResult
 from data.transforms import celltype_expression_residuals, midline_latent, zscore_covariate
 from data import raw_coordinates_from_standardized, standardize_coordinate_batch
@@ -37,22 +38,16 @@ from methods.block_permutation import (
     build_block_permuted_coordinate_batch,
     resolve_um_per_unit,
 )
+from methods.correlated_null_permutation import (
+    build_correlated_null_adaptive_surrogates_from_dataset,
+    build_correlated_null_surrogates_from_dataset,
+)
 from methods.binning import bin_dataset_to_pseudospots, parallel_config_for_binned_run
 from methods.visium_pseudobulk import (
     build_visium_pseudobulk_dataset,
     parallel_config_for_visium_pseudobulk_run,
 )
 from methods.moran import maybe_compute_moran_artifacts
-from methods.msr import (
-    build_joint_truncated_msr_surrogates,
-    build_joint_truncated_rank_msr_surrogates,
-)
-from methods.perturbation import run_comparison_perturbation_test, run_perturbation_test
-from methods.subsampling import (
-    compute_masked_losses,
-    run_comparison_subsampling_test,
-    run_subsampling_test,
-)
 from methods.trainers import (
     covariate_decoder_is_closed_form,
     extract_celltype_model_isodepth,
@@ -297,6 +292,29 @@ def _select_extreme_index(metric: str, stat_perm: np.ndarray) -> int:
     return int(np.argmax(stat_perm))
 
 
+ExpressionNullBuilder = Callable[..., tuple[np.ndarray, dict[str, Any]]]
+
+
+def _expression_null_batched_arrays(
+    S: np.ndarray,
+    A: np.ndarray,
+    config: TestConfig,
+    builder: ExpressionNullBuilder,
+    dataset: DatasetBundle,
+    **builder_kwargs: Any,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    A_surr, diagnostics = builder(dataset, config, A_override=A, **builder_kwargs)
+    a_batched = np.concatenate(
+        [np.asarray(A, dtype=np.float32)[np.newaxis, :, :], A_surr],
+        axis=0,
+    ).astype(np.float32)
+    s_batched = np.tile(
+        np.asarray(S, dtype=np.float32)[np.newaxis, :, :],
+        (int(config.n_perms) + 1, 1, 1),
+    ).astype(np.float32)
+    return a_batched, s_batched, diagnostics
+
+
 def _build_permuted_coordinate_batch(
     S: np.ndarray,
     *,
@@ -343,90 +361,6 @@ def global_coordinate_permute_slot(
     return np.asarray(s_t[perm.numpy()].numpy(), dtype=np.float32)
 
 
-def _validate_cross_validation_folds(n_cells: int, n_folds: int) -> None:
-    if n_folds < 2:
-        raise ValueError("cross_validation requires test.n_folds >= 2")
-    if n_folds > n_cells:
-        raise ValueError(
-            f"cross_validation requires test.n_folds <= n_cells, got n_folds={n_folds} "
-            f"for n_cells={n_cells}"
-        )
-    max_test_size = int(np.ceil(float(n_cells) / float(n_folds)))
-    if n_cells - max_test_size < 1:
-        raise ValueError(
-            "cross_validation requires at least one train cell per fold for "
-            f"n_cells={n_cells} and n_folds={n_folds}"
-        )
-
-
-def _build_kfold_assignments(
-    n_cells: int,
-    n_folds: int,
-    seed: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return per-cell fold ids (0..k-1) and fold test sizes."""
-    _validate_cross_validation_folds(n_cells, n_folds)
-    rng = np.random.default_rng(seed)
-    indices = np.arange(n_cells, dtype=np.int64)
-    rng.shuffle(indices)
-
-    fold_ids = np.zeros(n_cells, dtype=np.int64)
-    fold_sizes = np.zeros(n_folds, dtype=np.int64)
-    base_size = n_cells // n_folds
-    remainder = n_cells % n_folds
-    pos = 0
-    for fold_index in range(n_folds):
-        size = base_size + (1 if fold_index < remainder else 0)
-        fold_sizes[fold_index] = size
-        fold_ids[indices[pos : pos + size]] = fold_index
-        pos += size
-    return fold_ids, fold_sizes
-
-
-def _fold_train_test_masks(
-    n_cells: int,
-    n_models: int,
-    fold_id: int,
-    cell_fold_ids: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    test_1d = (cell_fold_ids == fold_id).astype(np.float32)
-    train_1d = 1.0 - test_1d
-    if train_1d.sum() <= 0 or test_1d.sum() <= 0:
-        raise ValueError(
-            f"cross_validation fold {fold_id} produced empty train or test mask "
-            f"for n_cells={n_cells}"
-        )
-    train_mask = np.zeros((n_models, n_cells, 1), dtype=np.float32)
-    test_mask = np.zeros((n_models, n_cells, 1), dtype=np.float32)
-    train_mask[:, :, 0] = train_1d
-    test_mask[:, :, 0] = test_1d
-    return train_mask, test_mask
-
-
-def _aggregate_weighted_fold_losses(
-    fold_true_losses: list[float],
-    fold_perm_losses: list[np.ndarray],
-    fold_weights: np.ndarray,
-) -> tuple[float, np.ndarray]:
-    weights = np.asarray(fold_weights, dtype=np.float64)
-    if weights.shape[0] != len(fold_true_losses):
-        raise ValueError("fold_weights must match number of folds")
-    weight_sum = float(weights.sum())
-    if weight_sum <= 0:
-        raise ValueError("fold_weights must sum to a positive value")
-    weights = weights / weight_sum
-    true_values = np.asarray(fold_true_losses, dtype=np.float64)
-    perm_matrix = np.stack([np.asarray(values, dtype=np.float64) for values in fold_perm_losses], axis=0)
-    stat_true = float(np.sum(weights * true_values))
-    stat_perm = np.sum(weights[:, None] * perm_matrix, axis=0)
-    return stat_true, stat_perm
-
-
-def _format_isodepth_for_artifact(isodepth: np.ndarray) -> np.ndarray:
-    arr = np.asarray(isodepth, dtype=np.float32)
-    if arr.ndim == 2 and arr.shape[1] == 1:
-        return np.asarray(arr[:, 0], dtype=np.float32)
-    return arr
 
 
 def _rerun_summary(model) -> dict[str, object]:
@@ -470,19 +404,50 @@ def _celltype_indices_by_descending_cell_count(
     return [c for c, _ in counts]
 
 
+def _print_gene_filter_line(n_used: int, n_input: int, *, label: str | None = None) -> None:
+    """One terminal line: share of genes kept, and how many the filters removed."""
+    n_used = int(n_used)
+    n_input = int(n_input)
+    if n_input <= 0:
+        return
+    if n_used > n_input:
+        n_input = n_used
+    filtered = n_input - n_used
+    prefix = f"Genes ({label})" if label else "Genes"
+    print(
+        f"{prefix}: using {n_used}/{n_input} ({n_used / n_input:.1%}); filtered out {filtered}",
+        flush=True,
+    )
+
+
+def _print_dataset_gene_filter(dataset: DatasetBundle, *, label: str | None = None) -> None:
+    n_used = int(dataset.meta.get("n_genes_kept", dataset.n_genes))
+    n_input = int(dataset.meta.get("n_genes_input", n_used))
+    _print_gene_filter_line(n_used, n_input, label=label)
+
+
 def _preprocess_separate_subset(
-    dataset: DatasetBundle, A_c_raw: np.ndarray, type_index: int
+    dataset: DatasetBundle,
+    A_c_raw: np.ndarray,
+    type_index: int,
+    *,
+    label: str | None = None,
 ) -> tuple[np.ndarray, list[str] | None, str | None]:
     """Apply per-cell-type expression preprocessing for separate mode.
 
     When the loader deferred preprocessing (``cell_type="separate"``), HVG
     selection, gene filtering and z-scoring are computed *within this cell type
-    only*.  Falls back to the already-transformed matrix for datasets that did not
+    only*.  ``min_sparsity_percentage`` is a percent of this domain, so the
+    implied expressing-cell threshold differs across domains.  Falls back to the
+    already-transformed matrix for datasets that did not
     defer (e.g. synthetic bundles or legacy callers).
     """
     A_c_raw = np.asarray(A_c_raw, dtype=np.float32)
+    n_matrix = int(A_c_raw.shape[1])
+    n_file = int(dataset.meta.get("n_genes_input", n_matrix))
     pp = dataset.meta.get("separate_preprocessing")
     if not pp:
+        _print_gene_filter_line(n_matrix, n_file, label=label)
         return (
             A_c_raw,
             dataset.meta.get("var_names"),
@@ -490,12 +455,17 @@ def _preprocess_separate_subset(
         )
     params = {k: v for k, v in pp.items() if k != "seed"}
     seed = int(pp.get("seed", 0)) + int(type_index)
-    return preprocess_celltype_subset(
+    gene_counts: dict[str, int] = {}
+    transformed, var_names_c, feature_space = preprocess_celltype_subset(
         A_c_raw,
         dataset.meta.get("var_names"),
         seed=seed,
+        gene_counts=gene_counts,
         **params,
     )
+    n_kept = int(gene_counts.get("n_genes_kept", np.asarray(transformed).shape[1]))
+    _print_gene_filter_line(n_kept, n_file, label=label)
+    return transformed, var_names_c, feature_space
 
 
 def _process_single_celltype_separate(
@@ -508,12 +478,13 @@ def _process_single_celltype_separate(
     cell_type_labels: np.ndarray,
     metric: str,
     covariate_values: np.ndarray | None = None,
+    expression_null_builder: ExpressionNullBuilder | None = None,
 ) -> tuple[dict, tuple[np.ndarray, np.ndarray]]:
     """Train/evaluate one cell type; returns (per-type result dict, coord standardization)."""
     mask = cell_type_labels == type_index
     S_original_c = np.asarray(dataset.S[mask], dtype=np.float32)
     A_c, var_names_c, feature_space_c = _preprocess_separate_subset(
-        dataset, dataset.A[mask], type_index
+        dataset, dataset.A[mask], type_index, label=type_name
     )
     n_c = int(mask.sum())
 
@@ -549,15 +520,32 @@ def _process_single_celltype_separate(
         if fl_values is not None and dataset_uses_loss_difference_whitening(dataset)
         else None
     )
+    train_kwargs: dict[str, Any] = {
+        "S": S_c,
+        "A": A_c,
+        "config": parallel_config,
+        "device": device,
+    }
+    variogram_matching_diagnostics: dict[str, Any] | None = None
+    a_batched_c: np.ndarray | None = None
+    if expression_null_builder is not None:
+        S_raw_c = raw_coordinates_from_standardized(dataset.S, dataset.meta)[mask]
+        a_batched_c, s_batched_c, variogram_matching_diagnostics = _expression_null_batched_arrays(
+            S_c,
+            A_c,
+            type_config,
+            expression_null_builder,
+            dataset,
+            coords_override=S_raw_c,
+            seed_offset=type_index,
+            progress_label=type_name,
+        )
+        train_kwargs["s_batched"] = s_batched_c
+        train_kwargs["a_batched"] = a_batched_c
     model_c, training_outputs_c, s_batched_np_c, loss_diff_artifacts = _run_parallel_isodepth_training(
         dataset,
         train_fn=train_parallel_isodepth_model,
-        train_kwargs={
-            "S": S_c,
-            "A": A_c,
-            "config": parallel_config,
-            "device": device,
-        },
+        train_kwargs=train_kwargs,
         model_label=f"separate {type_name} h(d, n) ({n_c} cells)",
         covariate_values=cov_values_c,
     )
@@ -642,17 +630,28 @@ def _process_single_celltype_separate(
             dataset.meta,
             s_batched_np_c,
             A_c,
+            a_batched=a_batched_c,
             coord_mean=mean_c,
             coord_std=safe_std_c,
         ),
     }
+    if a_batched_c is not None:
+        type_result["lowest_A"] = a_batched_c[low_idx + 1].copy()
+        type_result["highest_A"] = a_batched_c[high_idx + 1].copy()
+    if variogram_matching_diagnostics is not None:
+        type_result["variogram_matching_diagnostics"] = variogram_matching_diagnostics
     del s_batched_np_c
     type_result["model"] = offload_module_to_cpu(model_c)
     return type_result, (mean_c, safe_std_c)
 
 
 def _run_celltype_separate_parallel_permutation(
-    dataset: DatasetBundle, config: TestConfig, device: torch.device
+    dataset: DatasetBundle,
+    config: TestConfig,
+    device: torch.device,
+    *,
+    expression_null_builder: ExpressionNullBuilder | None = None,
+    method_name: str = "parallel_permutation",
 ) -> TestResult:
     """Per-cell-type independent isodepth models with within-type permutations."""
     metric = canonicalize_metric_name(config.metric)
@@ -698,6 +697,7 @@ def _run_celltype_separate_parallel_permutation(
                 cell_type_labels=cell_type_labels,
                 metric=metric,
                 covariate_values=covariate_values,
+                expression_null_builder=expression_null_builder,
             )
             per_type_standardization[type_name] = standardization
             return type_result
@@ -730,11 +730,6 @@ def _run_celltype_separate_parallel_permutation(
 
     runtime_sec = time.time() - start
 
-    all_stat_true = [per_type_results[n]["stat_true"] for n in cell_type_names]
-    all_stat_perm = np.concatenate([per_type_results[n]["stat_perm"] for n in cell_type_names])
-    combined_stat_true = float(np.mean(all_stat_true))
-    combined_p = float(np.mean([per_type_results[n]["p_value"] for n in cell_type_names]))
-
     separate_artifacts: dict[str, object] = {
         "per_type_results": per_type_results,
         "cell_type_names": cell_type_names,
@@ -755,11 +750,11 @@ def _run_celltype_separate_parallel_permutation(
     separate_artifacts.update(assemble_separate_loss_difference_artifacts(dataset, per_type_results))
 
     return TestResult(
-        method_name="parallel_permutation",
+        method_name=method_name,
         metric=metric,
-        p_value=combined_p,
-        stat_true=combined_stat_true,
-        stat_perm=all_stat_perm,
+        p_value=None,
+        stat_true=None,
+        stat_perm=None,
         runtime_sec=runtime_sec,
         n_cells=dataset.n_cells,
         n_genes=dataset.n_genes,
@@ -923,7 +918,12 @@ def _run_celltype_parallel_permutation(
 
 
 def run_parallel_permutation_method(
-    dataset: DatasetBundle, config: TestConfig, device: torch.device | None = None
+    dataset: DatasetBundle,
+    config: TestConfig,
+    device: torch.device | None = None,
+    *,
+    expression_null_builder: ExpressionNullBuilder | None = None,
+    method_name: str = "parallel_permutation",
 ) -> TestResult:
     dataset.validate()
     config.validate()
@@ -931,7 +931,13 @@ def run_parallel_permutation_method(
     device = device or resolve_device(config.device)
 
     if dataset.meta.get("cell_type_mode") == "separate":
-        return _run_celltype_separate_parallel_permutation(dataset, config, device)
+        return _run_celltype_separate_parallel_permutation(
+            dataset,
+            config,
+            device,
+            expression_null_builder=expression_null_builder,
+            method_name=method_name,
+        )
     if dataset.meta.get("cell_type_labels") is not None:
         return _run_celltype_parallel_permutation(dataset, config, device)
 
@@ -939,16 +945,29 @@ def run_parallel_permutation_method(
     has_midline_covariate = _covariate_type_midline(config)
     has_values_covariate = _covariate_type_values(config)
     parallel_config = replace(config, covariate=None) if (has_midline_covariate or has_values_covariate) else config
+    train_kwargs: dict[str, Any] = {
+        "S": dataset.S,
+        "A": dataset.A,
+        "config": parallel_config,
+        "device": device,
+    }
+    variogram_matching_diagnostics: dict[str, Any] | None = None
+    a_batched: np.ndarray | None = None
+    if expression_null_builder is not None:
+        a_batched, s_batched, variogram_matching_diagnostics = _expression_null_batched_arrays(
+            dataset.S,
+            dataset.A,
+            config,
+            expression_null_builder,
+            dataset,
+        )
+        train_kwargs["s_batched"] = s_batched
+        train_kwargs["a_batched"] = a_batched
     loss_diff_artifacts: dict[str, object] = {}
     model, training_outputs, s_batched_np, loss_diff_artifacts = _run_parallel_isodepth_training(
         dataset,
         train_fn=train_parallel_isodepth_model,
-        train_kwargs={
-            "S": dataset.S,
-            "A": dataset.A,
-            "config": parallel_config,
-            "device": device,
-        },
+        train_kwargs=train_kwargs,
         model_label="parallel isodepth h(d, n)",
     )
     stat_true = float(training_outputs.stat_true)
@@ -998,525 +1017,46 @@ def run_parallel_permutation_method(
             ).astype(np.float32)
 
     moran_artifacts = maybe_compute_moran_artifacts(
-        config, dataset.meta, s_batched_np, dataset.A,
+        config,
+        dataset.meta,
+        s_batched_np,
+        dataset.A,
+        a_batched=a_batched,
     )
-
-    return TestResult(
-        method_name="parallel_permutation",
-        metric=metric,
-        p_value=p_value,
-        stat_true=stat_true,
-        stat_perm=stat_perm,
-        runtime_sec=runtime_sec,
-        n_cells=dataset.n_cells,
-        n_genes=dataset.n_genes,
-        config={"test": config.__dict__.copy()},
-        artifacts={
-            "model": model,
-            "pred_true": pred_true_np,
-            "true_isodepth": np.asarray(slot_iso[0], dtype=np.float32),
-            "rerun_summary": _rerun_summary(model),
-            "true_rerun_index": int(true_rerun_index),
-            "true_train_loss": float(true_train_loss),
-            "lowest_isodepth": np.asarray(slot_iso[low_idx + 1], dtype=np.float32),
-            "lowest_S": np.asarray(s_batched_np[low_idx + 1], dtype=np.float32),
-            "lowest_stat": float(stat_perm[low_idx]),
-            "lowest_perm_index": low_idx,
-            "lowest_rerun_index": int(lowest_rerun_index),
-            "lowest_train_loss": float(lowest_train_loss),
-            "highest_isodepth": np.asarray(slot_iso[high_idx + 1], dtype=np.float32),
-            "highest_S": np.asarray(s_batched_np[high_idx + 1], dtype=np.float32),
-            "highest_stat": float(stat_perm[high_idx]),
-            "highest_perm_index": high_idx,
-            "highest_rerun_index": int(highest_rerun_index),
-            "highest_train_loss": float(highest_train_loss),
-            **covariate_artifacts,
-            **loss_diff_artifacts,
-            **moran_artifacts,
-        },
-    ).validate()
-
-
-def _cross_validation_fold_weights(fold_test_sizes: np.ndarray, n_cells: int) -> np.ndarray:
-    return np.asarray(fold_test_sizes, dtype=np.float64) / float(n_cells)
-
-
-def _per_fold_p_values(
-    metric: str,
-    fold_true_losses: list[float],
-    fold_perm_losses: list[np.ndarray],
-) -> np.ndarray:
-    return np.asarray(
-        [
-            permutation_p_value(metric, float(true_loss), np.asarray(perm_losses, dtype=np.float64))
-            for true_loss, perm_losses in zip(fold_true_losses, fold_perm_losses)
-        ],
-        dtype=np.float64,
-    )
-
-
-def _extract_fold_true_isodepth_plain(model, S: np.ndarray, device: torch.device) -> np.ndarray:
-    return _format_isodepth_for_artifact(extract_model_isodepth(model, S, device, slot_index=0))
-
-
-def _extract_fold_true_isodepth_celltype(model, S: np.ndarray, device: torch.device) -> np.ndarray:
-    return _format_isodepth_for_artifact(
-        extract_celltype_model_isodepth(model, S, device, slot_index=0)
-    )
-
-
-def _cross_validation_common_artifacts(
-    *,
-    config: TestConfig,
-    metric: str,
-    stat_true: float,
-    stat_perm: np.ndarray,
-    fold_true_losses: list[float],
-    fold_perm_losses: list[np.ndarray],
-    fold_test_sizes: np.ndarray,
-    fold_weights: np.ndarray,
-    fold_true_isodepths: list[np.ndarray],
-    per_fold_p_values: np.ndarray,
-    primary_training_outputs,
-    primary_model,
-    primary_s_batched_np: np.ndarray,
-    primary_train_mask: np.ndarray,
-    primary_test_mask: np.ndarray,
-    device: torch.device,
-    covariate_artifacts: dict[str, object] | None = None,
-    pred_true_np: np.ndarray | None = None,
-    cell_type_isodepth: bool = False,
-    true_coords: np.ndarray | None = None,
-) -> dict[str, object]:
-    low_idx = int(primary_training_outputs.best_null_index)
-    high_idx = int(primary_training_outputs.worst_null_index)
-    if cell_type_isodepth:
-        true_s = true_coords if true_coords is not None else primary_s_batched_np[0]
-        slot_iso = {
-            0: extract_celltype_model_isodepth(primary_model, true_s, device, slot_index=0),
-            low_idx + 1: extract_celltype_model_isodepth(
-                primary_model,
-                primary_s_batched_np[low_idx + 1],
-                device,
-                slot_index=low_idx + 1,
-            ),
-            high_idx + 1: extract_celltype_model_isodepth(
-                primary_model,
-                primary_s_batched_np[high_idx + 1],
-                device,
-                slot_index=high_idx + 1,
-            ),
-        }
-        for key, iso in list(slot_iso.items()):
-            if iso.ndim == 2 and iso.shape[1] == 1:
-                slot_iso[key] = np.asarray(iso[:, 0], dtype=np.float32)
-            else:
-                slot_iso[key] = np.asarray(iso, dtype=np.float32)
-    else:
-        slot_iso = _extract_slot_isodepths(
-            primary_model, primary_s_batched_np, [0, low_idx + 1, high_idx + 1], device,
-        )
-    true_rerun_index, true_train_loss = _rerun_index_and_loss(primary_model, 0)
-    lowest_rerun_index, lowest_train_loss = _rerun_index_and_loss(primary_model, low_idx + 1)
-    highest_rerun_index, highest_train_loss = _rerun_index_and_loss(primary_model, high_idx + 1)
-    if pred_true_np is None:
-        pred_true_np = np.asarray(primary_training_outputs.pred_true, dtype=np.float32)
 
     artifacts: dict[str, object] = {
-        "model": primary_model,
+        "model": model,
         "pred_true": pred_true_np,
         "true_isodepth": np.asarray(slot_iso[0], dtype=np.float32),
-        "rerun_summary": _rerun_summary(primary_model),
+        "rerun_summary": _rerun_summary(model),
         "true_rerun_index": int(true_rerun_index),
         "true_train_loss": float(true_train_loss),
         "lowest_isodepth": np.asarray(slot_iso[low_idx + 1], dtype=np.float32),
-        "lowest_S": np.asarray(primary_s_batched_np[low_idx + 1], dtype=np.float32),
+        "lowest_S": np.asarray(s_batched_np[low_idx + 1], dtype=np.float32),
         "lowest_stat": float(stat_perm[low_idx]),
         "lowest_perm_index": low_idx,
         "lowest_rerun_index": int(lowest_rerun_index),
         "lowest_train_loss": float(lowest_train_loss),
         "highest_isodepth": np.asarray(slot_iso[high_idx + 1], dtype=np.float32),
-        "highest_S": np.asarray(primary_s_batched_np[high_idx + 1], dtype=np.float32),
+        "highest_S": np.asarray(s_batched_np[high_idx + 1], dtype=np.float32),
         "highest_stat": float(stat_perm[high_idx]),
         "highest_perm_index": high_idx,
         "highest_rerun_index": int(highest_rerun_index),
         "highest_train_loss": float(highest_train_loss),
-        "held_out_losses": np.asarray(primary_training_outputs.model_metrics, dtype=np.float64),
-        "null_summary": {
-            "mean": float(np.mean(stat_perm)),
-            "std": float(np.std(stat_perm)),
-            "min": float(np.min(stat_perm)),
-            "max": float(np.max(stat_perm)),
-        },
-        "train_mask": np.asarray(primary_train_mask, dtype=np.float32),
-        "test_mask": np.asarray(primary_test_mask, dtype=np.float32),
-        "n_folds": int(config.n_folds),
-        "fold_test_sizes": np.asarray(fold_test_sizes, dtype=np.int64),
-        "fold_weights": np.asarray(fold_weights, dtype=np.float64),
-        "per_fold_true_loss": np.asarray(fold_true_losses, dtype=np.float64),
-        "per_fold_perm_loss": np.stack(
-            [np.asarray(values, dtype=np.float64) for values in fold_perm_losses],
-            axis=0,
-        ),
-        "per_fold_p_values": np.asarray(per_fold_p_values, dtype=np.float64),
-        "per_fold_true_isodepth": np.stack(
-            [np.asarray(values, dtype=np.float32) for values in fold_true_isodepths],
-            axis=0,
-        ),
-        "train_size": int(np.sum(primary_train_mask > 0)),
-        "test_size": int(np.sum(primary_test_mask > 0)),
-        "observed_test_loss": float(stat_true),
+        **covariate_artifacts,
+        **loss_diff_artifacts,
+        **moran_artifacts,
     }
-    if covariate_artifacts:
-        artifacts.update(covariate_artifacts)
-    return artifacts
-
-
-def _run_kfold_cv_training_loop(
-    *,
-    dataset: DatasetBundle,
-    config: TestConfig,
-    metric: str,
-    device: torch.device,
-    s_batched_np: np.ndarray,
-    cell_fold_ids: np.ndarray,
-    fold_test_sizes: np.ndarray,
-    train_fn,
-    train_kwargs: dict,
-    extract_fold_isodepth_fn=None,
-) -> tuple[
-    float,
-    np.ndarray,
-    object,
-    object,
-    np.ndarray,
-    np.ndarray,
-    np.ndarray,
-    list[float],
-    list[np.ndarray],
-    list[np.ndarray],
-    np.ndarray,
-]:
-    n_models = config.n_perms + 1
-    n_folds = int(config.n_folds)
-    fold_true_losses: list[float] = []
-    fold_perm_losses: list[np.ndarray] = []
-    fold_true_isodepths: list[np.ndarray] = []
-    primary_model = None
-    primary_training_outputs = None
-    primary_train_mask = None
-    primary_test_mask = None
-
-    for fold_id in range(n_folds):
-        train_mask_batched, test_mask_batched = _fold_train_test_masks(
-            dataset.n_cells,
-            n_models=n_models,
-            fold_id=fold_id,
-            cell_fold_ids=cell_fold_ids,
-        )
-        model, training_outputs, s_batched_out = train_fn(
-            dataset.S,
-            dataset.A,
-            config,
-            device=device,
-            s_batched=s_batched_np,
-            loss_mask_batched=train_mask_batched,
-            metric_loss_mask_batched=test_mask_batched,
-            model_label=(
-                f"cross validation fold {fold_id + 1}/{n_folds} "
-                f"(true + {config.n_perms} permuted models)"
-            ),
-            **train_kwargs,
-        )
-        fold_true_losses.append(float(training_outputs.stat_true))
-        fold_perm_losses.append(np.asarray(training_outputs.stat_perm, dtype=np.float64))
-        if extract_fold_isodepth_fn is not None:
-            fold_true_isodepths.append(
-                np.asarray(
-                    extract_fold_isodepth_fn(model, dataset.S, device),
-                    dtype=np.float32,
-                )
-            )
-        if fold_id == 0:
-            primary_model = model
-            primary_training_outputs = training_outputs
-            primary_train_mask = np.asarray(train_mask_batched[0, :, 0], dtype=np.float32)
-            primary_test_mask = np.asarray(test_mask_batched[0, :, 0], dtype=np.float32)
-        else:
-            del model
-
-    assert primary_model is not None
-    assert primary_training_outputs is not None
-    assert primary_train_mask is not None
-    assert primary_test_mask is not None
-
-    fold_weights = _cross_validation_fold_weights(fold_test_sizes, dataset.n_cells)
-    stat_true, stat_perm = _aggregate_weighted_fold_losses(
-        fold_true_losses,
-        fold_perm_losses,
-        fold_weights,
-    )
-    per_fold_p_values = _per_fold_p_values(metric, fold_true_losses, fold_perm_losses)
-    return (
-        stat_true,
-        stat_perm,
-        primary_model,
-        primary_training_outputs,
-        s_batched_np,
-        primary_train_mask,
-        primary_test_mask,
-        fold_true_losses,
-        fold_perm_losses,
-        fold_true_isodepths,
-        per_fold_p_values,
-    )
-
-
-def _run_plain_cross_validation(
-    dataset: DatasetBundle, config: TestConfig, device: torch.device
-) -> TestResult:
-    metric = canonicalize_metric_name(config.metric)
-    start = time.time()
-    _validate_cross_validation_folds(dataset.n_cells, config.n_folds)
-    cell_fold_ids, fold_test_sizes = _build_kfold_assignments(
-        dataset.n_cells,
-        config.n_folds,
-        config.seed,
-    )
-
-    s_batched_pre, _ = _build_permuted_coordinate_batch(
-        dataset.S,
-        n_perms=config.n_perms,
-        seed=config.seed,
-        device=device,
-    )
-    s_batched_np = np.asarray(s_batched_pre.detach().cpu().numpy(), dtype=np.float32)
-    del s_batched_pre
-
-    has_midline_covariate = _covariate_type_midline(config)
-    has_values_covariate = _covariate_type_values(config)
-    parallel_config = replace(config, covariate=None) if (has_midline_covariate or has_values_covariate) else config
-
-    (
-        stat_true,
-        stat_perm,
-        model,
-        training_outputs,
-        s_batched_np,
-        primary_train_mask,
-        primary_test_mask,
-        fold_true_losses,
-        fold_perm_losses,
-        fold_true_isodepths,
-        per_fold_p_values,
-    ) = _run_kfold_cv_training_loop(
-        dataset=dataset,
-        config=parallel_config,
-        metric=metric,
-        device=device,
-        s_batched_np=s_batched_np,
-        cell_fold_ids=cell_fold_ids,
-        fold_test_sizes=fold_test_sizes,
-        train_fn=train_parallel_isodepth_model,
-        train_kwargs={},
-        extract_fold_isodepth_fn=_extract_fold_true_isodepth_plain,
-    )
-
-    covariate_artifacts: dict[str, object] = {}
-    if _has_covariate(config):
-        cov_values = (
-            _values_covariate_from_dataset(dataset, config) if has_values_covariate else None
-        )
-        covariate_artifacts = _train_covariate_artifacts(
-            dataset.S,
-            dataset.A,
-            config,
-            device,
-            metric,
-            stat_perm,
-            covariate_values=cov_values,
-            model_label=(
-                f"values covariate decoder ({config.covariate.type})"
-                if has_values_covariate
-                else "true layout covariate decoder"
-            ),
-        )
-
-    pred_true_np = np.asarray(training_outputs.pred_true, dtype=np.float32)
-    if canonicalize_metric_name(metric) == "nll_poisson_mse":
-        sf_row = np.asarray(dataset.A, dtype=np.float32).sum(axis=1, keepdims=True)
-        pred_true_np = (sf_row * np.exp(pred_true_np)).astype(np.float32)
-        pred_cov = covariate_artifacts.get("pred_true_covariate")
-        if pred_cov is not None:
-            covariate_artifacts["pred_true_covariate"] = (
-                sf_row * np.exp(np.asarray(pred_cov, dtype=np.float32))
-            ).astype(np.float32)
-
-    fold_weights = _cross_validation_fold_weights(fold_test_sizes, dataset.n_cells)
-    runtime_sec = time.time() - start
-    return TestResult(
-        method_name="cross_validation",
-        metric=metric,
-        p_value=permutation_p_value(metric, stat_true, stat_perm),
-        stat_true=stat_true,
-        stat_perm=stat_perm,
-        runtime_sec=runtime_sec,
-        n_cells=dataset.n_cells,
-        n_genes=dataset.n_genes,
-        config={"test": config.__dict__.copy()},
-        artifacts=_cross_validation_common_artifacts(
-            config=config,
-            metric=metric,
-            stat_true=stat_true,
-            stat_perm=stat_perm,
-            fold_true_losses=fold_true_losses,
-            fold_perm_losses=fold_perm_losses,
-            fold_test_sizes=fold_test_sizes,
-            fold_weights=fold_weights,
-            fold_true_isodepths=fold_true_isodepths,
-            per_fold_p_values=per_fold_p_values,
-            primary_training_outputs=training_outputs,
-            primary_model=model,
-            primary_s_batched_np=s_batched_np,
-            primary_train_mask=primary_train_mask,
-            primary_test_mask=primary_test_mask,
-            device=device,
-            covariate_artifacts=covariate_artifacts,
-            pred_true_np=pred_true_np,
-        ),
-    ).validate()
-
-
-def _run_celltype_together_cross_validation(
-    dataset: DatasetBundle, config: TestConfig, device: torch.device
-) -> TestResult:
-    metric = canonicalize_metric_name(config.metric)
-    cell_type_labels = np.asarray(dataset.meta["cell_type_labels"], dtype=np.int64)
-    n_cell_types = int(dataset.meta["n_cell_types"])
-    start = time.time()
-    _validate_cross_validation_folds(dataset.n_cells, config.n_folds)
-    cell_fold_ids, fold_test_sizes = _build_kfold_assignments(
-        dataset.n_cells,
-        config.n_folds,
-        config.seed,
-    )
-
-    s_batched_pre, _ = _build_permuted_coordinate_batch(
-        dataset.S,
-        n_perms=config.n_perms,
-        seed=config.seed,
-        device=device,
-    )
-    s_batched_np = np.asarray(s_batched_pre.detach().cpu().numpy(), dtype=np.float32)
-    del s_batched_pre
-
-    has_midline_covariate = _covariate_type_midline(config)
-    has_values_covariate = _covariate_type_values(config)
-    parallel_config = replace(config, covariate=None) if (has_midline_covariate or has_values_covariate) else config
-
-    (
-        stat_true,
-        stat_perm,
-        model,
-        training_outputs,
-        s_batched_np,
-        primary_train_mask,
-        primary_test_mask,
-        fold_true_losses,
-        fold_perm_losses,
-        fold_true_isodepths,
-        per_fold_p_values,
-    ) = _run_kfold_cv_training_loop(
-        dataset=dataset,
-        config=parallel_config,
-        metric=metric,
-        device=device,
-        s_batched_np=s_batched_np,
-        cell_fold_ids=cell_fold_ids,
-        fold_test_sizes=fold_test_sizes,
-        train_fn=train_celltype_parallel_isodepth_model,
-        train_kwargs={
-            "cell_type_labels": cell_type_labels,
-            "n_cell_types": n_cell_types,
-        },
-        extract_fold_isodepth_fn=_extract_fold_true_isodepth_celltype,
-    )
-
-    is_poisson_ct = canonicalize_metric_name(metric) == "nll_poisson_mse"
-    if is_poisson_ct:
-        expression_for_covariate = np.asarray(dataset.A, dtype=np.float32)
-        ct_means = np.zeros((n_cell_types, dataset.A.shape[1]), dtype=np.float32)
-        for ct in range(n_cell_types):
-            mask = cell_type_labels == ct
-            if mask.any():
-                ct_means[ct] = expression_for_covariate[mask].mean(axis=0)
-        sf_ct_np: np.ndarray | None = np.maximum(ct_means[cell_type_labels], 1e-3)
-    else:
-        expression_for_covariate = celltype_expression_residuals(
-            dataset.A,
-            cell_type_labels,
-            n_cell_types=n_cell_types,
-        )
-        sf_ct_np = None
-
-    covariate_artifacts: dict[str, object] = {}
-    if _has_covariate(config):
-        cov_values = (
-            _values_covariate_from_dataset(dataset, config) if has_values_covariate else None
-        )
-        covariate_artifacts = _train_covariate_artifacts(
-            dataset.S,
-            expression_for_covariate,
-            config,
-            device,
-            metric,
-            stat_perm,
-            covariate_values=cov_values,
-            model_label="true layout covariate decoder (cell-type parallel)",
-            poisson_size_factors_np=sf_ct_np,
-        )
-
-    pred_true_np = np.asarray(training_outputs.pred_true, dtype=np.float32)
-    if is_poisson_ct and sf_ct_np is not None:
-        pred_true_np = (sf_ct_np * np.exp(pred_true_np)).astype(np.float32)
-        pred_cov = covariate_artifacts.get("pred_true_covariate")
-        if pred_cov is not None:
-            covariate_artifacts["pred_true_covariate"] = (
-                sf_ct_np * np.exp(np.asarray(pred_cov, dtype=np.float32))
-            ).astype(np.float32)
-
-    fold_weights = _cross_validation_fold_weights(fold_test_sizes, dataset.n_cells)
-    runtime_sec = time.time() - start
-    artifacts = _cross_validation_common_artifacts(
-        config=config,
-        metric=metric,
-        stat_true=stat_true,
-        stat_perm=stat_perm,
-        fold_true_losses=fold_true_losses,
-        fold_perm_losses=fold_perm_losses,
-        fold_test_sizes=fold_test_sizes,
-        fold_weights=fold_weights,
-        fold_true_isodepths=fold_true_isodepths,
-        per_fold_p_values=per_fold_p_values,
-        primary_training_outputs=training_outputs,
-        primary_model=model,
-        primary_s_batched_np=s_batched_np,
-        primary_train_mask=primary_train_mask,
-        primary_test_mask=primary_test_mask,
-        device=device,
-        covariate_artifacts=covariate_artifacts,
-        pred_true_np=pred_true_np,
-        cell_type_isodepth=True,
-        true_coords=np.asarray(dataset.S, dtype=np.float32),
-    )
-    artifacts["cell_type_labels"] = cell_type_labels
-    artifacts["cell_type_names"] = dataset.meta["cell_type_names"]
-    artifacts["n_cell_types"] = n_cell_types
+    if a_batched is not None:
+        artifacts["lowest_A"] = a_batched[low_idx + 1].copy()
+        artifacts["highest_A"] = a_batched[high_idx + 1].copy()
+    if variogram_matching_diagnostics is not None:
+        artifacts["variogram_matching_diagnostics"] = variogram_matching_diagnostics
 
     return TestResult(
-        method_name="cross_validation",
+        method_name=method_name,
         metric=metric,
-        p_value=permutation_p_value(metric, stat_true, stat_perm),
+        p_value=p_value,
         stat_true=stat_true,
         stat_perm=stat_perm,
         runtime_sec=runtime_sec,
@@ -1527,271 +1067,104 @@ def _run_celltype_together_cross_validation(
     ).validate()
 
 
-def _process_single_celltype_separate_cv(
-    dataset: DatasetBundle,
-    config: TestConfig,
-    device: torch.device,
-    *,
-    type_index: int,
-    type_name: str,
-    cell_type_labels: np.ndarray,
-    metric: str,
-    covariate_values: np.ndarray | None = None,
-) -> tuple[dict, tuple[np.ndarray, np.ndarray]]:
-    mask = cell_type_labels == type_index
-    S_original_c = np.asarray(dataset.S[mask], dtype=np.float32)
-    A_c = dataset.A[mask]
-    n_c = int(mask.sum())
-
-    mean_c = S_original_c.mean(axis=0)
-    std_c = S_original_c.std(axis=0)
-    safe_std_c = np.where(std_c > 1e-8, std_c, 1.0)
-    S_c = np.asarray((S_original_c - mean_c) / safe_std_c, dtype=np.float32)
-
-    type_config = replace(config, seed=config.seed + type_index)
-    parallel_config = replace(type_config, covariate=None) if _has_covariate(config) else type_config
-    _validate_cross_validation_folds(n_c, type_config.n_folds)
-    cell_fold_ids, fold_test_sizes = _build_kfold_assignments(
-        n_c,
-        type_config.n_folds,
-        type_config.seed,
-    )
-
-    s_batched_pre, _ = _build_permuted_coordinate_batch(
-        S_c,
-        n_perms=type_config.n_perms,
-        seed=type_config.seed,
-        device=device,
-    )
-    s_batched_np = np.asarray(s_batched_pre.detach().cpu().numpy(), dtype=np.float32)
-    del s_batched_pre
-
-    subset_bundle = DatasetBundle(S=S_c, A=A_c).validate()
-    (
-        stat_true,
-        stat_perm,
-        model_c,
-        training_outputs_c,
-        s_batched_np,
-        primary_train_mask,
-        primary_test_mask,
-        fold_true_losses,
-        fold_perm_losses,
-        fold_true_isodepths,
-        per_fold_p_values,
-    ) = _run_kfold_cv_training_loop(
-        dataset=subset_bundle,
-        config=parallel_config,
-        metric=metric,
-        device=device,
-        s_batched_np=s_batched_np,
-        cell_fold_ids=cell_fold_ids,
-        fold_test_sizes=fold_test_sizes,
-        train_fn=train_parallel_isodepth_model,
-        train_kwargs={},
-        extract_fold_isodepth_fn=_extract_fold_true_isodepth_plain,
-    )
-    p_value_c = permutation_p_value(metric, stat_true, stat_perm)
-
-    covariate_artifacts: dict[str, object] = {}
-    if _has_covariate(config):
-        cov_values_c = None
-        if covariate_values is not None:
-            cov_values_c = np.asarray(covariate_values[mask], dtype=np.float32)
-        cov_label = config.covariate.type if config.covariate is not None else "covariate"
-        covariate_artifacts = _train_covariate_artifacts(
-            S_c,
-            A_c,
-            type_config,
-            device,
-            metric,
-            stat_perm,
-            covariate_values=cov_values_c,
-            model_label=f"{cov_label} covariate decoder ({type_name})",
-        )
-
-    fold_weights = _cross_validation_fold_weights(fold_test_sizes, n_c)
-    low_idx = int(training_outputs_c.best_null_index)
-    high_idx = int(training_outputs_c.worst_null_index)
-    slot_iso = _extract_slot_isodepths(
-        model_c, s_batched_np, [0, low_idx + 1, high_idx + 1], device,
-    )
-    true_rerun_index, true_train_loss = _rerun_index_and_loss(model_c, 0)
-    lowest_rerun_index, lowest_train_loss = _rerun_index_and_loss(model_c, low_idx + 1)
-    highest_rerun_index, highest_train_loss = _rerun_index_and_loss(model_c, high_idx + 1)
-
-    pred_true_c = np.asarray(training_outputs_c.pred_true, dtype=np.float32)
-    if canonicalize_metric_name(metric) == "nll_poisson_mse":
-        sf_row_c = np.asarray(A_c, dtype=np.float32).sum(axis=1, keepdims=True)
-        pred_true_c = (sf_row_c * np.exp(pred_true_c)).astype(np.float32)
-        pred_cov_c = covariate_artifacts.get("pred_true_covariate")
-        if pred_cov_c is not None:
-            covariate_artifacts["pred_true_covariate"] = (
-                sf_row_c * np.exp(np.asarray(pred_cov_c, dtype=np.float32))
-            ).astype(np.float32)
-
-    type_result = {
-        "p_value": p_value_c,
-        "stat_true": stat_true,
-        "stat_perm": stat_perm,
-        "n_cells": n_c,
-        "model": model_c,
-        "pred_true": pred_true_c,
-        "true_isodepth": np.asarray(slot_iso[0], dtype=np.float32),
-        "rerun_summary": _rerun_summary(model_c),
-        "true_rerun_index": int(true_rerun_index),
-        "true_train_loss": float(true_train_loss),
-        "lowest_isodepth": np.asarray(slot_iso[low_idx + 1], dtype=np.float32),
-        "lowest_S": np.asarray(s_batched_np[low_idx + 1], dtype=np.float32),
-        "lowest_stat": float(stat_perm[low_idx]),
-        "lowest_perm_index": int(low_idx),
-        "lowest_rerun_index": int(lowest_rerun_index),
-        "lowest_train_loss": float(lowest_train_loss),
-        "highest_isodepth": np.asarray(slot_iso[high_idx + 1], dtype=np.float32),
-        "highest_S": np.asarray(s_batched_np[high_idx + 1], dtype=np.float32),
-        "highest_stat": float(stat_perm[high_idx]),
-        "highest_perm_index": int(high_idx),
-        "highest_rerun_index": int(highest_rerun_index),
-        "highest_train_loss": float(highest_train_loss),
-        "n_folds": int(type_config.n_folds),
-        "fold_test_sizes": np.asarray(fold_test_sizes, dtype=np.int64),
-        "fold_weights": np.asarray(fold_weights, dtype=np.float64),
-        "per_fold_true_loss": np.asarray(fold_true_losses, dtype=np.float64),
-        "per_fold_perm_loss": np.stack(
-            [np.asarray(values, dtype=np.float64) for values in fold_perm_losses],
-            axis=0,
-        ),
-        "per_fold_p_values": np.asarray(per_fold_p_values, dtype=np.float64),
-        "per_fold_true_isodepth": np.stack(
-            [np.asarray(values, dtype=np.float32) for values in fold_true_isodepths],
-            axis=0,
-        ),
-        "train_mask": np.asarray(primary_train_mask, dtype=np.float32),
-        "test_mask": np.asarray(primary_test_mask, dtype=np.float32),
-        "observed_test_loss": float(stat_true),
-        "S": S_c,
-        "S_original": S_original_c,
-        "A": A_c,
-        **covariate_artifacts,
-    }
-    del s_batched_np
-    type_result["model"] = offload_module_to_cpu(model_c)
-    return type_result, (mean_c, safe_std_c)
-
-
-def _run_celltype_separate_cross_validation(
-    dataset: DatasetBundle, config: TestConfig, device: torch.device
+def run_correlated_null_permutation_method(
+    dataset: DatasetBundle, config: TestConfig, device: torch.device | None = None
 ) -> TestResult:
-    metric = canonicalize_metric_name(config.metric)
-    cell_type_labels = np.asarray(dataset.meta["cell_type_labels"], dtype=np.int64)
-    cell_type_names: list[str] = list(dataset.meta["cell_type_names"])
-    n_cell_types = int(dataset.meta["n_cell_types"])
-    type_order = _celltype_indices_by_descending_cell_count(cell_type_labels, n_cell_types)
-    covariate_values = dataset.meta.get("covariate_values")
-    if _covariate_type_values(config) and covariate_values is None:
-        cov_type = config.covariate.type
-        raise ValueError(
-            f"test.covariate type '{cov_type}' was specified but "
-            "dataset.meta['covariate_values'] is missing."
+    """Variogram-matched correlated nulls with fixed coordinates (plain or separate mode)."""
+    dataset.validate()
+    config.validate()
+    if (
+        dataset.meta.get("cell_type_labels") is not None
+        and dataset.meta.get("cell_type_mode") != "separate"
+    ):
+        raise NotImplementedError(
+            "correlated_null_permutation currently supports plain datasets or "
+            "cell_type='separate' only."
         )
-    if covariate_values is not None:
-        covariate_values = np.asarray(covariate_values, dtype=np.float32)
-
-    start = time.time()
-    per_type_results: dict[str, dict] = {}
-    per_type_standardization: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    current_device = device
-
-    for step_idx, type_index in enumerate(type_order):
-        type_name = cell_type_names[type_index]
-        n_c = int((cell_type_labels == type_index).sum())
+    device = device or resolve_device(config.device)
+    if config.verbose:
         print(
-            f"Cell type {step_idx + 1}/{n_cell_types}: {type_name} ({n_c} cells)",
+            "Correlated null permutation: fixed S, variogram-matched expression nulls "
+            f"(sigma multiples={list(config.variogram_sigma_multiples)})",
             flush=True,
         )
 
-        used_device = current_device
-
-        def _train_current_type(train_device: torch.device) -> dict:
-            nonlocal used_device
-            used_device = train_device
-            type_result, standardization = _process_single_celltype_separate_cv(
-                dataset,
-                config,
-                train_device,
-                type_index=type_index,
-                type_name=type_name,
-                cell_type_labels=cell_type_labels,
-                metric=metric,
-                covariate_values=covariate_values,
-            )
-            per_type_standardization[type_name] = standardization
-            return type_result
-
-        per_type_results[type_name] = run_with_cuda_oom_retry(
-            _train_current_type,
-            current_device,
-            label=f"cell type '{type_name}'",
+    def _builder(
+        ds: DatasetBundle,
+        cfg: TestConfig,
+        *,
+        A_override: np.ndarray | None = None,
+        coords_override: np.ndarray | None = None,
+        seed_offset: int = 0,
+        progress_label: str | None = None,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        return build_correlated_null_surrogates_from_dataset(
+            ds,
+            cfg,
+            A_override=A_override,
+            coords_override=coords_override,
+            seed_offset=seed_offset,
+            progress_label=progress_label,
         )
-        current_device = used_device
 
-    full_isodepths: list[np.ndarray] = []
-    spearman_labels: list[str] = []
-    for type_name in cell_type_names:
-        mean_c, safe_std_c = per_type_standardization[type_name]
-        S_full_standardized = np.asarray(
-            (dataset.S - mean_c) / safe_std_c, dtype=np.float32,
-        )
-        model_c = per_type_results[type_name]["model"]
-        iso_full = _extract_isodepth_from_model(model_c, S_full_standardized, device)
-        full_isodepths.append(iso_full.reshape(-1))
-        spearman_labels.append(type_name)
-
-    spearman_matrix, spearman_labels = _compute_spearman_matrix(
-        full_isodepths, spearman_labels,
+    return run_parallel_permutation_method(
+        dataset,
+        config,
+        device,
+        expression_null_builder=_builder,
+        method_name="correlated_null_permutation",
     )
-    runtime_sec = time.time() - start
-
-    all_stat_true = [per_type_results[n]["stat_true"] for n in cell_type_names]
-    all_stat_perm = np.concatenate([per_type_results[n]["stat_perm"] for n in cell_type_names])
-    combined_stat_true = float(np.mean(all_stat_true))
-    combined_p = float(np.mean([per_type_results[n]["p_value"] for n in cell_type_names]))
-
-    return TestResult(
-        method_name="cross_validation",
-        metric=metric,
-        p_value=combined_p,
-        stat_true=combined_stat_true,
-        stat_perm=all_stat_perm,
-        runtime_sec=runtime_sec,
-        n_cells=dataset.n_cells,
-        n_genes=dataset.n_genes,
-        config={"test": config.__dict__.copy()},
-        artifacts={
-            "per_type_results": per_type_results,
-            "cell_type_names": cell_type_names,
-            "cell_type_labels": cell_type_labels,
-            "n_cell_types": n_cell_types,
-            "cell_type_mode": "separate",
-            "spearman_matrix": spearman_matrix,
-            "spearman_labels": spearman_labels,
-            "n_folds": int(config.n_folds),
-        },
-    ).validate()
 
 
-def run_cross_validation_method(
+def run_correlated_null_adaptive_permutation_method(
     dataset: DatasetBundle, config: TestConfig, device: torch.device | None = None
 ) -> TestResult:
+    """STCompare adaptive locfit variogram-matched correlated nulls (separate or plain)."""
     dataset.validate()
     config.validate()
+    if (
+        dataset.meta.get("cell_type_labels") is not None
+        and dataset.meta.get("cell_type_mode") != "separate"
+    ):
+        raise NotImplementedError(
+            "correlated_null_adaptive_permutation currently supports plain datasets or "
+            "cell_type='separate' only."
+        )
     device = device or resolve_device(config.device)
+    if config.verbose:
+        print(
+            "Correlated null adaptive permutation (STCompare locfit): fixed S, "
+            f"nn candidates={list(config.variogram_nn_candidates)}",
+            flush=True,
+        )
 
-    if dataset.meta.get("cell_type_mode") == "separate":
-        return _run_celltype_separate_cross_validation(dataset, config, device)
-    if dataset.meta.get("cell_type_labels") is not None:
-        return _run_celltype_together_cross_validation(dataset, config, device)
-    return _run_plain_cross_validation(dataset, config, device)
+    def _builder(
+        ds: DatasetBundle,
+        cfg: TestConfig,
+        *,
+        A_override: np.ndarray | None = None,
+        coords_override: np.ndarray | None = None,
+        seed_offset: int = 0,
+        progress_label: str | None = None,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        return build_correlated_null_adaptive_surrogates_from_dataset(
+            ds,
+            cfg,
+            A_override=A_override,
+            coords_override=coords_override,
+            seed_offset=seed_offset,
+            progress_label=progress_label,
+        )
+
+    return run_parallel_permutation_method(
+        dataset,
+        config,
+        device,
+        expression_null_builder=_builder,
+        method_name="correlated_null_adaptive_permutation",
+    )
+
+
 
 
 def run_full_retraining_method(
@@ -1934,7 +1307,7 @@ def _process_single_celltype_separate_block_permutation(
     # used by save_combined_celltype_isodepth_grid whose tissue_limits come from dataset.S.
     S_original_c = np.asarray(dataset.S[mask], dtype=np.float32)
     A_c, var_names_c, feature_space_c = _preprocess_separate_subset(
-        dataset, dataset.A[mask], type_index
+        dataset, dataset.A[mask], type_index, label=type_name
     )
     n_c = int(mask.sum())
 
@@ -2150,17 +1523,12 @@ def _run_celltype_separate_block_permutation(
 
     runtime_sec = time.time() - start
 
-    all_stat_true = [per_type_results[n]["stat_true"] for n in cell_type_names]
-    all_stat_perm = np.concatenate([per_type_results[n]["stat_perm"] for n in cell_type_names])
-    combined_stat_true = float(np.mean(all_stat_true))
-    combined_p = float(np.mean([per_type_results[n]["p_value"] for n in cell_type_names]))
-
     return TestResult(
         method_name="block_permutation",
         metric=metric,
-        p_value=combined_p,
-        stat_true=combined_stat_true,
-        stat_perm=all_stat_perm,
+        p_value=None,
+        stat_true=None,
+        stat_perm=None,
         runtime_sec=runtime_sec,
         n_cells=dataset.n_cells,
         n_genes=dataset.n_genes,
@@ -2399,524 +1767,7 @@ def run_block_permutation_method(
     ).validate()
 
 
-def _run_joint_msr_method(
-    dataset: DatasetBundle,
-    config: TestConfig,
-    device: torch.device | None = None,
-    *,
-    method_name: str,
-    rank_match: bool,
-) -> TestResult:
-    """Joint truncated MSR family: expression surrogates with fixed coordinates."""
-    dataset.validate()
-    config.validate()
-    metric = canonicalize_metric_name(config.metric)
-    device = device or resolve_device(config.device)
 
-    if dataset.meta.get("cell_type_mode") == "separate":
-        return _run_celltype_separate_joint_msr(
-            dataset,
-            config,
-            device,
-            method_name=method_name,
-            rank_match=rank_match,
-        )
-
-    um_per_unit = resolve_um_per_unit(
-        config.coordinate_um_per_unit,
-        dataset.meta.get("coordinate_um_per_unit"),
-    )
-    neighbor_radius_um = float(config.msr_neighbor_radius_um)  # type: ignore[arg-type]
-    truncate_um = float(config.msr_truncate_um) if config.msr_truncate_um is not None else 0.0
-    calibration_um = float(config.msr_calibration_um) if config.msr_calibration_um is not None else None
-
-    S_raw = raw_coordinates_from_standardized(dataset.S, dataset.meta)
-    S_um = np.asarray(S_raw, dtype=np.float64) * um_per_unit
-
-    label = "Joint truncated rank-MSR" if rank_match else "Joint truncated MSR"
-    if config.verbose:
-        zscore_note = (
-            " [coords z-scored for training; MSR basis on raw physical coords]"
-            if dataset.meta.get("coordinate_standardization") == "zscore"
-            else ""
-        )
-        shared_note = " shared_rank=True" if rank_match and config.msr_shared_rank else ""
-        print(
-            f"{label}: neighbor_radius={neighbor_radius_um:.1f} µm, "
-            f"truncate>{truncate_um:.1f} µm, "
-            f"calibration_um={calibration_um if calibration_um is not None else 'auto'}"
-            f"{shared_note}{zscore_note}"
-        )
-
-    start = time.time()
-    if rank_match:
-        A_surr = build_joint_truncated_rank_msr_surrogates(
-            S_um,
-            dataset.A,
-            n_surrogates=config.n_perms,
-            seed=config.seed,
-            radius=neighbor_radius_um,
-            truncate_scale_um=truncate_um,
-            calibration_um=calibration_um,
-            shared_rank=bool(config.msr_shared_rank),
-        )
-    else:
-        A_surr = build_joint_truncated_msr_surrogates(
-            S_um,
-            dataset.A,
-            n_surrogates=config.n_perms,
-            seed=config.seed,
-            radius=neighbor_radius_um,
-            truncate_scale_um=truncate_um,
-            calibration_um=calibration_um,
-        )
-    # slot 0 = true A; slots 1..n_perms = surrogates
-    a_batched = np.concatenate(
-        [dataset.A[np.newaxis, :, :], A_surr], axis=0
-    ).astype(np.float32)
-    # coordinates are identical for every slot
-    s_batched = np.tile(dataset.S[np.newaxis, :, :], (config.n_perms + 1, 1, 1))
-
-    # --- train all slots in one parallel pass --------------------------------
-    has_midline_covariate = _covariate_type_midline(config)
-    has_values_covariate = _covariate_type_values(config)
-    parallel_config = (
-        replace(config, covariate=None)
-        if (has_midline_covariate or has_values_covariate)
-        else config
-    )
-
-    model, training_outputs, s_batched_np = train_parallel_isodepth_model(
-        dataset.S,
-        dataset.A,
-        parallel_config,
-        device=device,
-        s_batched=s_batched,
-        a_batched=a_batched,
-    )
-
-    stat_true = float(training_outputs.stat_true)
-    stat_perm = training_outputs.stat_perm
-    p_value = permutation_p_value(metric, stat_true, stat_perm)
-
-    if _has_covariate(config):
-        cov_values = (
-            _values_covariate_from_dataset(dataset, config) if has_values_covariate else None
-        )
-        covariate_artifacts = _train_covariate_artifacts(
-            dataset.S,
-            dataset.A,
-            config,
-            device,
-            metric,
-            stat_perm,
-            covariate_values=cov_values,
-            model_label=(
-                f"values covariate decoder ({config.covariate.type})"
-                if has_values_covariate
-                else "true layout covariate decoder"
-            ),
-        )
-    else:
-        covariate_artifacts = {}
-
-    low_idx = int(training_outputs.best_null_index)
-    high_idx = int(training_outputs.worst_null_index)
-    # s_batched_np is all identical (same S for every slot), so lowest/highest_S == dataset.S
-    slot_iso = _extract_slot_isodepths(
-        model, s_batched_np, [0, low_idx + 1, high_idx + 1], device,
-    )
-    true_rerun_index, true_train_loss = _rerun_index_and_loss(model, 0)
-    lowest_rerun_index, lowest_train_loss = _rerun_index_and_loss(model, low_idx + 1)
-    highest_rerun_index, highest_train_loss = _rerun_index_and_loss(model, high_idx + 1)
-    runtime_sec = time.time() - start
-
-    pred_true_np = np.asarray(training_outputs.pred_true, dtype=np.float32)
-    is_poisson = canonicalize_metric_name(metric) == "nll_poisson_mse"
-    if is_poisson:
-        A_f = np.asarray(dataset.A, dtype=np.float32)
-        sf_row = A_f.sum(axis=1, keepdims=True)
-        pred_true_np = (sf_row * np.exp(pred_true_np)).astype(np.float32)
-        pred_cov = covariate_artifacts.get("pred_true_covariate")
-        if pred_cov is not None:
-            covariate_artifacts["pred_true_covariate"] = (
-                sf_row * np.exp(np.asarray(pred_cov, dtype=np.float32))
-            ).astype(np.float32)
-
-    S_raw_moran = raw_coordinates_from_standardized(dataset.S, dataset.meta)
-    s_native_moran = np.tile(
-        np.asarray(S_raw_moran, dtype=np.float32)[np.newaxis, :, :],
-        (a_batched.shape[0], 1, 1),
-    )
-    moran_artifacts = maybe_compute_moran_artifacts(
-        config,
-        dataset.meta,
-        s_batched_np,
-        dataset.A,
-        a_batched=a_batched,
-        s_batched_native=s_native_moran,
-    )
-
-    return TestResult(
-        method_name=method_name,
-        metric=metric,
-        p_value=p_value,
-        stat_true=stat_true,
-        stat_perm=stat_perm,
-        runtime_sec=runtime_sec,
-        n_cells=dataset.n_cells,
-        n_genes=dataset.n_genes,
-        config={"test": config.__dict__.copy()},
-        artifacts={
-            "model": model,
-            "pred_true": pred_true_np,
-            "true_isodepth": np.asarray(slot_iso[0], dtype=np.float32),
-            "rerun_summary": _rerun_summary(model),
-            "true_rerun_index": int(true_rerun_index),
-            "true_train_loss": float(true_train_loss),
-            "lowest_isodepth": np.asarray(slot_iso[low_idx + 1], dtype=np.float32),
-            "lowest_S": np.asarray(s_batched_np[low_idx + 1], dtype=np.float32),
-            "lowest_stat": float(stat_perm[low_idx]),
-            "lowest_perm_index": low_idx,
-            "lowest_rerun_index": int(lowest_rerun_index),
-            "lowest_train_loss": float(lowest_train_loss),
-            "highest_isodepth": np.asarray(slot_iso[high_idx + 1], dtype=np.float32),
-            "highest_S": np.asarray(s_batched_np[high_idx + 1], dtype=np.float32),
-            "highest_stat": float(stat_perm[high_idx]),
-            "highest_perm_index": high_idx,
-            "highest_rerun_index": int(highest_rerun_index),
-            "highest_train_loss": float(highest_train_loss),
-            "msr_surrogate_example": np.asarray(A_surr[0], dtype=np.float32),
-            **covariate_artifacts,
-            **moran_artifacts,
-        },
-    ).validate()
-
-
-def _process_single_celltype_separate_joint_msr(
-    dataset: DatasetBundle,
-    config: TestConfig,
-    device: torch.device,
-    *,
-    type_index: int,
-    type_name: str,
-    cell_type_labels: np.ndarray,
-    method_name: str,
-    rank_match: bool,
-    S_raw_full: np.ndarray,
-    um_per_unit: float,
-) -> tuple[dict, tuple[np.ndarray, np.ndarray]]:
-    """Run joint truncated MSR independently for one separated spatial group."""
-    mask = cell_type_labels == type_index
-    S_raw_c = np.asarray(S_raw_full[mask], dtype=np.float32)
-    S_original_c = np.asarray(dataset.S[mask], dtype=np.float32)
-    A_c, var_names_c, feature_space_c = _preprocess_separate_subset(
-        dataset, dataset.A[mask], type_index
-    )
-    n_c = int(mask.sum())
-
-    mean_c = S_raw_c.mean(axis=0)
-    std_c = S_raw_c.std(axis=0)
-    safe_std_c = np.where(std_c > 1e-8, std_c, 1.0)
-    S_c = np.asarray((S_raw_c - mean_c) / safe_std_c, dtype=np.float32)
-
-    subset = DatasetBundle(
-        S=S_c,
-        A=np.asarray(A_c, dtype=np.float32),
-        meta={
-            "coordinate_standardization": "zscore",
-            "coord_mean": np.asarray(mean_c, dtype=np.float32),
-            "coord_std": np.asarray(safe_std_c, dtype=np.float32),
-            "coordinate_um_per_unit": float(um_per_unit),
-            "var_names": var_names_c,
-            "feature_space": feature_space_c,
-            "cell_type_mode": "none",
-        },
-    ).validate()
-    type_config = replace(
-        config,
-        seed=config.seed + type_index,
-        coordinate_um_per_unit=float(um_per_unit),
-    )
-    result_c = _run_joint_msr_method(
-        subset,
-        type_config,
-        device,
-        method_name=method_name,
-        rank_match=rank_match,
-    )
-    artifacts = dict(result_c.artifacts)
-    model_c = artifacts.pop("model")
-    type_result = {
-        "p_value": float(result_c.p_value),
-        "stat_true": float(result_c.stat_true),
-        "stat_perm": np.asarray(result_c.stat_perm, dtype=np.float64),
-        "n_cells": n_c,
-        "n_genes": int(np.asarray(A_c).shape[1]),
-        "model": offload_module_to_cpu(model_c),
-        "S": S_c,
-        "S_original": S_original_c,
-        "S_raw": S_raw_c,
-        "A": np.asarray(A_c, dtype=np.float32),
-        "var_names": var_names_c,
-        "feature_space": feature_space_c,
-        **artifacts,
-    }
-    return type_result, (mean_c, safe_std_c)
-
-
-def _run_celltype_separate_joint_msr(
-    dataset: DatasetBundle,
-    config: TestConfig,
-    device: torch.device,
-    *,
-    method_name: str,
-    rank_match: bool,
-) -> TestResult:
-    """Run MSR after DBSCAN/cell-type separation, independently per retained group."""
-    metric = canonicalize_metric_name(config.metric)
-    cell_type_labels = np.asarray(dataset.meta["cell_type_labels"], dtype=np.int64)
-    cell_type_names: list[str] = list(dataset.meta["cell_type_names"])
-    n_cell_types = int(dataset.meta["n_cell_types"])
-    type_order = _celltype_indices_by_descending_cell_count(cell_type_labels, n_cell_types)
-    S_raw = raw_coordinates_from_standardized(dataset.S, dataset.meta)
-    um_per_unit = resolve_um_per_unit(
-        config.coordinate_um_per_unit,
-        dataset.meta.get("coordinate_um_per_unit"),
-    )
-
-    start = time.time()
-    per_type_results: dict[str, dict] = {}
-    per_type_standardization: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    current_device = device
-
-    for step_idx, type_index in enumerate(type_order):
-        type_name = cell_type_names[type_index]
-        n_c = int((cell_type_labels == type_index).sum())
-        print(
-            f"MSR group {step_idx + 1}/{n_cell_types}: {type_name} ({n_c} cells)",
-            flush=True,
-        )
-        used_device = current_device
-
-        def _train_current_group(
-            train_device: torch.device,
-            _ti=type_index,
-            _tn=type_name,
-        ) -> dict:
-            nonlocal used_device
-            used_device = train_device
-            type_result, standardization = _process_single_celltype_separate_joint_msr(
-                dataset,
-                config,
-                train_device,
-                type_index=_ti,
-                type_name=_tn,
-                cell_type_labels=cell_type_labels,
-                method_name=method_name,
-                rank_match=rank_match,
-                S_raw_full=S_raw,
-                um_per_unit=um_per_unit,
-            )
-            per_type_standardization[_tn] = standardization
-            return type_result
-
-        per_type_results[type_name] = run_with_cuda_oom_retry(
-            _train_current_group,
-            current_device,
-            label=f"MSR group '{type_name}'",
-        )
-        current_device = used_device
-
-    full_isodepths: list[np.ndarray] = []
-    for type_name in cell_type_names:
-        mean_c, safe_std_c = per_type_standardization[type_name]
-        S_full_standardized = np.asarray(
-            (S_raw - mean_c) / safe_std_c, dtype=np.float32
-        )
-        model_c = per_type_results[type_name]["model"]
-        full_isodepths.append(
-            _extract_isodepth_from_model(model_c, S_full_standardized, device).reshape(-1)
-        )
-    spearman_matrix, spearman_labels = _compute_spearman_matrix(
-        full_isodepths, cell_type_names
-    )
-
-    all_stat_true = [per_type_results[name]["stat_true"] for name in cell_type_names]
-    all_stat_perm = np.concatenate(
-        [per_type_results[name]["stat_perm"] for name in cell_type_names]
-    )
-    combined_p = float(
-        np.mean([per_type_results[name]["p_value"] for name in cell_type_names])
-    )
-    return TestResult(
-        method_name=method_name,
-        metric=metric,
-        p_value=combined_p,
-        stat_true=float(np.mean(all_stat_true)),
-        stat_perm=all_stat_perm,
-        runtime_sec=time.time() - start,
-        n_cells=dataset.n_cells,
-        n_genes=dataset.n_genes,
-        config={"test": config.__dict__.copy()},
-        artifacts={
-            "per_type_results": per_type_results,
-            "cell_type_names": cell_type_names,
-            "cell_type_labels": cell_type_labels,
-            "n_cell_types": n_cell_types,
-            "cell_type_mode": "separate",
-            "spearman_matrix": spearman_matrix,
-            "spearman_labels": spearman_labels,
-        },
-    ).validate()
-
-
-def run_joint_truncated_msr_method(
-    dataset: DatasetBundle, config: TestConfig, device: torch.device | None = None
-) -> TestResult:
-    return _run_joint_msr_method(
-        dataset, config, device, method_name="joint_truncated_msr", rank_match=False
-    )
-
-
-def run_joint_truncated_rank_msr_method(
-    dataset: DatasetBundle, config: TestConfig, device: torch.device | None = None
-) -> TestResult:
-    return _run_joint_msr_method(
-        dataset, config, device, method_name="joint_truncated_rank_msr", rank_match=True
-    )
-
-
-def run_fourier_spectral_randomization_method(
-    dataset: DatasetBundle, config: TestConfig, device: torch.device | None = None
-) -> TestResult:
-    """Fourier phase-randomization existence test with fixed coordinates."""
-    dataset.validate()
-    config.validate()
-    if dataset.meta.get("cell_type_mode") == "separate" or dataset.meta.get("cell_type_labels") is not None:
-        raise NotImplementedError(
-            "fourier_spectral_randomization currently supports plain single-matrix datasets only."
-        )
-
-    metric = canonicalize_metric_name(config.metric)
-    device = device or resolve_device(config.device)
-    start = time.time()
-    if config.verbose:
-        print("Fourier spectral randomization: fixed S, coherent phase-randomized A nulls")
-
-    A_surr = build_fourier_spectral_randomization_surrogates_from_meta(
-        dataset.A,
-        dataset.meta,
-        n_surrogates=config.n_perms,
-        seed=config.seed,
-    )
-    a_batched = np.concatenate([dataset.A[np.newaxis, :, :], A_surr], axis=0).astype(np.float32)
-    s_batched = np.tile(dataset.S[np.newaxis, :, :], (config.n_perms + 1, 1, 1)).astype(np.float32)
-
-    has_midline_covariate = _covariate_type_midline(config)
-    has_values_covariate = _covariate_type_values(config)
-    parallel_config = replace(config, covariate=None) if (has_midline_covariate or has_values_covariate) else config
-
-    model, training_outputs, s_batched_np = train_parallel_isodepth_model(
-        dataset.S,
-        dataset.A,
-        parallel_config,
-        device=device,
-        s_batched=s_batched,
-        a_batched=a_batched,
-        model_label="Fourier spectral randomization h(d)",
-    )
-    stat_true = float(training_outputs.stat_true)
-    stat_perm = training_outputs.stat_perm
-    p_value = permutation_p_value(metric, stat_true, stat_perm)
-
-    covariate_artifacts: dict[str, object] = {}
-    if _has_covariate(config):
-        cov_values = (
-            _values_covariate_from_dataset(dataset, config) if has_values_covariate else None
-        )
-        covariate_artifacts = _train_covariate_artifacts(
-            dataset.S,
-            dataset.A,
-            config,
-            device,
-            metric,
-            stat_perm,
-            covariate_values=cov_values,
-            model_label=(
-                f"values covariate decoder ({config.covariate.type})"
-                if has_values_covariate
-                else "true layout covariate decoder"
-            ),
-        )
-
-    low_idx = int(training_outputs.best_null_index)
-    high_idx = int(training_outputs.worst_null_index)
-    slot_iso = _extract_slot_isodepths(
-        model, s_batched_np, [0, low_idx + 1, high_idx + 1], device,
-    )
-    true_rerun_index, true_train_loss = _rerun_index_and_loss(model, 0)
-    lowest_rerun_index, lowest_train_loss = _rerun_index_and_loss(model, low_idx + 1)
-    highest_rerun_index, highest_train_loss = _rerun_index_and_loss(model, high_idx + 1)
-
-    pred_true_np = np.asarray(training_outputs.pred_true, dtype=np.float32)
-    if canonicalize_metric_name(metric) == "nll_poisson_mse":
-        sf_row = np.asarray(dataset.A, dtype=np.float32).sum(axis=1, keepdims=True)
-        pred_true_np = (sf_row * np.exp(pred_true_np)).astype(np.float32)
-        pred_cov = covariate_artifacts.get("pred_true_covariate")
-        if pred_cov is not None:
-            covariate_artifacts["pred_true_covariate"] = (
-                sf_row * np.exp(np.asarray(pred_cov, dtype=np.float32))
-            ).astype(np.float32)
-
-    S_raw_moran = raw_coordinates_from_standardized(dataset.S, dataset.meta)
-    s_native_moran = np.tile(
-        np.asarray(S_raw_moran, dtype=np.float32)[np.newaxis, :, :],
-        (a_batched.shape[0], 1, 1),
-    )
-    moran_artifacts = maybe_compute_moran_artifacts(
-        config,
-        dataset.meta,
-        s_batched_np,
-        dataset.A,
-        a_batched=a_batched,
-        s_batched_native=s_native_moran,
-    )
-
-    return TestResult(
-        method_name="fourier_spectral_randomization",
-        metric=metric,
-        p_value=p_value,
-        stat_true=stat_true,
-        stat_perm=stat_perm,
-        runtime_sec=time.time() - start,
-        n_cells=dataset.n_cells,
-        n_genes=dataset.n_genes,
-        config={"test": config.__dict__.copy()},
-        artifacts={
-            "model": model,
-            "pred_true": pred_true_np,
-            "true_isodepth": np.asarray(slot_iso[0], dtype=np.float32),
-            "rerun_summary": _rerun_summary(model),
-            "true_rerun_index": int(true_rerun_index),
-            "true_train_loss": float(true_train_loss),
-            "lowest_isodepth": np.asarray(slot_iso[low_idx + 1], dtype=np.float32),
-            "lowest_S": np.asarray(s_batched_np[low_idx + 1], dtype=np.float32),
-            "lowest_stat": float(stat_perm[low_idx]),
-            "lowest_perm_index": low_idx,
-            "lowest_rerun_index": int(lowest_rerun_index),
-            "lowest_train_loss": float(lowest_train_loss),
-            "highest_isodepth": np.asarray(slot_iso[high_idx + 1], dtype=np.float32),
-            "highest_S": np.asarray(s_batched_np[high_idx + 1], dtype=np.float32),
-            "highest_stat": float(stat_perm[high_idx]),
-            "highest_perm_index": high_idx,
-            "highest_rerun_index": int(highest_rerun_index),
-            "highest_train_loss": float(highest_train_loss),
-            "fourier_surrogate_example": np.asarray(A_surr[0], dtype=np.float32),
-            **covariate_artifacts,
-            **moran_artifacts,
-        },
-    ).validate()
 
 
 def run_binning_method(
@@ -2924,6 +1775,8 @@ def run_binning_method(
 ) -> TestResult:
     """Bin cells/spots into pseudospots, then run the standard permutation test."""
     binned_dataset, binning_artifacts = bin_dataset_to_pseudospots(dataset, config)
+    if binned_dataset.meta.get("cell_type_mode") != "separate":
+        _print_dataset_gene_filter(binned_dataset)
     if config.verbose:
         summary = binning_artifacts["binning_summary"]
         print(
@@ -2948,6 +1801,8 @@ def run_visium_pseudobulk_method(
 ) -> TestResult:
     """Aggregate cells into Visium-style pseudospots, then run the standard permutation test."""
     binned_dataset, pseudobulk_artifacts = build_visium_pseudobulk_dataset(dataset, config)
+    if binned_dataset.meta.get("cell_type_mode") != "separate":
+        _print_dataset_gene_filter(binned_dataset)
     if config.verbose:
         summary = pseudobulk_artifacts["visium_pseudobulk_summary"]
         print(
@@ -2973,14 +1828,6 @@ def run_visium_pseudobulk_method(
 def _run_permutation_method_on_device(
     dataset: DatasetBundle, config: TestConfig, device: torch.device
 ) -> TestResult:
-    if config.method == "comparison_perturbation_test":
-        return run_comparison_perturbation_test(dataset, config, device=device)
-    if config.method == "perturbation_test":
-        return run_perturbation_test(dataset, config, device=device)
-    if config.method == "comparison_subsampling_test":
-        return run_comparison_subsampling_test(dataset, config, device=device)
-    if config.method == "subsampling_test":
-        return run_subsampling_test(dataset, config, device=device)
     if config.method == "parallel_permutation":
         return run_parallel_permutation_method(dataset, config, device=device)
     if config.method == "block_permutation":
@@ -2989,14 +1836,10 @@ def _run_permutation_method_on_device(
         return run_binning_method(dataset, config, device=device)
     if config.method == "visium_pseudobulk":
         return run_visium_pseudobulk_method(dataset, config, device=device)
-    if config.method == "fourier_spectral_randomization":
-        return run_fourier_spectral_randomization_method(dataset, config, device=device)
-    if config.method == "joint_truncated_msr":
-        return run_joint_truncated_msr_method(dataset, config, device=device)
-    if config.method == "joint_truncated_rank_msr":
-        return run_joint_truncated_rank_msr_method(dataset, config, device=device)
-    if config.method == "cross_validation":
-        return run_cross_validation_method(dataset, config, device=device)
+    if config.method == "correlated_null_permutation":
+        return run_correlated_null_permutation_method(dataset, config, device=device)
+    if config.method == "correlated_null_adaptive_permutation":
+        return run_correlated_null_adaptive_permutation_method(dataset, config, device=device)
     if config.method == "full_retraining":
         return run_full_retraining_method(dataset, config, device=device)
     raise ValueError(f"Unsupported test.method '{config.method}'")
@@ -3005,6 +1848,13 @@ def _run_permutation_method_on_device(
 def run_permutation_method(dataset: DatasetBundle, config: TestConfig) -> TestResult:
     device = resolve_device(config.device)
     print(f"device: {device}")
+    # Separate mode filters inside each domain, and binning / Visium pseudobulk
+    # filter after aggregation. Those paths print their own line.
+    if (
+        dataset.meta.get("cell_type_mode") != "separate"
+        and config.method not in {"binning", "visium_pseudobulk"}
+    ):
+        _print_dataset_gene_filter(dataset)
 
     dispatch = lambda resolved_device: _run_permutation_method_on_device(  # noqa: E731
         dataset, config, resolved_device
@@ -3016,9 +1866,8 @@ def run_permutation_method(dataset: DatasetBundle, config: TestConfig) -> TestRe
             "block_permutation",
             "binning",
             "visium_pseudobulk",
-            "fourier_spectral_randomization",
-            "joint_truncated_msr",
-            "joint_truncated_rank_msr",
+            "correlated_null_permutation",
+            "correlated_null_adaptive_permutation",
         }
         and dataset.meta.get("cell_type_mode") == "separate"
     ):

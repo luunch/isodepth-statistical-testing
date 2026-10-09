@@ -210,6 +210,7 @@ def load_dataset_for_visualization(data_cfg: DataConfig) -> DatasetBundle:
         layer=data_cfg.layer,
         use_raw=data_cfg.use_raw,
         min_cells_per_gene=data_cfg.min_cells_per_gene,
+        min_sparsity_percentage=data_cfg.min_sparsity_percentage,
         log1p=data_cfg.log1p,
         standardize_expression=data_cfg.standardize_expression,
         q=data_cfg.q,

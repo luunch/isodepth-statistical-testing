@@ -1,0 +1,46 @@
+{
+  "data": {
+    "source": "h5ad",
+    "h5ad": "data/h5ad/cosmx_human_nsclc_annotated.h5ad",
+    "obs_indices": "data/h5ad/cosmx_celltype_regions/luad_9_r1/cosmx_luad_9_r1_neutrophil_c35.indices.npy",
+    "spatial_key": "spatial",
+    "obs_x_col": null,
+    "obs_y_col": null,
+    "layer": "counts",
+    "use_raw": false,
+    "cell_type_key": "cell_type",
+    "cell_type": false,
+    "min_cells_per_gene": 1,
+    "normalize_total": false,
+    "standardize_expression": false,
+    "standardize_coordinates": true,
+    "log1p": false,
+    "max_cells": null,
+    "seed": 42
+  },
+  "test": {
+    "method": "visium_pseudobulk",
+    "metric": "nll_poisson_mse",
+    "n_perms": 99,
+    "epochs": 500,
+    "n_reruns": 10,
+    "sgd_batch_size": 128,
+    "lr": 0.001,
+    "seed": 42,
+    "device": "cuda",
+    "decoder": "nn",
+    "batch_size": null,
+    "verbose": false,
+    "visium_spot_distance_um": 100.0,
+    "visium_spot_diameter_um": 55.0,
+    "coordinate_um_per_unit": 0.12028,
+    "visium_tissue_radius_um": 25.355519999102327,
+    "block_jitter": false
+  },
+  "output": {
+    "out_dir": "results/cosmx_celltype_regions",
+    "run_name": "cosmx_luad_9_r1_neutrophil_c35_visium_pseudobulk_poisson",
+    "save_preds": false,
+    "save_perm_stats": true
+  }
+}

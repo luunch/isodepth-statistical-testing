@@ -19,8 +19,6 @@ from analysis.plots import (
     save_combined_celltype_residual_ratio_outputs,
     save_combined_celltype_isodepth_grid,
     save_combined_celltype_metric_distribution,
-    save_cross_validation_fold_isodepth_grid,
-    save_cross_validation_per_fold_metric_distributions,
     save_dataset_triptych,
     save_gene_expression_vs_coordinates_comparison,
     save_gene_expression_vs_isodepth_plot,
@@ -28,25 +26,21 @@ from analysis.plots import (
     save_loss_curve_plot,
     save_metric_distribution_plot,
     save_moran_distribution_plot,
-    save_msr_surrogate_example_plot,
     save_obs_numeric_filter_diagnostic_plot,
     save_obs_numeric_filter_histogram,
     save_permutation_null_comparison,
     save_pre_aggregation_dataset_plot,
-    save_perturbation_delta_pvalue_plot,
     save_synthetic_kernel_plot,
     save_synthetic_true_curve_plot,
-    save_subset_fraction_pvalue_plot,
     save_true_rerun_isodepth_grid,
     save_freedman_lane_covariate_plot,
     save_visium_pseudobulk_overlay,
     save_covariate_whitening_spatial_plot,
     save_single_type_covariate_plot,
-    save_fourier_surrogate_example_plot,
+    save_variogram_matching_plots,
 )
 from data.schemas import (
     DatasetBundle,
-    MSR_METHODS,
     RunConfig,
     TestResult,
     TOTAL_COUNTS_COVARIATE,
@@ -384,6 +378,7 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
     data = dict(config_dict.get("data", {}))
     test = dict(config_dict.get("test", {}))
     output = dict(config_dict.get("output", {}))
+    blurred_permutations = config_dict.get("blurred_permutations")
     method = str(test.get("method", run_config.test.method))
 
     data_keys = {
@@ -404,7 +399,14 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
             "obs_y_col",
             "layer",
             "use_raw",
+            "input_expression_representation",
+            "input_normalization_target",
+            "make_var_names_unique",
             "min_cells_per_gene",
+            "min_sparsity_percentage",
+            "top_var_genes",
+            "n_expression_pcs",
+            "normalize_total",
             "exclude_gene_patterns",
             "gene_list",
             "log1p",
@@ -462,17 +464,27 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
         "block_permutation",
         "binning",
         "visium_pseudobulk",
-        "joint_truncated_msr",
-        "joint_truncated_rank_msr",
-        "fourier_spectral_randomization",
-        "cross_validation",
+        "correlated_null_permutation",
+        "correlated_null_adaptive_permutation",
         "full_retraining",
-        "comparison_perturbation_test",
-        "perturbation_test",
-        "comparison_subsampling_test",
-        "subsampling_test",
     }:
         test_keys.add("n_perms")
+    if method == "correlated_null_permutation":
+        test_keys |= {
+            "variogram_sigma_multiples",
+            "variogram_n_bins",
+            "variogram_n_plot_genes",
+            "variogram_backend",
+            "variogram_perm_batch_size",
+        }
+    if method == "correlated_null_adaptive_permutation":
+        test_keys |= {
+            "variogram_nn_candidates",
+            "variogram_n_bins",
+            "variogram_n_plot_genes",
+            "variogram_backend",
+            "variogram_perm_batch_size",
+        }
     if method == "block_permutation":
         test_keys |= {
             "block_radius",
@@ -494,22 +506,6 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
             "coordinate_um_per_unit",
             "block_jitter",
         }
-    if method in MSR_METHODS:
-        test_keys |= {
-            "msr_truncate_um",
-            "msr_neighbor_radius_um",
-            "msr_calibration_um",
-            "coordinate_um_per_unit",
-        }
-        if method == "joint_truncated_rank_msr":
-            test_keys.add("msr_shared_rank")
-    if method == "cross_validation":
-        test_keys.add("n_folds")
-    if method in {"comparison_perturbation_test", "perturbation_test"}:
-        test_keys |= {"n_nulls", "batch_size", "delta", "perturb_target"}
-    elif method in {"comparison_subsampling_test", "subsampling_test"}:
-        test_keys |= {"n_nulls", "subset_fractions"}
-
     output_keys = {"out_dir", "run_name", "save_preds", "save_perm_stats"}
 
     compact = {
@@ -517,6 +513,8 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
         "test": _filter_mapping(test, test_keys),
         "output": _filter_mapping(output, output_keys),
     }
+    if blurred_permutations is not None:
+        compact["blurred_permutations"] = dict(blurred_permutations)
     return compact
 
 
@@ -539,11 +537,9 @@ def _method_artifact_keys(method_name: str) -> set[str]:
         "block_permutation",
         "binning",
         "visium_pseudobulk",
-        "joint_truncated_msr",
-        "joint_truncated_rank_msr",
-        "cross_validation",
+        "correlated_null_permutation",
+        "correlated_null_adaptive_permutation",
         "full_retraining",
-        "subsampling_test",
     }:
         extra = {
             "null_summary",
@@ -556,21 +552,6 @@ def _method_artifact_keys(method_name: str) -> set[str]:
             "pred_true_full_iso",
             "true_isodepth_full_iso",
         }
-        if method_name == "cross_validation":
-            extra |= {
-                "train_mask",
-                "test_mask",
-                "n_folds",
-                "fold_test_sizes",
-                "fold_weights",
-                "per_fold_true_loss",
-                "per_fold_perm_loss",
-                "per_fold_p_values",
-                "per_fold_true_isodepth",
-                "train_size",
-                "test_size",
-                "observed_test_loss",
-            }
         if method_name == "block_permutation":
             extra.add("block_stats")
         if method_name == "binning":
@@ -583,10 +564,6 @@ def _method_artifact_keys(method_name: str) -> set[str]:
                 "visium_pseudobulk_summary",
                 "visium_pseudobulk_cell_counts",
             }
-        if method_name in MSR_METHODS:
-            extra.add("msr_surrogate_example")
-        if method_name == "fourier_spectral_randomization":
-            extra.add("fourier_surrogate_example")
         extra |= {
             "moran_skipped",
             "moran_skip_reason",
@@ -604,43 +581,26 @@ def _method_artifact_keys(method_name: str) -> set[str]:
         "freedman_lane_pred",
     }
         return shared | extra
-    if method_name == "perturbation_test":
-        return shared | {
-            "delta",
-            "delta_summaries",
-            "primary_delta",
-            "perturb_target",
-            "observed_summary",
-            "null_summary",
-            "summary_statistic",
-            "n_nulls",
-        }
-    if method_name == "comparison_perturbation_test":
-        return shared | {
-            "delta",
-            "delta_summaries",
-            "primary_delta",
-            "perturb_target",
-            "observed_summary",
-            "null_summary",
-            "summary_statistic",
-            "n_nulls",
-        }
-    if method_name == "comparison_subsampling_test":
-        return shared | {
-            "observed_summary",
-            "observed_correlation_summary",
-            "null_summary",
-            "fraction_summaries",
-            "primary_fraction",
-            "summary_statistic",
-            "n_nulls",
-            "n_perms",
-            "subset_fractions",
-            "lowest_subset_fraction",
-            "highest_subset_fraction",
-        }
     return shared
+
+
+# Cell-by-gene decoder outputs. Plots still read these from the in-memory
+# TestResult. They are left out of result.json unless output.save_preds is true,
+# because a JSON list of every cell-by-gene prediction is unreadable and is
+# almost the entire file (about 187 MB for a 645 x 10050 MERFISH run).
+_RESULT_JSON_PREDICTION_KEYS = frozenset({
+    "pred_true",
+    "pred_true_covariate",
+    "pred_true_full_iso",
+    "freedman_lane_pred",
+})
+
+
+def _method_artifact_keys_for_json(method_name: str, *, save_preds: bool) -> set[str]:
+    keys = _method_artifact_keys(method_name)
+    if save_preds:
+        return keys
+    return keys - _RESULT_JSON_PREDICTION_KEYS
 
 
 def _loss_history_arrays_from_model(model: Any) -> dict[str, np.ndarray]:
@@ -727,22 +687,29 @@ def _save_single_type_outputs(
             "true_train_loss": type_data.get("true_train_loss", 0.0),
             "lowest_isodepth": type_data.get("lowest_isodepth"),
             "lowest_S": type_data.get("lowest_S"),
+            "lowest_A": type_data.get("lowest_A"),
             "lowest_stat": type_data.get("lowest_stat", 0.0),
             "lowest_perm_index": type_data.get("lowest_perm_index", 0),
             "lowest_rerun_index": type_data.get("lowest_rerun_index", 0),
             "lowest_train_loss": type_data.get("lowest_train_loss", 0.0),
             "highest_isodepth": type_data.get("highest_isodepth"),
             "highest_S": type_data.get("highest_S"),
+            "highest_A": type_data.get("highest_A"),
             "highest_stat": type_data.get("highest_stat", 0.0),
             "highest_perm_index": type_data.get("highest_perm_index", 0),
             "highest_rerun_index": type_data.get("highest_rerun_index", 0),
             "highest_train_loss": type_data.get("highest_train_loss", 0.0),
-            "msr_surrogate_example": type_data.get("msr_surrogate_example"),
         },
     ).validate()
 
     type_dir.mkdir(parents=True, exist_ok=True)
     paths: dict[str, str] = {}
+
+    if type_data.get("lowest_A") is not None:
+        p = save_dataset_triptych(subset_dataset, subset_result, type_dir / f"{type_name}_dataset.png")
+        if p is not None:
+            paths["dataset_triptych_plot"] = str(p)
+            paths["dataset_triptych_data_npz"] = str(p.with_name(p.stem + "_inputs.npz"))
 
     p = save_isodepth_triptych(subset_dataset, subset_result, type_dir / f"{type_name}_isodepth.png")
     if p is not None:
@@ -812,49 +779,13 @@ def _save_single_type_outputs(
         if p_moran is not None:
             paths["moran_distribution_plot"] = str(p_moran)
 
-    if method_name in MSR_METHODS:
-        p_msr = save_msr_surrogate_example_plot(
-            subset_dataset,
-            subset_result,
-            type_dir / f"{type_name}_msr_surrogate_example.png",
-            n_genes=5,
-        )
-        if p_msr is not None:
-            paths["msr_surrogate_example_plot"] = str(p_msr)
-
-    if type_data.get("per_fold_true_isodepth") is not None:
-        fold_isodepths = np.asarray(type_data["per_fold_true_isodepth"], dtype=np.float32)
-        p_fold_iso = save_cross_validation_fold_isodepth_grid(
-            subset_dataset,
-            [np.asarray(row, dtype=np.float32) for row in fold_isodepths],
-            type_dir / f"{type_name}_cv_fold_isodepths.png",
-            fold_test_sizes=np.asarray(type_data.get("fold_test_sizes", []), dtype=np.int64),
-        )
-        if p_fold_iso is not None:
-            paths["cross_validation_fold_isodepth_grid_plot"] = str(p_fold_iso)
-
-        cv_subset_result = TestResult(
-            method_name="cross_validation",
-            metric=metric,
-            p_value=float(type_data["p_value"]),
-            stat_true=float(type_data["stat_true"]),
-            stat_perm=np.asarray(type_data["stat_perm"], dtype=np.float64),
-            runtime_sec=0.0,
-            n_cells=int(S_c.shape[0]),
-            n_genes=int(A_c.shape[1]),
-            config={},
-            artifacts={
-                "per_fold_true_loss": type_data.get("per_fold_true_loss"),
-                "per_fold_perm_loss": type_data.get("per_fold_perm_loss"),
-                "per_fold_p_values": type_data.get("per_fold_p_values"),
-            },
-        ).validate()
-        p_fold_dist = save_cross_validation_per_fold_metric_distributions(
-            cv_subset_result,
-            type_dir / f"{type_name}_cv_per_fold_metric_distributions.png",
-        )
-        if p_fold_dist is not None:
-            paths["cross_validation_per_fold_metric_distribution_plot"] = str(p_fold_dist)
+    vm_diag = type_data.get("variogram_matching_diagnostics")
+    if method_name in {
+        "correlated_null_permutation",
+        "correlated_null_adaptive_permutation",
+    } and vm_diag is not None:
+        vm_paths = save_variogram_matching_plots(vm_diag, type_dir)
+        paths.update({f"variogram_matching_{k}": v for k, v in vm_paths.items()})
 
     iso_raw = type_data.get("true_isodepth")
     cov_raw = type_data.get("true_isodepth_covariate")
@@ -905,11 +836,6 @@ def _save_single_type_outputs(
         pred_cov = type_data.get("pred_true_covariate")
         if pred_cov is not None:
             npz_payload["pred_true_covariate"] = np.asarray(pred_cov, dtype=np.float32)
-        msr_surrogate = type_data.get("msr_surrogate_example")
-        if msr_surrogate is not None:
-            npz_payload["msr_surrogate_example"] = np.asarray(
-                msr_surrogate, dtype=np.float32
-            )
         moran_i_slots = type_data.get("moran_i_per_gene_per_slot")
         if moran_i_slots is not None:
             npz_payload["moran_i_per_gene_per_slot"] = np.asarray(
@@ -1008,43 +934,43 @@ def _save_gene_expression_summary_plots(
     cov_lbl = covariate_label or "Covariate"
     if cov_raw is not None:
         cov = np.asarray(cov_raw, dtype=np.float64).reshape(-1)
-        try:
-            p = save_gene_expression_vs_coordinates_comparison(
-                plot_dataset, iso, cov,
-                out_dir / f"{run_name}_gene_expression_vs_coordinates.png",
-                isodepth_label=isodepth_label,
-                covariate_label=cov_lbl,
-                pred_isodepth=pred_iso,
-                pred_covariate=pred_cov,
-                decoder_df=decoder_df,
-            )
-            artifact_paths["gene_expression_plot"] = str(p)
-            stem = p.parent / p.stem
-            companion_artifacts = {
-                "gene_expression_correlation_distribution_plot": Path(f"{stem}_correlation_distribution.png"),
-                "gene_expression_residual_ratio_distribution_plot": Path(f"{stem}_residual_ratio_distribution.png"),
-                "gene_expression_residual_ratio_rankings_csv": Path(f"{stem}_residual_ratio_rankings.csv"),
-            }
-            for key, path in companion_artifacts.items():
-                if path.exists():
-                    artifact_paths[key] = str(path)
-        except Exception:
-            pass
+        p = save_gene_expression_vs_coordinates_comparison(
+            plot_dataset, iso, cov,
+            out_dir / f"{run_name}_gene_expression_vs_coordinates.png",
+            isodepth_label=isodepth_label,
+            covariate_label=cov_lbl,
+            pred_isodepth=pred_iso,
+            pred_covariate=pred_cov,
+            decoder_df=decoder_df,
+        )
+        artifact_paths["gene_expression_plot"] = str(p)
+        stem = p.parent / p.stem
+        companion_artifacts = {
+            "gene_expression_correlation_distribution_plot": Path(f"{stem}_correlation_distribution.png"),
+            "gene_expression_residual_ratio_distribution_plot": Path(f"{stem}_residual_ratio_distribution.png"),
+            "gene_expression_residual_ratio_rankings_csv": Path(f"{stem}_residual_ratio_rankings.csv"),
+            "svg_spatial_expression_plot": Path(f"{stem}_svg_spatial_expression.png"),
+        }
+        for key, path in companion_artifacts.items():
+            if path.exists():
+                artifact_paths[key] = str(path)
     else:
-        try:
-            p = save_gene_expression_vs_isodepth_plot(
-                plot_dataset, iso,
-                out_dir / f"{run_name}_gene_expression_vs_isodepth.png",
-                coord_label=isodepth_label,
-                decoder_preds=pred_iso,
-                decoder_df=decoder_df,
-            )
-            artifact_paths["gene_expression_plot"] = str(p)
-            corr_path = p.parent / f"{p.stem}_correlation_distribution.png"
-            if corr_path.exists():
-                artifact_paths["gene_expression_correlation_distribution_plot"] = str(corr_path)
-        except Exception:
-            pass
+        p = save_gene_expression_vs_isodepth_plot(
+            plot_dataset, iso,
+            out_dir / f"{run_name}_gene_expression_vs_isodepth.png",
+            coord_label=isodepth_label,
+            decoder_preds=pred_iso,
+            decoder_df=decoder_df,
+        )
+        artifact_paths["gene_expression_plot"] = str(p)
+        stem = p.parent / p.stem
+        companion_artifacts = {
+            "gene_expression_correlation_distribution_plot": Path(f"{stem}_correlation_distribution.png"),
+            "svg_spatial_expression_plot": Path(f"{stem}_svg_spatial_expression.png"),
+        }
+        for key, path in companion_artifacts.items():
+            if path.exists():
+                artifact_paths[key] = str(path)
 
 
 def _decoder_df_from_config(decoder: str | None) -> int | None:
@@ -1185,6 +1111,10 @@ def save_standardized_outputs(
     )
     if dataset_triptych_path is not None:
         artifact_paths["dataset_triptych_plot"] = str(dataset_triptych_path)
+        if result.artifacts.get("lowest_A") is not None:
+            artifact_paths["dataset_triptych_data_npz"] = str(
+                dataset_triptych_path.with_name(dataset_triptych_path.stem + "_inputs.npz")
+            )
 
     if _is_cosmx_subset_config(run_config.data) or _LEGACY_RUN_RE.match(run_config.output.run_name):
         try:
@@ -1341,46 +1271,15 @@ def save_standardized_outputs(
             if null_comparison_path is not None:
                 artifact_paths["permutation_null_comparison_plot"] = null_comparison_path
 
-    if result.method_name in MSR_METHODS:
-        surr_plot_path = save_msr_surrogate_example_plot(
-            dataset,
-            result,
-            out_dir / f"{run_config.output.run_name}_msr_surrogate_example.png",
-        )
-        if surr_plot_path is not None:
-            artifact_paths["msr_surrogate_example_plot"] = str(surr_plot_path)
-
-    if result.method_name == "fourier_spectral_randomization":
-        fourier_surr_plot_path = save_fourier_surrogate_example_plot(
-            dataset,
-            result,
-            out_dir / f"{run_config.output.run_name}_fourier_surrogate_example.png",
-        )
-        if fourier_surr_plot_path is not None:
-            artifact_paths["fourier_surrogate_example_plot"] = str(fourier_surr_plot_path)
-
-    if result.method_name == "cross_validation":
-        fold_isodepths = result.artifacts.get("per_fold_true_isodepth")
-        if fold_isodepths is not None:
-            fold_grid_path = save_cross_validation_fold_isodepth_grid(
-                dataset,
-                [np.asarray(row, dtype=np.float32) for row in np.asarray(fold_isodepths)],
-                out_dir / f"{run_config.output.run_name}_cv_fold_isodepths.png",
-                fold_test_sizes=np.asarray(
-                    result.artifacts.get("fold_test_sizes", []),
-                    dtype=np.int64,
-                ),
-            )
-            if fold_grid_path is not None:
-                artifact_paths["cross_validation_fold_isodepth_grid_plot"] = str(fold_grid_path)
-
-        per_fold_dist_path = save_cross_validation_per_fold_metric_distributions(
-            result,
-            out_dir / f"{run_config.output.run_name}_cv_per_fold_metric_distributions.png",
-        )
-        if per_fold_dist_path is not None:
-            artifact_paths["cross_validation_per_fold_metric_distribution_plot"] = str(
-                per_fold_dist_path
+    if result.method_name in {
+        "correlated_null_permutation",
+        "correlated_null_adaptive_permutation",
+    }:
+        vm_diag = result.artifacts.get("variogram_matching_diagnostics")
+        if vm_diag is not None:
+            vm_paths = save_variogram_matching_plots(vm_diag, out_dir)
+            artifact_paths.update(
+                {f"variogram_matching_{k}": v for k, v in vm_paths.items()}
             )
 
     _save_gene_expression_summary_plots(
@@ -1388,20 +1287,6 @@ def save_standardized_outputs(
         covariate_label=_resolve_covariate_label(run_config),
         decoder_df=_decoder_df_from_config(getattr(run_config.test, "decoder", None)),
     )
-
-    subset_fraction_plot_path = save_subset_fraction_pvalue_plot(
-        result,
-        out_dir / f"{run_config.output.run_name}_subset_fraction_pvalues.png",
-    )
-    if subset_fraction_plot_path is not None:
-        artifact_paths["subset_fraction_pvalue_plot"] = str(subset_fraction_plot_path)
-
-    perturbation_delta_plot_path = save_perturbation_delta_pvalue_plot(
-        result,
-        out_dir / f"{run_config.output.run_name}_delta_pvalues.png",
-    )
-    if perturbation_delta_plot_path is not None:
-        artifact_paths["delta_pvalue_plot"] = str(perturbation_delta_plot_path)
 
     celltype_plot_path = save_celltype_or_spatial_split_plot(
         dataset,
@@ -1451,7 +1336,10 @@ def save_standardized_outputs(
                 **artifact_paths,
                 **{
                     key: result.artifacts[key]
-                    for key in _method_artifact_keys(result.method_name)
+                    for key in _method_artifact_keys_for_json(
+                        result.method_name,
+                        save_preds=bool(run_config.output.save_preds),
+                    )
                     if key in result.artifacts
                 },
                 "perm_summary": summarize_metric_distribution(result.stat_perm),
@@ -1600,7 +1488,10 @@ def _save_separate_celltype_outputs(
         "cell_type_mode": "separate",
         "cell_type_names": cell_type_names,
         "per_type_summaries": per_type_summaries,
-        "perm_summary": summarize_metric_distribution(result.stat_perm),
+        "perm_summary_by_cell_type": {
+            name: summarize_metric_distribution(per_type_results[name]["stat_perm"])
+            for name in cell_type_names
+        },
         "dataset_meta": _compact_dataset_meta(dataset.meta),
         "combined_metric_distribution_plot": str(combined_dist_path),
         "combined_isodepth_plot": str(combined_isodepth_path),
@@ -1619,6 +1510,8 @@ def _save_separate_celltype_outputs(
         "freedman_lane_latent",
         "freedman_lane_pred",
     ):
+        if key in _RESULT_JSON_PREDICTION_KEYS and not run_config.output.save_preds:
+            continue
         if key in result.artifacts:
             top_level_artifacts[key] = result.artifacts[key]
 

@@ -38,6 +38,9 @@ REPO = repo_root(__file__)
 from analysis.plots import (  # noqa: E402
     _calicost_clone_base_color,
     _clone_tumor_proportion_colors,
+    _normalize_depth,
+    _point_size,
+    _square_spatial_axis_limits,
 )
 from data.h5ad_loader import _detect_coordinate_um_per_unit  # noqa: E402
 from data.spatial_regions import _auto_eps, _split_dbscan  # noqa: E402
@@ -62,6 +65,11 @@ INCLUSION_TUMOR_THRESHOLD = 0.7
 INCLUSION_MIN_SPOTS = 60
 INCLUSION_MIN_CLUSTER_SPOTS = 50
 INCLUSION_DEFAULT_SUBDIR = "gt1clone/inclusion_gt0p7_qc60"
+SELECTED_EXISTENCE_CLUSTERS_CSV = (
+    REPO / "configs/calicost/inclusion_gt0p7_qc60/selected_clusters.csv"
+)
+ISODEPTH_CMAP = "viridis"
+ISODEPTH_COLORBAR_LABEL = "Normalized isodepth"
 DBSCAN_EPS_MULT = 3.0
 DBSCAN_MIN_SAMPLES = 10
 
@@ -1224,53 +1232,87 @@ def _plot_inclusion_dbscan_clusters(
     print(f"[inclusion] wrote {out_path}")
 
 
+def _norm_clone_label(value: object) -> str:
+    try:
+        return f"{float(value):.1f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _cluster_identity(
+    slice_id: object, clone_label: object, cluster_id: object
+) -> tuple[str, str, int]:
+    return str(slice_id), _norm_clone_label(clone_label), int(cluster_id)
+
+
+def _select_existence_test_clusters(
+    clusters: list[dict],
+    csv_path: Path,
+) -> list[dict]:
+    """Keep the DBSCAN clusters used for existence / permutation tests, in panel order."""
+    selection = pd.read_csv(csv_path)
+    by_key = {
+        _cluster_identity(entry["slice_id"], entry["clone_label"], entry["cluster_id"]): entry
+        for entry in clusters
+    }
+    selected: list[dict] = []
+    missing: list[str] = []
+    for rec in selection.to_dict("records"):
+        key = _cluster_identity(rec["slice_id"], rec["clone_label"], rec["cluster_id"])
+        entry = by_key.get(key)
+        if entry is None:
+            missing.append(
+                f"panel {int(rec['panel'])} {key[0]} clone {key[1]} cluster {key[2]}"
+            )
+            continue
+        selected.append({**entry, "panel": int(rec["panel"])})
+    if missing:
+        raise ValueError(
+            "selected existence clusters missing from DBSCAN results:\n  "
+            + "\n  ".join(missing)
+        )
+    return selected
+
+
 def _plot_inclusion_cluster_metric_heatmaps(
     clusters: list[dict],
     out_dir: Path,
+    *,
+    selected_clusters_csv: Path | None = SELECTED_EXISTENCE_CLUSTERS_CSV,
 ) -> None:
+    if selected_clusters_csv is not None and selected_clusters_csv.exists():
+        clusters = _select_existence_test_clusters(clusters, selected_clusters_csv)
+        print(
+            f"[inclusion] metric heatmaps restricted to {len(clusters)} "
+            f"existence-test clusters from {selected_clusters_csv}"
+        )
     if not clusters:
         print("[inclusion] no clusters for metric heatmaps; skipping")
         return
 
-    metric_specs: tuple[tuple[str, str, str, str, tuple[float, float] | None], ...] = (
+    metric_specs: tuple[tuple[str, str, str], ...] = (
         (
             "calicost_tumor_proportion",
             "survey_inclusion_spatial_tumor_prop.png",
-            "Tumor Proportion — included DBSCAN clusters",
-            "viridis",
-            (0.0, 1.0),
+            "Tumor Proportion — existence-test clusters",
         ),
         (
             "pct_mt",
             "survey_inclusion_spatial_qc_pctmt.png",
-            "Mitochondrial Fraction (pct_mt) — included DBSCAN clusters",
-            "magma",
-            None,
+            "Mitochondrial Fraction (pct_mt) — existence-test clusters",
         ),
         (
             "total_counts",
             "survey_inclusion_spatial_qc_totalcounts.png",
-            "Library Depth (total counts) — included DBSCAN clusters",
-            "viridis",
-            None,
+            "Library Depth (total counts) — existence-test clusters",
         ),
     )
+    cmap = plt.get_cmap(ISODEPTH_CMAP)
+    norm = mcolors.Normalize(vmin=0.0, vmax=1.0)
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
 
-    for metric_col, out_name, title, cmap_name, fixed_range in metric_specs:
-        cluster_vals = []
-        for entry in clusters:
-            vals = entry["df"].loc[entry["cluster_mask"], metric_col].to_numpy(dtype=np.float64)
-            cluster_vals.append(vals[np.isfinite(vals)])
-        pooled = np.concatenate(cluster_vals) if cluster_vals else np.array([0.0])
-        if fixed_range is not None:
-            vmin, vmax = fixed_range
-        else:
-            vmin = float(np.nanpercentile(pooled, 2))
-            vmax = float(np.nanpercentile(pooled, 98))
-        cmap = plt.get_cmap(cmap_name)
-        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
-        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
-
+    for metric_col, out_name, title in metric_specs:
         n = len(clusters)
         nrows, ncols, figsize = _contact_sheet_figsize(n, panel_w=3.0, panel_h=3.6)
         fig, axes = plt.subplots(nrows, ncols, figsize=figsize)
@@ -1279,31 +1321,37 @@ def _plot_inclusion_cluster_metric_heatmaps(
         for ax, entry in zip(axes, clusters):
             df = entry["df"]
             cluster_mask = entry["cluster_mask"]
-            _draw_inclusion_cluster_background(
-                ax,
-                df,
-                cluster_mask,
-                entry["included_mask"],
-                entry["discard"],
-            )
             vals = df.loc[cluster_mask, metric_col].to_numpy(dtype=np.float64)
-            if metric_col == "calicost_tumor_proportion":
-                vals = np.clip(vals, 0.0, 1.0)
+            finite = np.isfinite(vals)
+            plot_vals = np.full(vals.shape, np.nan, dtype=np.float32)
+            if finite.any():
+                plot_vals[finite] = _normalize_depth(vals[finite])
+            x = df.loc[cluster_mask, "x_um"].to_numpy(dtype=np.float64)
+            y = df.loc[cluster_mask, "y_um"].to_numpy(dtype=np.float64)
+            ok = np.isfinite(plot_vals)
+            coords = np.column_stack([x[ok], y[ok]])
             ax.scatter(
-                df.loc[cluster_mask, "x_um"],
-                df.loc[cluster_mask, "y_um"],
-                c=vals,
+                coords[:, 0],
+                coords[:, 1],
+                c=plot_vals[ok],
                 cmap=cmap,
                 norm=norm,
-                s=5,
+                s=_point_size(coords),
                 linewidths=0,
             )
+            panel = entry.get("panel")
+            panel_prefix = f"panel {int(panel):02d}  " if panel is not None else ""
             _style_spatial_ax(
                 ax,
-                f"{entry['slice_id']}\nclone {entry['clone_label']}  "
+                f"{panel_prefix}{entry['slice_id']}\nclone {entry['clone_label']}  "
                 f"cluster {entry['cluster_id']}  n={entry['n_spots']}",
                 title_fontsize=6,
             )
+            if coords.shape[0] > 0:
+                xlim, ylim = _square_spatial_axis_limits(coords)
+                ax.set_aspect("equal", adjustable="box")
+                ax.set_xlim(*xlim)
+                ax.set_ylim(*ylim)
 
         for ax in axes[n:]:
             ax.axis("off")
@@ -1316,7 +1364,7 @@ def _plot_inclusion_cluster_metric_heatmaps(
             title_lines=3,
             has_colorbar=True,
             cbar_mappable=sm,
-            cbar_label=metric_col,
+            cbar_label=ISODEPTH_COLORBAR_LABEL,
         )
         print(f"[inclusion] wrote {out_path}")
 

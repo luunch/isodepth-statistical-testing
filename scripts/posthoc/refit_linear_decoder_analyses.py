@@ -12,7 +12,7 @@ closed-form MSE optimum for the final latent (see agent.md). This script:
 
 Usage (from repo root, isodepth_env):
     python -m scripts.posthoc.refit_linear_decoder_analyses \
-        configs/jfan_merfish.json \
+        configs/jfanmerfish/jfan_raw_pooled_coord_perm.json \
         results/jfan_merfish/260810_jfan_merfish_linear_decoder/260810_jfan_merfish_linear_decoder_result.json \
         --gmt data/gmt/h.all.v2026.1.Hs.symbols.gmt
 """

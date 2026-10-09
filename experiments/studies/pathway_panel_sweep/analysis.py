@@ -10,6 +10,7 @@ import numpy as np
 from scipy.stats import spearmanr
 
 from analysis.experiment_plots import save_value_histogram
+from experiments.core.study_spec import add_spec_argument
 from analysis.plots import _plot_spatial_isodepth
 from experiments.core.study_io import scan_result_json_paths, write_csv
 from experiments.studies.pathway_panel_sweep.lib import (
@@ -422,7 +423,7 @@ def analyze_pathway_panel_sweep_results(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Analyze a Hallmark pathway-panel sweep.")
-    parser.add_argument("--spec", required=True, help="Path to the experiment spec JSON")
+    add_spec_argument(parser)
     parser.add_argument(
         "--reference-full-result-json",
         default=None,

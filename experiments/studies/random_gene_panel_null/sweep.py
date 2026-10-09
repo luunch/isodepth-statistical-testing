@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import argparse
 import json
 
 from data import load_dataset
 from experiments.configuration import build_manifest_config_snapshot, build_run_config, save_standardized_outputs
+from experiments.core.study_spec import sweep_arg_parser
 from experiments.studies.random_gene_panel_null.lib import (
     build_condition_run_config,
     build_eligible_gene_universe,
@@ -111,14 +111,10 @@ def run_random_gene_panel_null_sweep(
     return manifest_payload
 
 
-def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Run a random gene-panel null specificity sweep for isodepth existence tests.",
+def _build_arg_parser():
+    return sweep_arg_parser(
+        "Run a random gene-panel null specificity sweep for isodepth existence tests."
     )
-    parser.add_argument("--spec", required=True, help="Path to the experiment spec JSON")
-    parser.add_argument("--dry-run", action="store_true", help="Print planned runs without executing")
-    parser.add_argument("--max-runs", type=int, default=None, help="Optional cap on number of runs")
-    return parser
 
 
 def main() -> None:

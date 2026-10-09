@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import json
 from pathlib import Path
 
@@ -9,6 +8,7 @@ from analysis.experiment_plots import (
     save_null_pvalue_histograms,
     save_rate_vs_sigma_plot,
 )
+from experiments.core.study_spec import analysis_arg_parser
 from experiments.studies.existence_sigma.lib import (
     analysis_dir_for_spec,
     extract_result_record,
@@ -138,10 +138,8 @@ def analyze_existence_sigma_results(spec_path: str | Path) -> dict[str, object]:
     return payload
 
 
-def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Analyze existence sigma sweep results.")
-    parser.add_argument("--spec", required=True, help="Path to the experiment spec JSON")
-    return parser
+def _build_arg_parser():
+    return analysis_arg_parser("Analyze existence sigma sweep results.")
 
 
 def main() -> None:

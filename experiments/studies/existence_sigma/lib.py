@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import math
 import re
 from dataclasses import asdict, dataclass, field
@@ -12,7 +11,13 @@ import numpy as np
 
 from data.schemas import DatasetBundle, RunConfig, SUPPORTED_EXISTENCE_METHODS, run_config_from_mapping
 from experiments.configuration import build_run_config
-from experiments.core.paths import repo_root
+from experiments.core.study_spec import (
+    analysis_dir_for_output,
+    common_study_fields,
+    load_spec,
+    manifest_path_for_output,
+    resolve_repo_path as _resolve_repo_path,
+)
 from experiments.core.study_io import (  # noqa: F401 — re-export for stable imports
     load_manifest_entries,
     load_result_payload,
@@ -21,7 +26,6 @@ from experiments.core.study_io import (  # noqa: F401 — re-export for stable i
 )
 
 
-REPO_ROOT = repo_root(__file__)
 SUPPORTED_NULL_FAMILIES = {"matched_shuffled"}
 RUN_NAME_MODE_PATTERN = re.compile(r"(?:^|[_-])(radial|noise|fourier)(?:[_-]|$)")
 
@@ -91,13 +95,6 @@ class SweepCondition:
         return self.mode
 
 
-def _resolve_repo_path(path_value: str | Path) -> Path:
-    path = Path(path_value)
-    if path.is_absolute():
-        return path.resolve()
-    return (REPO_ROOT / path).resolve()
-
-
 def _format_number_for_name(value: float) -> str:
     text = f"{float(value):.6g}"
     return text.replace("-", "m").replace(".", "p")
@@ -119,14 +116,13 @@ def _build_run_name(spec: ExistenceSigmaStudySpec, condition: SweepCondition) ->
 
 
 def load_existence_sigma_spec(path: str | Path) -> ExistenceSigmaStudySpec:
-    spec_path = Path(path).resolve()
-    with open(spec_path, "r", encoding="utf-8") as handle:
-        payload = json.load(handle)
+    payload = load_spec(path)
+    experiment_name, base_config, output_root = common_study_fields(payload)
 
     spec = ExistenceSigmaStudySpec(
-        experiment_name=str(payload["experiment_name"]),
-        base_config=_resolve_repo_path(payload["base_config"]),
-        output_root=_resolve_repo_path(payload["output_root"]),
+        experiment_name=experiment_name,
+        base_config=base_config,
+        output_root=output_root,
         alpha=float(payload.get("alpha", 0.05)),
         sigma_values=list(payload.get("sigma_values", [])),
         seeds=list(payload.get("seeds", [])),
@@ -258,11 +254,11 @@ def prepare_dataset_for_condition(dataset: DatasetBundle, condition: SweepCondit
 
 
 def manifest_path_for_spec(spec: ExistenceSigmaStudySpec) -> Path:
-    return spec.output_root / "manifest.json"
+    return manifest_path_for_output(spec.output_root)
 
 
 def analysis_dir_for_spec(spec: ExistenceSigmaStudySpec) -> Path:
-    return spec.output_root / "analysis"
+    return analysis_dir_for_output(spec.output_root)
 
 
 def _record_family_label(mode: str, k_value: object) -> str:

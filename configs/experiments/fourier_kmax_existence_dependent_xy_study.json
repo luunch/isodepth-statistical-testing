@@ -1,9 +1,0 @@
-{
-  "experiment_name": "fourier_kmax_existence_dependent_xy_msr_study",
-  "base_config": "configs/synthetic/msr_fourier_existence.json",
-  "output_root": "results/experiments/fourier_kmax_existence_dependent_xy_msr_study",
-  "k_min": 1,
-  "k_max_values": [3, 5, 8, 10, 15, 30],
-  "seeds": [42, 43, 44, 45, 46, 47],
-  "reuse_result_roots": []
-}

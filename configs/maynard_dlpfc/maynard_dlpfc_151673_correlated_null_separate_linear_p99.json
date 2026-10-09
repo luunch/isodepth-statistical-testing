@@ -1,0 +1,50 @@
+{
+  "data": {
+    "source": "h5ad",
+    "h5ad": "data/h5ad/151673.h5ad",
+    "spatial_key": "spatial",
+    "cell_type": "separate",
+    "cell_type_key": "Region",
+    "obs_drop_na": [
+      "Region"
+    ],
+    "top_var_genes": 3000,
+    "min_cells_per_gene": 20,
+    "min_sparsity_percentage": 5,
+    "min_cells_per_celltype": 10,
+    "normalize_total": true,
+    "log1p": true,
+    "standardize_expression": true,
+    "standardize_coordinates": true,
+    "use_raw": false,
+    "max_cells": null,
+    "seed": 42
+  },
+  "test": {
+    "method": "correlated_null_permutation",
+    "metric": "nll_gaussian_mse",
+    "covariate": null,
+    "n_perms": 99,
+    "epochs": 500,
+    "n_reruns": 30,
+    "sgd_batch_size": 128,
+    "lr": 0.001,
+    "patience": 0,
+    "seed": 42,
+    "device": "cuda",
+    "decoder": "linear",
+    "batch_size": null,
+    "verbose": true,
+    "coordinate_um_per_unit": 1.0,
+    "variogram_sigma_multiples": [1, 2, 3, 4, 6, 8, 12],
+    "variogram_n_bins": 13,
+    "variogram_n_plot_genes": 10,
+    "variogram_backend": "cuda"
+  },
+  "output": {
+    "out_dir": "results/maynard_dlpfc",
+    "run_name": "maynard_dlpfc_151673_correlated_null_separate_gaussian_linear_p99_min_cells_per_gene_20",
+    "save_preds": false,
+    "save_perm_stats": true
+  }
+}

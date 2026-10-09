@@ -5,7 +5,7 @@
 #SBATCH --mem=64G
 #SBATCH --time=2-00:00:00
 #SBATCH --gres=gpu:1
-#SBATCH --partition=a100
+#SBATCH --partition=l40s
 #SBATCH --cpus-per-task=4
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=ajain71@jh.edu
@@ -19,7 +19,6 @@ set -euo pipefail
 #
 # Skipjack: do not pass --nodelist (old names like c008 are gone).
 #   sbatch run_inclusion_gt0p7_qc60.sh
-#   sbatch --partition=h100 run_inclusion_gt0p7_qc60.sh
 
 ENV_NAME="${ENV_NAME:-isodepth_env}"
 

@@ -12,11 +12,14 @@ import scipy.sparse as sp
 
 from data.schemas import RunConfig, SUPPORTED_EXISTENCE_METHODS, run_config_from_mapping
 from experiments.configuration import build_run_config
-from experiments.core.paths import repo_root
+from experiments.core.study_spec import (
+    analysis_dir_for_output,
+    common_study_fields,
+    load_spec,
+    manifest_path_for_output,
+    resolve_repo_path as _resolve_repo_path,
+)
 from experiments.core.study_io import load_result_payload, scan_result_json_paths, write_csv
-
-REPO_ROOT = repo_root(__file__)
-
 
 @dataclass
 class RandomGenePanelNullStudySpec:
@@ -69,22 +72,14 @@ class RandomGenePanelCondition:
     gene_list: list[str]
 
 
-def _resolve_repo_path(path_value: str | Path) -> Path:
-    path = Path(path_value)
-    if path.is_absolute():
-        return path.resolve()
-    return (REPO_ROOT / path).resolve()
-
-
 def load_random_gene_panel_null_spec(path: str | Path) -> RandomGenePanelNullStudySpec:
-    spec_path = Path(path).resolve()
-    with open(spec_path, "r", encoding="utf-8") as handle:
-        payload = json.load(handle)
+    payload = load_spec(path)
+    experiment_name, base_config, output_root = common_study_fields(payload)
 
     spec = RandomGenePanelNullStudySpec(
-        experiment_name=str(payload["experiment_name"]),
-        base_config=_resolve_repo_path(payload["base_config"]),
-        output_root=_resolve_repo_path(payload["output_root"]),
+        experiment_name=experiment_name,
+        base_config=base_config,
+        output_root=output_root,
         n_panels=int(payload.get("n_panels", 30)),
         panel_size=int(payload.get("panel_size", 200)),
         panel_seeds=list(payload.get("panel_seeds", [])),
@@ -226,11 +221,11 @@ def build_condition_run_config(
 
 
 def manifest_path_for_spec(spec: RandomGenePanelNullStudySpec) -> Path:
-    return spec.output_root / "manifest.json"
+    return manifest_path_for_output(spec.output_root)
 
 
 def analysis_dir_for_spec(spec: RandomGenePanelNullStudySpec) -> Path:
-    return spec.output_root / "analysis"
+    return analysis_dir_for_output(spec.output_root)
 
 
 def eligible_universe_path_for_spec(spec: RandomGenePanelNullStudySpec) -> Path:

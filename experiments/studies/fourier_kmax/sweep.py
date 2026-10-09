@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import argparse
 import json
 
 from data import load_dataset
 from experiments.configuration import build_manifest_config_snapshot, build_run_config, save_standardized_outputs
+from experiments.core.study_spec import sweep_arg_parser
 from experiments.studies.fourier_kmax.lib import (
     FourierKmaxStudySpec,
     analysis_dir_for_spec,
@@ -82,12 +82,8 @@ def run_fourier_kmax_sweep(
     return manifest_payload
 
 
-def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run a Fourier k_max existence sweep experiment.")
-    parser.add_argument("--spec", required=True, help="Path to the experiment spec JSON")
-    parser.add_argument("--dry-run", action="store_true", help="Print the planned runs without executing them")
-    parser.add_argument("--max-runs", type=int, default=None, help="Optional cap on the number of planned runs")
-    return parser
+def _build_arg_parser():
+    return sweep_arg_parser("Run a Fourier k_max existence sweep experiment.")
 
 
 def main() -> None:

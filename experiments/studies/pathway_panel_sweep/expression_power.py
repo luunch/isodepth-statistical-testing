@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 
+from experiments.core.study_spec import add_spec_argument
 from experiments.studies.pathway_panel_sweep.pathway_expression_power import (
     analyze_pathway_expression_power,
 )
@@ -15,7 +16,7 @@ def main() -> None:
             "nonsignificant Hallmark pathways."
         ),
     )
-    parser.add_argument("--spec", required=True, help="Path to the pathway sweep spec JSON")
+    add_spec_argument(parser, help="Path to the pathway sweep spec JSON")
     parser.add_argument(
         "--reference-pathway",
         default="HALLMARK_EPITHELIAL_MESENCHYMAL_TRANSITION",

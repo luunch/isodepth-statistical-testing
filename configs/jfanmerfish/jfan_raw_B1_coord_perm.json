@@ -1,0 +1,36 @@
+{
+  "data": {
+    "source": "h5ad",
+    "h5ad": "data/h5ad/merfish_xia2019_u2os.h5ad",
+    "spatial_key": "spatial",
+    "obs_filters": {"batch": "B1"},
+    "min_cells_per_gene": 10,
+    "min_cells_per_celltype": 5,
+    "standardize_expression": true,
+    "standardize_coordinates": true,
+    "normalize_total": true,
+    "log1p": true,
+    "use_raw": false,
+    "seed": 0
+  },
+  "test": {
+    "method": "parallel_permutation",
+    "metric": "nll_gaussian_mse",
+    "n_perms": 249,
+    "epochs": 1000,
+    "n_reruns": 30,
+    "sgd_batch_size": 128,
+    "sgd_cosine_lr_decay": true,
+    "lr": 0.001,
+    "seed": 42,
+    "device": "cuda",
+    "decoder": "linear",
+    "verbose": true
+  },
+  "output": {
+    "out_dir": "results/jfan_merfish",
+    "run_name": "260904_jfan_merfish_linear_decoder_B1_p499",
+    "save_preds": false,
+    "save_perm_stats": true
+  }
+}

@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import matplotlib
@@ -39,6 +40,7 @@ from experiments.configuration import (
     _dataset_for_gene_expression_plots,
     _decoder_df_from_config,
 )
+from methods.permutation import _preprocess_separate_subset
 
 
 def _covariate_label(cfg: dict) -> str:
@@ -86,6 +88,54 @@ def _load_per_type_expression(
         expr_by_type[ct] = np.asarray(dataset.A[mask], dtype=np.float32)
         spatial_by_type[ct] = np.asarray(dataset.S[mask], dtype=np.float32)
     return expr_by_type, spatial_by_type, meta
+
+
+def _data_cfg_with_meta_preprocessing(data_cfg: DataConfig, dataset_meta: dict) -> DataConfig:
+    """Fill HVG/transform fields dropped by compact result JSON."""
+    src = dataset_meta.get("separate_preprocessing") or dataset_meta
+    updates = {}
+    for key in (
+        "top_var_genes",
+        "normalize_total",
+        "min_cells_per_gene",
+        "min_sparsity_percentage",
+        "log1p",
+        "standardize_expression",
+        "q",
+    ):
+        if key in src:
+            updates[key] = src[key]
+    return replace(data_cfg, **updates) if updates else data_cfg
+
+
+def _recover_per_type_var_names(
+    data_cfg: DataConfig,
+    cell_type_names: list[str],
+    covariate: CovariateConfig | None,
+    n_genes_by_type: dict[str, int],
+    dataset_meta: dict | None = None,
+) -> dict[str, list[str]]:
+    """Rebuild per-type gene names to match saved NPZ expression columns.
+
+    Compact result JSON drops ``var_names``, so NPZ-only regen would otherwise
+    label panels as ``gene_0``, ``gene_1``, …
+    """
+    if dataset_meta:
+        data_cfg = _data_cfg_with_meta_preprocessing(data_cfg, dataset_meta)
+    dataset = load_dataset(data_cfg, covariate=covariate)
+    labels = np.asarray(dataset.meta.get("cell_type_labels", []), dtype=np.int64)
+    names: list[str] = list(dataset.meta.get("cell_type_names", []))
+    recovered: dict[str, list[str]] = {}
+    for ct, n_genes in n_genes_by_type.items():
+        if ct not in names:
+            continue
+        idx = names.index(ct)
+        _, var_names_c, _ = _preprocess_separate_subset(
+            dataset, dataset.A[labels == idx], idx
+        )
+        if var_names_c is not None and len(var_names_c) == int(n_genes):
+            recovered[ct] = [str(v) for v in var_names_c]
+    return recovered
 
 
 def regen_separate_celltype_plots(result_path: Path, *, dry_run: bool = False) -> str:
@@ -141,6 +191,27 @@ def regen_separate_celltype_plots(result_path: Path, *, dry_run: bool = False) -
         spatial_cache.update(spatial_by_type)
 
     subset_meta = _subset_meta(dataset_meta)
+    names_by_type: dict[str, list[str]] = {}
+    compact_names = subset_meta.get("var_names")
+    n_genes_by_type = {
+        ct: int(arr.shape[1])
+        for ct, arr in {**expr_by_type, **npz_cache}.items()
+        if arr is not None
+    }
+    needs_name_recovery = not (
+        isinstance(compact_names, (list, tuple))
+        and n_genes_by_type
+        and all(len(compact_names) == n for n in n_genes_by_type.values())
+    )
+    if needs_name_recovery and n_genes_by_type:
+        try:
+            names_by_type = _recover_per_type_var_names(
+                data_cfg, cell_type_names, covariate, n_genes_by_type,
+                dataset_meta=dataset_meta,
+            )
+        except Exception as exc:
+            print(f"  warning: could not recover gene names for {result_path.name}: {exc}", flush=True)
+
     regenerated = 0
 
     for ct in cell_type_names:
@@ -156,7 +227,14 @@ def regen_separate_celltype_plots(result_path: Path, *, dry_run: bool = False) -
         if S is None:
             S = np.zeros((A.shape[0], 2), dtype=np.float32)
 
-        bundle = DatasetBundle(S=S, A=A, meta=subset_meta).validate()
+        meta_ct = dict(subset_meta)
+        if ct in names_by_type:
+            meta_ct["var_names"] = names_by_type[ct]
+        elif isinstance(compact_names, (list, tuple)) and len(compact_names) == A.shape[1]:
+            meta_ct["var_names"] = [str(v) for v in compact_names]
+        else:
+            meta_ct.pop("var_names", None)
+        bundle = DatasetBundle(S=S, A=A, meta=meta_ct).validate()
         pred_iso = pred_cache.get(ct)
         pred_cov = pred_cov_cache.get(ct)
         cov = cov_cache.get(ct)

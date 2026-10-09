@@ -5,6 +5,7 @@ import json
 
 from data import load_dataset
 from experiments.configuration import build_manifest_config_snapshot, build_run_config, save_standardized_outputs
+from experiments.core.study_spec import add_spec_argument, add_sweep_run_arguments
 from experiments.studies.pathway_panel_sweep.lib import (
     build_pathway_run_config,
     expand_pathway_conditions,
@@ -140,9 +141,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run isodepth existence tests for every pathway in a GMT file.",
     )
-    parser.add_argument("--spec", required=True, help="Path to the experiment spec JSON")
-    parser.add_argument("--dry-run", action="store_true", help="Print planned runs without executing")
-    parser.add_argument("--max-runs", type=int, default=None, help="Optional cap on number of runs")
+    add_spec_argument(parser)
+    add_sweep_run_arguments(parser)
     parser.add_argument(
         "--hvg3000-only",
         action="store_true",

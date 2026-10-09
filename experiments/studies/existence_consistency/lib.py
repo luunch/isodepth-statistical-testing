@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from experiments.core.paths import repo_root
-
 import copy
 import json
 from dataclasses import dataclass, field
@@ -12,11 +10,15 @@ import numpy as np
 
 from data.schemas import RunConfig, SUPPORTED_EXISTENCE_METHODS, run_config_from_mapping
 from experiments.configuration import build_run_config
+from experiments.core.study_spec import (
+    analysis_dir_for_output,
+    common_study_fields,
+    load_spec,
+    manifest_path_for_output,
+    resolve_repo_path as _resolve_repo_path,
+)
 from experiments.studies.existence_sigma.lib import load_result_payload, scan_result_json_paths, write_csv
 from methods.metrics import compute_metric
-
-
-REPO_ROOT = repo_root(__file__)
 
 
 @dataclass
@@ -61,22 +63,14 @@ class RealDataExistenceRepeatCondition:
     run_name: str
 
 
-def _resolve_repo_path(path_value: str | Path) -> Path:
-    path = Path(path_value)
-    if path.is_absolute():
-        return path.resolve()
-    return (REPO_ROOT / path).resolve()
-
-
 def load_real_data_existence_consistency_spec(path: str | Path) -> RealDataExistenceConsistencyStudySpec:
-    spec_path = Path(path).resolve()
-    with open(spec_path, "r", encoding="utf-8") as handle:
-        payload = json.load(handle)
+    payload = load_spec(path)
+    experiment_name, base_config, output_root = common_study_fields(payload)
 
     spec = RealDataExistenceConsistencyStudySpec(
-        experiment_name=str(payload["experiment_name"]),
-        base_config=_resolve_repo_path(payload["base_config"]),
-        output_root=_resolve_repo_path(payload["output_root"]),
+        experiment_name=experiment_name,
+        base_config=base_config,
+        output_root=output_root,
         n_repeats=int(payload.get("n_repeats", 20)),
         repeat_seeds=list(payload.get("repeat_seeds", [])),
         n_perms=int(payload.get("n_perms", 100)),
@@ -133,11 +127,11 @@ def build_repeat_run_config(
 
 
 def manifest_path_for_spec(spec: RealDataExistenceConsistencyStudySpec) -> Path:
-    return spec.output_root / "manifest.json"
+    return manifest_path_for_output(spec.output_root)
 
 
 def analysis_dir_for_spec(spec: RealDataExistenceConsistencyStudySpec) -> Path:
-    return spec.output_root / "analysis"
+    return analysis_dir_for_output(spec.output_root)
 
 
 def load_manifest_entries(path: str | Path) -> dict[Path, dict[str, Any]]:

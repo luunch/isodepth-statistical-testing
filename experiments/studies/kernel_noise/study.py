@@ -25,9 +25,16 @@ from experiments.core.dataset_cache import (  # noqa: F401 — re-export for scr
     load_dataset_cache,
     save_dataset_cache,
 )
-from experiments.core.paths import repo_root
+from experiments.core.study_spec import (
+    add_spec_argument,
+    add_sweep_run_arguments,
+    analysis_dir_for_output,
+    load_spec,
+    manifest_path_for_output,
+    resolve_repo_path as _resolve_repo_path,
+    runs_dir_for_output,
+)
 
-REPO_ROOT = repo_root(__file__)
 TestMethod = Literal["parallel_permutation", "block_permutation"]
 
 
@@ -90,21 +97,13 @@ class KernelNoiseRunCondition:
     run_name: str
 
 
-def _resolve_repo_path(path_value: str | Path) -> Path:
-    path = Path(path_value)
-    if path.is_absolute():
-        return path.resolve()
-    return (REPO_ROOT / path).resolve()
-
-
 def _format_number(value: float) -> str:
     text = f"{float(value):.6g}"
     return text.replace("-", "m").replace(".", "p")
 
 
 def load_kernel_noise_study_spec(path: str | Path) -> KernelNoiseStudySpec:
-    with open(path, encoding="utf-8") as handle:
-        payload = json.load(handle)
+    payload = load_spec(path)
     spec = KernelNoiseStudySpec(
         experiment_name=str(payload["experiment_name"]),
         existence_base_config=_resolve_repo_path(payload["existence_base_config"]),
@@ -121,7 +120,7 @@ def load_kernel_noise_study_spec(path: str | Path) -> KernelNoiseStudySpec:
 
 
 def analysis_dir_for_spec(spec: KernelNoiseStudySpec) -> Path:
-    return spec.output_root / "analysis"
+    return analysis_dir_for_output(spec.output_root)
 
 
 def datasets_dir_for_spec(spec: KernelNoiseStudySpec) -> Path:
@@ -129,11 +128,11 @@ def datasets_dir_for_spec(spec: KernelNoiseStudySpec) -> Path:
 
 
 def runs_dir_for_spec(spec: KernelNoiseStudySpec) -> Path:
-    return spec.output_root / "runs"
+    return runs_dir_for_output(spec.output_root)
 
 
 def manifest_path_for_spec(spec: KernelNoiseStudySpec) -> Path:
-    return spec.output_root / "manifest.json"
+    return manifest_path_for_output(spec.output_root)
 
 
 def expand_kernel_noise_conditions(spec: KernelNoiseStudySpec) -> list[KernelNoiseRunCondition]:
@@ -358,9 +357,8 @@ def run_kernel_noise_study(
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the synthetic kernel-noise coordinate vs block study.")
-    parser.add_argument("--spec", required=True, help="Path to configs/experiments/kernel_noise_study.json")
-    parser.add_argument("--dry-run", action="store_true", help="Print planned datasets/runs without executing")
-    parser.add_argument("--max-runs", type=int, default=None, help="Optional cap on number of test runs")
+    add_spec_argument(parser, help="Path to configs/experiments/kernel_noise_study.json")
+    add_sweep_run_arguments(parser)
     return parser
 
 

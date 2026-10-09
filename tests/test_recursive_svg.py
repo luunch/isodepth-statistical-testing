@@ -49,7 +49,7 @@ class TestRecursiveSchemaValidation(unittest.TestCase):
     def test_recursive_rejected_for_non_parallel_permutation(self) -> None:
         with self.assertRaises(ValueError) as ctx:
             TestConfig(
-                method="cross_validation",
+                method="full_retraining",
                 decoder="linear",
                 recursive=True,
                 n_perms=2,

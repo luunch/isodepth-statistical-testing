@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import json
 from pathlib import Path
 
@@ -8,6 +7,7 @@ import numpy as np
 
 from analysis.experiment_plots import save_target_vs_null_histogram
 from experiments.core.study_io import scan_result_json_paths, write_csv
+from experiments.core.study_spec import analysis_arg_parser
 from experiments.studies.random_gene_panel_null.lib import (
     analysis_dir_for_spec,
     compute_target_rank,
@@ -145,10 +145,8 @@ def analyze_random_gene_panel_null_results(spec_path: str | Path) -> dict[str, o
     return payload
 
 
-def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Analyze a random gene-panel null specificity study.")
-    parser.add_argument("--spec", required=True, help="Path to the experiment spec JSON")
-    return parser
+def _build_arg_parser():
+    return analysis_arg_parser("Analyze a random gene-panel null specificity study.")
 
 
 def main() -> None:

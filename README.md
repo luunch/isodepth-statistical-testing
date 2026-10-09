@@ -90,7 +90,6 @@ Create a config file like this and save it as `configs/my_run.json`:
     "method": "parallel_permutation",
     "metric": "nll_gaussian_mse",
     "n_perms": 100,
-    "n_nulls": 50,
     "epochs": 5000,
     "decoder": "nn",
     "lr": 0.001,
@@ -99,8 +98,6 @@ Create a config file like this and save it as `configs/my_run.json`:
     "device": "auto",
     "batch_size": null,
     "sgd_batch_size": 0,
-    "delta": [0.05],
-    "perturb_target": "coordinates",
     "verbose": true
   },
   "output": {
@@ -112,19 +109,15 @@ Create a config file like this and save it as `configs/my_run.json`:
 }
 ```
 
-There are ready-made perturbation examples at [noise_perturbation.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/noise_perturbation.json), [noise_comparison_perturbation.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/noise_comparison_perturbation.json), [radial_comparison_perturbation.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/radial_comparison_perturbation.json), and [mouse_hippocampus_comparison_perturbation.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/mouse_hippocampus_comparison_perturbation.json).
-
-A held-out existence example is available at [mouse_hippocampus_cross_validation_existence.json](/weka/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/mouse_hippocampus_cross_validation_existence.json).
-
 Supported `test.method` values:
 
 - `parallel_permutation`
-- `cross_validation`
+- `block_permutation`
+- `binning`
+- `visium_pseudobulk`
+- `correlated_null_permutation`
+- `correlated_null_adaptive_permutation`
 - `full_retraining`
-- `comparison_perturbation_test`
-- `perturbation_test`
-- `comparison_subsampling_test`
-- `subsampling_test`
 
 ## Running A Config
 
@@ -222,23 +215,19 @@ This option is intended for `h5ad` count-valued inputs and is not supported for 
 - `--k`: legacy shorthand for the Fourier frequency band when `--mode fourier`. It maps to `k_min = 1` and `k_max = k`, and the generator samples a coupled 2D Fourier basis over terms of the form `cos(2π(k1 x + k2 y))` and `sin(2π(k1 x + k2 y))`.
 - `data.dependent_xy`: Fourier-only boolean flag. `true` uses the coupled basis `k1 x + k2 y`; `false` uses independent `x`-only and `y`-only sine/cosine terms.
 
-- `--method`: test method. Supported values are `parallel_permutation`, `cross_validation`, `full_retraining`, `comparison_perturbation_test`, `perturbation_test`, `comparison_subsampling_test`, `subsampling_test`.
+- `--method`: test method. Supported values are `parallel_permutation`, `block_permutation`, `binning`, `visium_pseudobulk`, `correlated_null_permutation`, `correlated_null_adaptive_permutation`, and `full_retraining`.
 - `--metric`: one of `nll_gaussian_mse`, `mse`, `pearson_corr_mean`, `spearman_corr_mean`.
-- `--n-perms`: number of perturbations for `comparison_perturbation_test` and `perturbation_test`, number of random subset draws per fraction for `subsampling_test` and `comparison_subsampling_test`, or number of permutations for existence-style methods.
-- `--n-folds`: number of k-fold splits for `cross_validation`. Each fold trains on all but one partition and evaluates the held-out test loss; fold losses are combined with fold-size weighting before the permutation comparison.
+- `--n-perms`: number of permutations for existence-style methods.
 - `--n-reruns`: number of parallel reruns trained per dataset instance inside the batched GASTON model. The minimum training reconstruction loss is selected independently for the observed dataset and every transformed/null dataset. Default is `30`.
 - `--alpha`: one-sided permutation significance threshold. Default is `0.05`.
-- `--n-nulls`: number of null datasets for `comparison_perturbation_test` and `comparison_subsampling_test`. This field is ignored by the direct transformed-data methods.
 - `--epochs`: training epochs for learned-model methods.
 - `--lr`: learning rate.
-- `--patience`: early stopping patience.
+- `--patience`: early stopping patience. `0` disables early stopping; minibatch training still restores the best full-data epoch for each restart.
 - `--device`: compute device such as `cpu`, `cuda`, `mps`, or `auto`.
 - `--decoder`: decoder architecture for isodepth models. Supported values are `linear` and `nn`. Default is `nn` when omitted from config and CLI.
-- `--batch-size`: optional grouping cap for `comparison_perturbation_test` null datasets. Each grouped null batch packs up to `batch_size * (n_perms + 1)` models into one parallel trainer call. Leave unset to batch all null datasets together.
-- `--sgd-batch-size`: optional minibatch size for stochastic gradient descent over cells during model fitting. Leave unset or set to `0` to keep the current full-batch training behavior.
-- `--delta`: comma-separated perturbation scales for perturbation methods. Noise is sampled as a fraction of each spatial axis range.
-- `--perturb-target`: perturbation target for perturbation methods. The current implementation only supports `coordinates`.
-- `--subset-fractions`: comma-separated subset fractions for subsampling methods. The default schedule is `0.5,0.7,0.9`.
+- `--batch-size`: optional `test.batch_size` override.
+- `--sgd-batch-size`: optional minibatch size for stochastic gradient descent over cells during model fitting. Leave unset or set to `0` to keep the current full-batch training behavior. Each independent model receives its own mean reconstruction-loss gradient, without division by the number of parallel models. This convention is shared by learned isodepth models, models with appended covariates, cell-type models, and fixed-covariate decoders.
+  Gaussian linear/quadratic decoders also honor this setting: OLS is fit within each minibatch for encoder updates, while checkpoint selection and final decoder fitting use the full training data. In separate cell-type mode, the batch size applies independently within each cell-type subset.
 
 - `--out-dir`: parent output directory.
 - `--run-name`: run-specific subdirectory name under `out_dir`, and the filename prefix for saved artifacts.
@@ -285,142 +274,6 @@ The result JSON includes these standard fields:
 - `config`
 - `artifacts`
 
-## Comparison Perturbation Test
-
-`comparison_perturbation_test` measures whether the learned isodepth is stable after perturbing the spatial coordinates and retraining the model.
-
-- On the observed dataset, fit one original model plus `n_perms` perturbed-coordinate refits at each delta in the `delta` list and compute the perturbation score for each refit.
-- Each fitted dataset instance is internally trained with `n_reruns` parallel reruns, and the rerun with the minimum training reconstruction loss is kept before computing downstream statistics.
-- For each delta, summarize the observed perturbation scores at that delta by their mean. Each delta gets its own `stat_true`, null distribution, and p-value.
-- Build a null distribution by destroying the spatial-expression pairing with random permutations of `A`.
-- For each null dataset, rerun the same perturb-and-refit pipeline and keep a separate delta-specific null mean for every delta.
-- Compare each observed delta-specific mean perturbation score to its matching delta-specific null distribution to obtain the p-value.
-
-Metric semantics for `comparison_perturbation_test`:
-
-- `mse` and `nll_gaussian_mse` compare min-max normalized isodepth vectors, where lower is better.
-- `pearson_corr_mean` and `spearman_corr_mean` compare min-max normalized single-column vectors and use the absolute correlation, where higher is better.
-
-Example config:
-
-```json
-{
-  "test": {
-    "method": "comparison_perturbation_test",
-    "metric": "spearman_corr_mean",
-    "n_perms": 200,
-    "n_nulls": 50,
-    "delta": [0.05, 0.1, 0.5],
-    "perturb_target": "coordinates"
-  }
-}
-```
-
-Multi-delta perturbation plots:
-
-- The isodepth figure becomes a 3-column grid with one row per delta.
-- Each row contains the full-data isodepth, the lowest-metric perturbed refit for that delta, and the highest-metric perturbed refit for that delta.
-- A separate scatter plot shows delta on the x-axis and per-delta p-value on the y-axis.
-
-## Perturbation Test
-
-`perturbation_test` measures how unusual the original-data reconstruction loss is relative to refits on directly perturbed coordinate datasets.
-
-- Fit one baseline model on the original `(S, A)` dataset and use its reconstruction loss as `stat_true`.
-- For each configured delta, generate `n_perms` perturbed coordinate datasets, refit the model on each perturbed `S`, and evaluate reconstruction loss against the observed `A`.
-- Use those perturbed-data losses directly as the delta-specific null distribution.
-- Report one p-value per delta and expose the first configured delta as the top-level `stat_true`, `stat_perm`, and `p_value`.
-
-Metric semantics for `perturbation_test`:
-
-- `mse` and `nll_gaussian_mse` are supported, where lower is better.
-- Correlation metrics are rejected because this method tests reconstruction loss directly.
-
-Example config:
-
-```json
-{
-  "test": {
-    "method": "perturbation_test",
-    "metric": "nll_gaussian_mse",
-    "n_perms": 200,
-    "delta": [0.05, 0.1, 0.5],
-    "perturb_target": "coordinates"
-  }
-}
-```
-
-## Comparison Subsampling Test
-
-`comparison_subsampling_test` measures whether the full-data isodepth can be recovered from repeated subsets of spots.
-
-- Fit a baseline model on the full dataset and extract the reference isodepth `d`.
-- Draw `n_perms` random subsets at each configured subset fraction.
-- Refit isodepth models in parallel while restricting each model's training loss to its selected subset.
-- Compute the masked reconstruction loss for each subset refit and summarize those observed losses by their mean within each subset fraction. Each fraction gets its own `stat_true`, null distribution, and p-value.
-- Build a null distribution by permuting the expression rows, reusing the same subset masks, and recomputing the fraction-specific mean masked loss for each null replicate.
-- Record the absolute Spearman agreement between each subset isodepth `d_A` and `d` on the selected spots as a diagnostic artifact.
-- Compare each observed fraction-specific mean loss to its matching fraction-specific null distribution to obtain the p-value.
-
-Metric semantics for `comparison_subsampling_test`:
-
-- `mse` and `nll_gaussian_mse` are supported for hypothesis testing, where lower is better.
-- Correlation metrics are not used as the primary test statistic for this method.
-
-Recommended default schedule:
-
-- `subset_fractions = [0.5, 0.7, 0.9]`
-- `n_perms = 10`
-- total observed subset refits per run = `len(subset_fractions) * n_perms`
-
-Plots for `comparison_subsampling_test`:
-
-- The isodepth figure becomes a 3-column grid with one row per subset fraction.
-- Each row contains the full-data isodepth, the lowest-loss subset refit for that fraction, and the highest-loss subset refit for that fraction.
-- A separate scatter plot shows subset fraction on the x-axis and per-fraction p-value on the y-axis.
-
-## Subsampling Test
-
-`subsampling_test` measures how unusual the full-data reconstruction loss is relative to refits on directly subsampled coordinate sets.
-
-- Fit one baseline model on the full dataset and use its full-data reconstruction loss as `stat_true`.
-- Treat each random subset draw as one permutation, with `n_perms` draws at each configured subset fraction.
-- Refit the model with training loss restricted to each sampled subset.
-- Evaluate each subset refit on its selected spots, scale the subset loss by dividing by the subset fraction, and use those scaled losses as the fraction-specific null distribution.
-- Report one p-value per subset fraction and expose the first configured fraction as the top-level `stat_true`, `stat_perm`, and `p_value`.
-
-Metric semantics for `subsampling_test`:
-
-- `mse` and `nll_gaussian_mse` are supported, where lower is better.
-- Correlation diagnostics are retained as artifacts only and are not the test statistic.
-
-Example config:
-
-```json
-{
-  "test": {
-    "method": "subsampling_test",
-    "metric": "mse",
-    "n_perms": 50,
-    "subset_fractions": [0.5, 0.7, 0.9]
-  }
-}
-```
-
-Example config:
-
-```json
-{
-  "test": {
-    "method": "comparison_subsampling_test",
-    "metric": "mse",
-    "n_perms": 10,
-    "n_nulls": 50,
-    "subset_fractions": [0.5, 0.7, 0.9]
-  }
-}
-```
-
 ## Experiment Sweeps
 
 Broader multi-run studies live under `experiments/` and sit above the single-run `run_permutation.py` pipeline.
@@ -438,16 +291,12 @@ The Fourier `k_max` sweep uses:
 - `python -m experiments.fourier_kmax_sweep --spec configs/experiments/fourier_kmax_study.json` to launch the study
 - `python -m experiments.fourier_kmax_analysis --spec configs/experiments/fourier_kmax_study.json` to aggregate saved result JSONs into `per_run_results.csv`, `summary_by_kmax.csv`, and `pvalue_vs_kmax.png`
 
-The Fourier existence-only `k_max` studies use:
+The Fourier existence-only `k_max` study uses:
 
-- [configs/fourier_existence.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/fourier_existence.json) as the existence base config
-- [configs/fourier_existence_dependent_xy.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/fourier_existence_dependent_xy.json) as the dependent-`xy` existence base config
-- [configs/experiments/fourier_kmax_existence_study.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/experiments/fourier_kmax_existence_study.json) as the independent-`xy` sweep spec
-- [configs/experiments/fourier_kmax_existence_dependent_xy_study.json](/home/ajain71/scratchuchitra1/users/ajain71/isodepth-statistical-testing/configs/experiments/fourier_kmax_existence_dependent_xy_study.json) as the dependent-`xy` sweep spec
-- `python -m experiments.fourier_kmax_sweep --spec configs/experiments/fourier_kmax_existence_study.json` to launch the independent-`xy` study
-- `python -m experiments.fourier_kmax_analysis --spec configs/experiments/fourier_kmax_existence_study.json` to analyze the independent-`xy` study
-- `python -m experiments.fourier_kmax_sweep --spec configs/experiments/fourier_kmax_existence_dependent_xy_study.json` to launch the dependent-`xy` study
-- `python -m experiments.fourier_kmax_analysis --spec configs/experiments/fourier_kmax_existence_dependent_xy_study.json` to analyze the dependent-`xy` study
+- [configs/synthetic/fourier_existence.json](/home/jhu/ajain71/scratch_uchitra1/users/ajain71/isodepth-statistical-testing/configs/synthetic/fourier_existence.json) as the existence base config
+- [configs/experiments/fourier_kmax_existence_study.json](/home/ajain71/scratch_uchitra1/users/ajain71/isodepth-statistical-testing/configs/experiments/fourier_kmax_existence_study.json) as the sweep spec
+- `python -m experiments.fourier_kmax_sweep --spec configs/experiments/fourier_kmax_existence_study.json` to launch the study
+- `python -m experiments.fourier_kmax_analysis --spec configs/experiments/fourier_kmax_existence_study.json` to analyze the study
 
 The real-data existence consistency study uses:
 
@@ -616,3 +465,30 @@ Smoothness checks are available under `validation/`:
 
 - `python validation/smoothness.py`
 - `python validation/permuted_smoothness.py`
+
+### Independent-model training and reproducibility
+
+Parallel model losses are averaged within each model over the included cells/genes,
+then **summed across independent models** for backpropagation. Adding permutations,
+restarts, or covariates does not introduce a different loss-scale divisor. Stopping
+other slots or splitting a batch for GPU memory also does not rescale an active
+model's gradients. The former `gradient_scale_divisor` trainer argument has been
+removed, including its use in the bias diagnostic.
+
+All neural trainers use the same checkpoint rule: minibatch training restores the
+best full-data training epoch per restart, even with `patience=0`; full-batch training
+restores the best epoch when early stopping is enabled and otherwise uses the final
+epoch. The same optional cosine minibatch learning-rate schedule applies to fixed
+covariate decoders. Checkpointed spatial loss histories report the retained best
+loss per slot, so the final recorded ordering agrees with restart selection.
+Gaussian warm-up checkpoints are compared separately from the final Poisson phase.
+
+Gradient-scale invariance assumes identical initial weights and data batches. A
+fixed seed alone does not guarantee identical weights when model shapes or counts
+change, and adding a covariate can change the architecture and objective. Floating
+point kernels may also differ with batch shape. The regression tests explicitly
+copy weights to isolate the scaling guarantee.
+
+Results produced before this correction retain their original scores. Recompute
+both observed and permutation models to obtain results under the corrected
+training procedure; do not combine newly trained observed models with old nulls.

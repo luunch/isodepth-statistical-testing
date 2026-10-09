@@ -20,6 +20,7 @@ from analysis.plots import (
     _point_size,
     _spatial_axis_limits,
 )
+from methods.metrics import metric_axis_label
 
 
 MM_PER_INCH = 25.4
@@ -201,17 +202,12 @@ def plot_celltype_map(
     _strip_spatial_axes(ax, limits)
 
 
-_METRIC_DISPLAY = {
-    "nll_gaussian_mse": "Loss",
-    "mse": "MSE",
-    "pearson_corr_mean": "Pearson r",
-    "spearman_corr_mean": "Spearman \u03c1",
-}
-
-
 def friendly_metric(raw: str) -> str:
-    """Map internal metric names to human-readable labels."""
-    return _METRIC_DISPLAY.get(raw, raw)
+    """Map internal metric names to human-readable null-distribution labels."""
+    try:
+        return metric_axis_label(raw)
+    except ValueError:
+        return raw
 
 
 def plot_null_ecdf(
@@ -245,7 +241,7 @@ def plot_null_ecdf(
         ax.axvline(stat_covariate, color="#16a085", linestyle="--",
                    linewidth=0.8, label="Covariate")
 
-    xlabel = friendly_metric(metric_label) if metric_label else "Loss"
+    xlabel = friendly_metric(metric_label) if metric_label else "MSE"
     ax.set_xlabel(xlabel, fontsize=4.5)
     ax.set_ylabel("Cumulative prob.", fontsize=4.5)
     if title:
@@ -292,7 +288,7 @@ def plot_null_histogram(
         ax.axvline(stat_covariate, color="#16a085", linestyle="--",
                    linewidth=0.8, label="Covariate")
 
-    xlabel = friendly_metric(metric_label) if metric_label else "Loss"
+    xlabel = friendly_metric(metric_label) if metric_label else "MSE"
     ax.set_xlabel(xlabel, fontsize=4.5)
     ax.set_ylabel("Density", fontsize=4.5)
     if title:

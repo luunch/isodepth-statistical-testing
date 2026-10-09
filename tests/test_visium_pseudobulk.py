@@ -77,7 +77,7 @@ def test_visium_pseudobulk_drops_gap_cells_and_sums_counts():
     assert binned.n_cells == summary["n_pseudospots"]
 
 
-def test_visium_pseudobulk_discards_spots_whose_circle_exits_tissue_mask():
+def test_visium_pseudobulk_overtiles_mask_and_keeps_overhanging_spots():
     dataset = _square_grid_dataset(n_side=60, spacing=5.0)
     config = TestConfig(
         method="visium_pseudobulk",
@@ -88,24 +88,46 @@ def test_visium_pseudobulk_discards_spots_whose_circle_exits_tissue_mask():
         block_jitter=False,
     ).validate()
 
-    # Dataset has no "shape" in meta (not marked synthetic), so this falls back to the
-    # density-based tissue mask: spots near the point-cloud boundary should still be
-    # discarded relative to the raw candidate-lattice count.
     binned, artifacts = build_visium_pseudobulk_dataset(dataset, config)
     summary = artifacts["visium_pseudobulk_summary"]
+    assert summary["overtile"] is True
+    # Lattice still extends past the tissue, so overlap-filter drops some candidates.
     assert summary["n_spots_in_tissue"] < summary["n_candidate_spots"]
     assert summary["n_pseudospots"] <= summary["n_spots_in_tissue"]
 
+    S_um = np.asarray(artifacts["visium_overlay_S_um"], dtype=np.float64)
+    assigned = np.asarray(artifacts["visium_overlay_assigned"], dtype=bool)
+    centers = np.asarray(artifacts["visium_overlay_centers_in_tissue_um"], dtype=np.float64)
+    occupied = np.asarray(artifacts["visium_overlay_occupied_ids"], dtype=np.int64)
+    occupied_centers = centers[occupied]
+    xmin, ymin = S_um.min(axis=0)
+    xmax, ymax = S_um.max(axis=0)
+    # Overtile: some occupied centers sit outside the cell bounding box.
+    overhangs = (
+        (occupied_centers[:, 0] < xmin)
+        | (occupied_centers[:, 0] > xmax)
+        | (occupied_centers[:, 1] < ymin)
+        | (occupied_centers[:, 1] > ymax)
+    )
+    assert bool(np.any(overhangs))
+    # Edge cells can still land in a 55 µm circle (not dropped just for sitting on the rim).
+    edge = (
+        (S_um[:, 0] <= xmin + 10.0)
+        | (S_um[:, 0] >= xmax - 10.0)
+        | (S_um[:, 1] <= ymin + 10.0)
+        | (S_um[:, 1] >= ymax - 10.0)
+    )
+    assert bool(np.any(assigned[edge]))
+    assert binned.n_cells == summary["n_pseudospots"]
 
-def test_visium_pseudobulk_uses_synthetic_shape_mask_for_edge_effects():
+
+def test_visium_pseudobulk_synthetic_mask_overtiles_unit_square():
     dataset = _square_grid_dataset(n_side=20, spacing=5.0)
     dataset.meta["source"] = "synthetic"
     dataset.meta["shape"] = "square"
-    # Tissue extent is [0, 95] x [0, 95] in native units after this z-score-free setup;
-    # _point_in_spatial_shape for "square" is defined on [0, 1]^2, so mark coordinates as
-    # already "native" (no z-score) -- membership will therefore be false almost everywhere
-    # except near the origin, exercising the synthetic-shape branch without asserting exact
-    # counts (covered by the unit-square shape tests in test_synthetic.py).
+    # Tissue membership is the unit square [0, 1]^2; cells span [0, 95]. Overtile
+    # keeps spots whose 55 µm circle overlaps that square (near the origin), not
+    # spots on the far side of the grid.
     config = TestConfig(
         method="visium_pseudobulk",
         n_perms=1,
@@ -115,10 +137,11 @@ def test_visium_pseudobulk_uses_synthetic_shape_mask_for_edge_effects():
         block_jitter=False,
     ).validate()
 
-    try:
-        build_visium_pseudobulk_dataset(dataset, config)
-    except ValueError as exc:
-        assert "no spot whose full circular footprint" in str(exc)
+    binned, artifacts = build_visium_pseudobulk_dataset(dataset, config)
+    centers = np.asarray(artifacts["visium_overlay_centers_in_tissue_um"], dtype=np.float64)
+    assert binned.n_cells >= 1
+    assert np.all(centers[:, 0] < 50.0)
+    assert np.all(centers[:, 1] < 50.0)
 
 
 def test_visium_pseudobulk_keeps_cell_types_as_separate_pseudospots():

@@ -9,7 +9,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from data.schemas import CovariateConfig, DataConfig, TestConfig, run_config_from_mapping
+from data.schemas import (
+    BlurredPermutationsConfig,
+    CovariateConfig,
+    DataConfig,
+    TestConfig,
+    run_config_from_mapping,
+)
 from methods.metrics import compute_metric, permutation_p_value
 from run_permutation import _build_arg_parser, _build_cli_overrides
 
@@ -93,6 +99,19 @@ class TestDataSchema(unittest.TestCase):
                 gene_list=["ACTB", "VEGFA"],
                 top_var_genes=3000,
             ).validate()
+
+    def test_n_expression_pcs_is_rejected_with_q(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="h5ad",
+                h5ad="data/example.h5ad",
+                n_expression_pcs=20,
+                q=5,
+            ).validate()
+
+    def test_n_expression_pcs_is_rejected_for_synthetic(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(source="synthetic", n_cells=8, n_genes=3, n_expression_pcs=2).validate()
 
     def test_log1p_cannot_be_combined_with_q(self) -> None:
         with self.assertRaises(ValueError):
@@ -380,9 +399,8 @@ class TestPerturbationSchema(unittest.TestCase):
 
     def test_zero_sgd_batch_size_keeps_full_batch_behavior(self) -> None:
         config = TestConfig(
-            method="comparison_perturbation_test",
+            method="parallel_permutation",
             metric="mse",
-            delta=[0.1],
             sgd_batch_size=0,
         )
         self.assertIs(config.validate(), config)
@@ -390,9 +408,8 @@ class TestPerturbationSchema(unittest.TestCase):
     def test_negative_sgd_batch_size_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             TestConfig(
-                method="comparison_perturbation_test",
+                method="parallel_permutation",
                 metric="mse",
-                delta=[0.1],
                 sgd_batch_size=-1,
             ).validate()
 
@@ -405,17 +422,15 @@ class TestPerturbationSchema(unittest.TestCase):
     def test_cosine_lr_decay_requires_positive_sgd_batch_size(self) -> None:
         with self.assertRaises(ValueError):
             TestConfig(
-                method="comparison_perturbation_test",
+                method="parallel_permutation",
                 metric="mse",
-                delta=[0.1],
                 sgd_cosine_lr_decay=True,
                 sgd_batch_size=0,
             ).validate()
         with self.assertRaises(ValueError):
             TestConfig(
-                method="comparison_perturbation_test",
+                method="parallel_permutation",
                 metric="mse",
-                delta=[0.1],
                 sgd_cosine_lr_decay=True,
                 sgd_batch_size=None,
             ).validate()
@@ -423,18 +438,16 @@ class TestPerturbationSchema(unittest.TestCase):
     def test_cosine_eta_min_must_be_in_range(self) -> None:
         with self.assertRaises(ValueError):
             TestConfig(
-                method="comparison_perturbation_test",
+                method="parallel_permutation",
                 metric="mse",
-                delta=[0.1],
                 sgd_batch_size=4,
                 sgd_cosine_lr_decay=True,
                 sgd_cosine_eta_min=-1e-6,
             ).validate()
         with self.assertRaises(ValueError):
             TestConfig(
-                method="comparison_perturbation_test",
+                method="parallel_permutation",
                 metric="mse",
-                delta=[0.1],
                 sgd_batch_size=4,
                 lr=1e-3,
                 sgd_cosine_lr_decay=True,
@@ -444,9 +457,8 @@ class TestPerturbationSchema(unittest.TestCase):
     def test_cosine_t_max_steps_must_be_positive_when_set(self) -> None:
         with self.assertRaises(ValueError):
             TestConfig(
-                method="comparison_perturbation_test",
+                method="parallel_permutation",
                 metric="mse",
-                delta=[0.1],
                 sgd_batch_size=4,
                 sgd_cosine_lr_decay=True,
                 sgd_cosine_t_max_steps=0,
@@ -468,119 +480,13 @@ class TestPerturbationSchema(unittest.TestCase):
         self.assertEqual(overrides["test"]["sgd_cosine_eta_min"], 1e-5)
         self.assertEqual(overrides["test"]["sgd_cosine_t_max_steps"], 400)
 
-    def test_comparison_perturbation_config_is_valid(self) -> None:
-        config = TestConfig(
-            method="comparison_perturbation_test",
-            metric="spearman_corr_mean",
-            delta=[0.1],
-            perturb_target="coordinates",
-        )
-        self.assertIs(config.validate(), config)
+    def test_obs_key_covariate_type_is_allowed(self) -> None:
+        cfg = CovariateConfig(type="leiden").validate()
+        self.assertTrue(cfg.is_obs_key)
+        self.assertFalse(cfg.is_builtin)
+        self.assertEqual(cfg.type, "leiden")
 
-    def test_invalid_perturb_target_is_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            TestConfig(
-                method="comparison_perturbation_test",
-                delta=[0.1],
-                perturb_target="expression",
-            ).validate()
-
-    def test_invalid_delta_is_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            TestConfig(method="comparison_perturbation_test", delta=[0.0]).validate()
-
-    def test_delta_list_is_validated(self) -> None:
-        config = TestConfig(
-            method="comparison_perturbation_test",
-            delta=[0.01, 0.05, 0.1],
-        )
-        self.assertIs(config.validate(), config)
-
-    def test_invalid_delta_list_entries_are_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            TestConfig(
-                method="comparison_perturbation_test",
-                delta=[0.01, 0.0],
-            ).validate()
-
-    def test_perturbation_test_config_is_valid(self) -> None:
-        config = TestConfig(
-            method="perturbation_test",
-            metric="mse",
-            n_perms=3,
-            delta=[0.1],
-            perturb_target="coordinates",
-        )
-        self.assertIs(config.validate(), config)
-
-    def test_perturbation_test_rejects_correlation_metric(self) -> None:
-        with self.assertRaises(ValueError):
-            TestConfig(
-                method="perturbation_test",
-                metric="spearman_corr_mean",
-                n_perms=3,
-                delta=[0.1],
-            ).validate()
-
-
-class TestSubsetSelectionSchema(unittest.TestCase):
-    def test_comparison_subsampling_config_is_valid(self) -> None:
-        config = TestConfig(
-            method="comparison_subsampling_test",
-            metric="mse",
-            n_perms=3,
-            n_nulls=5,
-            subset_fractions=[0.4, 0.8],
-        )
-        self.assertIs(config.validate(), config)
-
-    def test_invalid_subset_fraction_is_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            TestConfig(
-                method="comparison_subsampling_test",
-                metric="mse",
-                subset_fractions=[0.5, 1.0],
-            ).validate()
-
-    def test_invalid_comparison_subsampling_n_perms_is_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            TestConfig(
-                method="comparison_subsampling_test",
-                metric="mse",
-                n_perms=0,
-            ).validate()
-
-    def test_comparison_subsampling_rejects_correlation_metric(self) -> None:
-        with self.assertRaises(ValueError):
-            TestConfig(
-                method="comparison_subsampling_test",
-                metric="spearman_corr_mean",
-            ).validate()
-
-    def test_subsampling_config_is_valid(self) -> None:
-        config = TestConfig(
-            method="subsampling_test",
-            metric="mse",
-            n_perms=3,
-            subset_fractions=[0.4, 0.8],
-        )
-        self.assertIs(config.validate(), config)
-
-    def test_subsampling_rejects_correlation_metric(self) -> None:
-        with self.assertRaises(ValueError):
-            TestConfig(
-                method="subsampling_test",
-                metric="spearman_corr_mean",
-                n_perms=3,
-            ).validate()
-
-
-class TestCovariateSchema(unittest.TestCase):
-    def test_unknown_covariate_type_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            CovariateConfig(type="unknown").validate()
-
-    def test_run_config_parses_nested_covariate(self) -> None:
+    def test_run_config_accepts_dict_covariate(self) -> None:
         cfg = run_config_from_mapping(
             {
                 "data": {"source": "synthetic", "n_cells": 16, "n_genes": 3, "mode": "noise"},
@@ -610,6 +516,67 @@ class TestCovariateSchema(unittest.TestCase):
             }
         )
         self.assertEqual(cfg.test.covariate.type, "midline")
+
+
+class TestInputExpressionSchema(unittest.TestCase):
+    def test_log1p_normalized_requires_target(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="h5ad",
+                h5ad="data/example.h5ad",
+                input_expression_representation="log1p_normalized",
+            ).validate()
+
+    def test_log1p_normalized_accepts_cpm10k_target(self) -> None:
+        config = DataConfig(
+            source="h5ad",
+            h5ad="data/example.h5ad",
+            input_expression_representation="log1p_normalized",
+            input_normalization_target=10000,
+            make_var_names_unique=True,
+        )
+        self.assertIs(config.validate(), config)
+
+    def test_raw_counts_rejects_normalization_target(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="h5ad",
+                h5ad="data/example.h5ad",
+                input_normalization_target=10000,
+            ).validate()
+
+    def test_make_var_names_unique_rejected_for_synthetic(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(source="synthetic", make_var_names_unique=True).validate()
+
+
+class TestBlurredPermutationsSchema(unittest.TestCase):
+    def test_valid_block_is_parsed(self) -> None:
+        cfg = run_config_from_mapping(
+            {
+                "data": {"source": "synthetic", "n_cells": 16, "n_genes": 3, "mode": "noise"},
+                "test": {"method": "parallel_permutation", "metric": "mse", "n_perms": 2},
+                "output": {"out_dir": "results", "run_name": "t"},
+                "blurred_permutations": {
+                    "sigmas_um": [10, 20, 50],
+                    "n_per_sigma": 20,
+                    "cutoff_mult": 4,
+                    "within_cell_type": True,
+                },
+            }
+        )
+        self.assertIsNotNone(cfg.blurred_permutations)
+        self.assertEqual(cfg.blurred_permutations.sigmas_um, [10.0, 20.0, 50.0])
+        self.assertEqual(cfg.blurred_permutations.n_per_sigma, 20)
+        self.assertTrue(cfg.blurred_permutations.within_cell_type)
+
+    def test_duplicate_sigmas_are_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            BlurredPermutationsConfig(sigmas_um=[10, 10]).validate()
+
+    def test_non_positive_sigma_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            BlurredPermutationsConfig(sigmas_um=[10, 0]).validate()
 
 
 class TestMetricUtilities(unittest.TestCase):

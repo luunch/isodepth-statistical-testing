@@ -404,6 +404,11 @@ class TestSyntheticGeneration(unittest.TestCase):
                 "highest_S": np.asarray(dataset.S, dtype=np.float32),
                 "highest_stat": 0.3,
                 "null_summary": {"mean": 0.25},
+                "pred_true": np.zeros((dataset.n_cells, dataset.n_genes), dtype=np.float32),
+                "pred_true_covariate": np.ones((dataset.n_cells, dataset.n_genes), dtype=np.float32),
+                "freedman_lane_pred": np.full(
+                    (dataset.n_cells, dataset.n_genes), 2.0, dtype=np.float32
+                ),
             },
         ).validate()
 
@@ -433,6 +438,9 @@ class TestSyntheticGeneration(unittest.TestCase):
         self.assertNotIn("delta", payload["artifacts"])
         self.assertIn("true_isodepth", payload["artifacts"])
         self.assertEqual(len(payload["artifacts"]["true_isodepth"]), dataset.n_cells)
+        self.assertNotIn("pred_true", payload["artifacts"])
+        self.assertNotIn("pred_true_covariate", payload["artifacts"])
+        self.assertNotIn("freedman_lane_pred", payload["artifacts"])
         self.assertIn("synthetic_true_curve_plot", payload["artifacts"])
         self.assertNotIn("synthetic_true_curve", payload["artifacts"]["dataset_meta"])
         self.assertTrue(payload["artifacts"]["dataset_meta"]["has_synthetic_true_curve"])

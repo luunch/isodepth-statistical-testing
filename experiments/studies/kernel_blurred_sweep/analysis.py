@@ -10,6 +10,7 @@ from typing import Any
 import matplotlib.pyplot as plt
 import numpy as np
 
+from experiments.core.study_spec import add_spec_argument
 from experiments.studies.kernel_blurred_sweep.sweep import (
     DatasetKey,
     KernelBlurredSweepSpec,
@@ -376,11 +377,12 @@ def analyze_kernel_blurred_sweep(spec_path: str | Path, *, plots_only: bool = Fa
     _write_csv(summary_csv, SUMMARY_FIELDS, summary_rows)
 
     method_name = str(rows[0]["test_method"]) if rows else "method"
-    plot_stem = (
-        "kernel_blurred_visium_pseudobulk"
-        if method_name == "visium_pseudobulk"
-        else "kernel_blurred_pseudobulk"
-    )
+    if method_name == "visium_pseudobulk":
+        plot_stem = "kernel_blurred_visium_pseudobulk"
+    elif method_name == "binning":
+        plot_stem = "kernel_blurred_pseudobulk"
+    else:
+        plot_stem = spec.experiment_name
     plot_path = analysis_dir / f"{plot_stem}_pvalues.png"
     save_kernel_blurred_pvalue_plot(rows, plot_path, spec=spec, alpha=float(spec.alpha))
 
@@ -422,13 +424,12 @@ def analyze_kernel_blurred_sweep(spec_path: str | Path, *, plots_only: bool = Fa
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Analyze kernel_blurred_sweep outputs.")
-    parser.add_argument(
-        "--spec",
-        required=True,
+    add_spec_argument(
+        parser,
         help=(
             "Sweep spec. Use "
-            "configs/experiments/kernel_blurred_visium_pseudobulk_sweep.json "
-            "or configs/experiments/kernel_blurred_pseudobulk_sweep.json."
+            "configs/experiments/kernel_blurred_visium_pseudobulk_sweep.json or "
+            "configs/experiments/kernel_blurred_pseudobulk_sweep.json."
         ),
     )
     parser.add_argument(

@@ -10,16 +10,6 @@ from methods.freedman_lane import apply_freedman_lane_whitening
 from methods.permutation import run_permutation_method
 
 
-def _parse_csv_floats(value: str) -> list[float]:
-    values = [item.strip() for item in value.split(",") if item.strip()]
-    if not values:
-        raise argparse.ArgumentTypeError("Expected at least one comma-separated float")
-    try:
-        return [float(item) for item in values]
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("Expected comma-separated floats") from exc
-
-
 def _build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run a configured isodepth statistical test from a config-defined dataset."
@@ -36,6 +26,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use-raw", dest="use_raw", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--no-use-raw", dest="use_raw", action="store_false", default=argparse.SUPPRESS)
     parser.add_argument("--min-cells-per-gene", type=int, default=argparse.SUPPRESS)
+    parser.add_argument(
+        "--min-sparsity-percentage",
+        dest="min_sparsity_percentage",
+        type=float,
+        default=argparse.SUPPRESS,
+        help=(
+            "Minimum percent of cells in which a gene must be expressed (0 disables). "
+            "Combined with --min-cells-per-gene, both must hold. In cell_type=separate "
+            "the percentage is applied inside each domain."
+        ),
+    )
     parser.add_argument(
         "--top-var-genes",
         dest="top_var_genes",
@@ -104,16 +105,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--method", default=argparse.SUPPRESS)
     parser.add_argument("--metric", default=argparse.SUPPRESS)
     parser.add_argument("--n-perms", type=int, default=argparse.SUPPRESS)
-    parser.add_argument(
-        "--n-folds",
-        dest="n_folds",
-        type=int,
-        default=argparse.SUPPRESS,
-        help="Number of cross-validation folds for cross_validation method.",
-    )
     parser.add_argument("--n-reruns", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--alpha", type=float, default=argparse.SUPPRESS)
-    parser.add_argument("--n-nulls", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--epochs", type=int, default=argparse.SUPPRESS)
     parser.add_argument("--lr", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--patience", type=int, default=argparse.SUPPRESS)
@@ -163,9 +156,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--sgd-cosine-eta-min", type=float, default=argparse.SUPPRESS)
     parser.add_argument("--sgd-cosine-t-max-steps", type=int, default=argparse.SUPPRESS)
-    parser.add_argument("--delta", type=_parse_csv_floats, default=argparse.SUPPRESS)
-    parser.add_argument("--perturb-target", default=argparse.SUPPRESS)
-    parser.add_argument("--subset-fractions", type=_parse_csv_floats, default=argparse.SUPPRESS)
     parser.add_argument("--verbose", dest="verbose", action="store_true", default=argparse.SUPPRESS)
     parser.add_argument("--quiet", dest="verbose", action="store_false", default=argparse.SUPPRESS)
     parser.add_argument(
@@ -290,6 +280,7 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict:
         "layer": "layer",
         "use_raw": "use_raw",
         "min_cells_per_gene": "min_cells_per_gene",
+        "min_sparsity_percentage": "min_sparsity_percentage",
         "top_var_genes": "top_var_genes",
         "normalize_total": "normalize_total",
         "log1p": "log1p",
@@ -316,10 +307,8 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict:
         "method": "method",
         "metric": "metric",
         "n_perms": "n_perms",
-        "n_folds": "n_folds",
         "n_reruns": "n_reruns",
         "alpha": "alpha",
-        "n_nulls": "n_nulls",
         "epochs": "epochs",
         "lr": "lr",
         "patience": "patience",
@@ -334,9 +323,6 @@ def _build_cli_overrides(args: argparse.Namespace) -> dict:
         "sgd_cosine_lr_decay": "sgd_cosine_lr_decay",
         "sgd_cosine_eta_min": "sgd_cosine_eta_min",
         "sgd_cosine_t_max_steps": "sgd_cosine_t_max_steps",
-        "delta": "delta",
-        "perturb_target": "perturb_target",
-        "subset_fractions": "subset_fractions",
         "verbose": "verbose",
         "recursive": "recursive",
         "max_gradients": "max_gradients",
@@ -399,7 +385,9 @@ def main() -> None:
     if run_config.test.method == "binning":
         dataset.meta["binning_preprocessing"] = {
             "min_cells_per_gene": int(run_config.data.min_cells_per_gene),
+            "min_sparsity_percentage": float(run_config.data.min_sparsity_percentage),
             "top_var_genes": int(run_config.data.top_var_genes),
+            "n_expression_pcs": int(run_config.data.n_expression_pcs),
             "normalize_total": bool(run_config.data.normalize_total),
             "log1p": bool(run_config.data.log1p),
             "standardize_expression": bool(run_config.data.standardize_expression),
@@ -409,7 +397,9 @@ def main() -> None:
     if run_config.test.method == "visium_pseudobulk":
         dataset.meta["visium_pseudobulk_preprocessing"] = {
             "min_cells_per_gene": int(run_config.data.min_cells_per_gene),
+            "min_sparsity_percentage": float(run_config.data.min_sparsity_percentage),
             "top_var_genes": int(run_config.data.top_var_genes),
+            "n_expression_pcs": int(run_config.data.n_expression_pcs),
             "normalize_total": bool(run_config.data.normalize_total),
             "log1p": bool(run_config.data.log1p),
             "standardize_expression": bool(run_config.data.standardize_expression),

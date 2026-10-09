@@ -114,7 +114,9 @@ def _expression_preprocessing_from_meta(dataset: DatasetBundle, config: TestConf
         pp.setdefault("log1p", bool(dataset.meta.get("log1p", True)))
         pp.setdefault("standardize_expression", bool(dataset.meta.get("standardize_expression", True)))
     pp.setdefault("min_cells_per_gene", int(dataset.meta.get("min_cells_per_gene", 0)))
+    pp.setdefault("min_sparsity_percentage", float(dataset.meta.get("min_sparsity_percentage", 0.0)))
     pp.setdefault("top_var_genes", int(dataset.meta.get("top_var_genes", 0)))
+    pp.setdefault("n_expression_pcs", int(dataset.meta.get("n_expression_pcs", 0)))
     pp.setdefault("q", dataset.meta.get("q"))
     pp.setdefault("seed", int(dataset.meta.get("seed", config.seed)))
     return pp
@@ -136,10 +138,12 @@ def _transform_binned_expression(
     transformed, transform_meta = apply_expression_transforms(
         A_sum,
         min_cells_per_gene=int(pp.get("min_cells_per_gene", 0)),
+        min_sparsity_percentage=float(pp.get("min_sparsity_percentage", 0.0)),
         normalize_total=bool(pp.get("normalize_total", True)),
         log1p=bool(pp.get("log1p", True)),
         standardize_expression=bool(pp.get("standardize_expression", True)),
         q=pp.get("q"),
+        n_expression_pcs=int(pp.get("n_expression_pcs", 0) or 0),
         seed=int(pp.get("seed", config.seed)),
         return_metadata=True,
     )
@@ -271,6 +275,8 @@ def bin_dataset_to_pseudospots(
         meta["normalize_total"] = bool(transform_meta.get("normalize_total", False))
         meta["log1p"] = bool(transform_meta.get("log1p", False))
         meta["standardize_expression"] = bool(transform_meta.get("standardize_expression", False))
+        meta.setdefault("n_genes_input", int(A_sum.shape[1]))
+        meta["n_genes_kept"] = int(np.asarray(transform_meta["gene_keep_mask"]).sum())
 
     if var_names is not None:
         meta["var_names"] = list(var_names)

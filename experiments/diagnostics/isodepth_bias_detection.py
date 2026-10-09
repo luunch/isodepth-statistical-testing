@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from experiments.core.paths import repo_root
+from experiments.core.study_spec import common_study_fields, load_spec
 
 import argparse
 import copy
@@ -72,13 +73,6 @@ class IsodepthBiasDetectionSpec:
         return self
 
 
-def _resolve_repo_path(path_value: str | Path) -> Path:
-    path = Path(path_value)
-    if path.is_absolute():
-        return path.resolve()
-    return (REPO_ROOT / path).resolve()
-
-
 def _parse_devices_payload(payload: Mapping[str, Any]) -> list[str]:
     if "devices" in payload and payload["devices"] is not None:
         raw = payload["devices"]
@@ -94,14 +88,13 @@ def _parse_devices_payload(payload: Mapping[str, Any]) -> list[str]:
 
 
 def load_isodepth_bias_detection_spec(path: str | Path) -> IsodepthBiasDetectionSpec:
-    spec_path = Path(path).resolve()
-    with open(spec_path, "r", encoding="utf-8") as handle:
-        payload = json.load(handle)
+    payload = load_spec(path)
+    experiment_name, base_config, output_root = common_study_fields(payload)
 
     return IsodepthBiasDetectionSpec(
-        experiment_name=str(payload["experiment_name"]),
-        base_config=_resolve_repo_path(payload["base_config"]),
-        output_root=_resolve_repo_path(payload["output_root"]),
+        experiment_name=experiment_name,
+        base_config=base_config,
+        output_root=output_root,
         n_perms=int(payload["n_perms"]),
         epochs=int(payload["epochs"]),
         devices=_parse_devices_payload(payload),
@@ -193,7 +186,6 @@ def _run_parallel_branch(
             latent_dim=1,
             model_label=f"parallel permutation batch (true + {run_config.test.n_perms} permutations)",
             initial_state=reference_initial_state,
-            gradient_scale_divisor=float(s_batched.shape[0]),
         )
     metadata = get_training_metadata(model)
     with torch.no_grad():

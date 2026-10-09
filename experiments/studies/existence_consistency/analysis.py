@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import json
 from pathlib import Path
 
@@ -14,6 +13,7 @@ from analysis.experiment_plots import (
     save_spearman_histogram,
     save_spearman_matrix_heatmap,
 )
+from experiments.core.study_spec import analysis_arg_parser
 from experiments.studies.existence_consistency.lib import (
     analysis_dir_for_spec,
     build_matrix_rows,
@@ -186,10 +186,8 @@ def analyze_real_data_existence_consistency_results(spec_path: str | Path) -> di
     return payload
 
 
-def _build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Analyze an existence consistency study (h5ad or synthetic).")
-    parser.add_argument("--spec", required=True, help="Path to the experiment spec JSON")
-    return parser
+def _build_arg_parser():
+    return analysis_arg_parser("Analyze an existence consistency study (h5ad or synthetic).")
 
 
 def main() -> None:

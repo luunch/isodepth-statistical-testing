@@ -560,9 +560,9 @@ class SpatialDataSimulator:
         plt.figure(figsize=(6, 5))
         sns.histplot(L_perm, color="salmon", kde=False)
         p_val = (1 + np.sum(L_perm <= L_true)) / (len(L_perm) + 1)
-        plt.axvline(L_true, color="red", linestyle="--", label=f"True Loss (p={p_val:.4f})")
+        plt.axvline(L_true, color="red", linestyle="--", label=f"True MSE (p={p_val:.4f})")
         plt.title(f"{title}: Null Distribution")
-        plt.xlabel("Loss")
+        plt.xlabel("MSE")
         plt.legend()
         plt.tight_layout()
         if save_path:
@@ -666,7 +666,9 @@ def generate_synthetic_dataset(config: DataConfig) -> DatasetBundle:
         )
     ):
         meta["side_length"] = int(config.side_length)
-        meta["other_side_length"] = int(config.side_length)
+        # Rectangular requested grids use ``side_length`` as the width; retain
+        # the simulator's actual height rather than assuming a square lattice.
+        meta["other_side_length"] = int(simulator.grid_height)
         if config.lattice_cell_centers:
             meta["lattice_cell_centers"] = True
     if config.kernel is not None and (

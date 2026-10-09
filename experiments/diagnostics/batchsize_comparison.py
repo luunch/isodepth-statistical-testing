@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from experiments.core.paths import repo_root
+from experiments.core.study_spec import resolve_repo_path as _resolve_repo_path
 
 import argparse
 import json
@@ -76,14 +77,6 @@ class BatchSizeComparisonSpec:
         self.n_perms = None if self.n_perms is None else int(self.n_perms)
         self.n_reruns = None if self.n_reruns is None else int(self.n_reruns)
         return self
-
-
-def _resolve_repo_path(value: str) -> Path:
-    path = Path(value)
-    if path.is_absolute():
-        return path.resolve()
-    return (REPO_ROOT / path).resolve()
-
 
 
 def _extract_experiment_section(config_path: Path) -> dict[str, Any]:
