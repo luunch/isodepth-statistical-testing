@@ -80,6 +80,30 @@ class TestSeuratHvgFallback(unittest.TestCase):
         self.assertEqual(len(kept), 6)
         self.assertEqual(space, "gene_expression")
 
+    def test_hvg_is_applied_after_count_filters(self) -> None:
+        rng = np.random.default_rng(4)
+        n_cells = 40
+        rare = np.zeros((n_cells, 1), dtype=np.float32)
+        rare[0, 0] = 5000.0
+        background = rng.poisson(4.0, size=(n_cells, 12)).astype(np.float32)
+        variable = np.where(rng.random((n_cells, 4)) < 0.5, 1.0, 40.0).astype(np.float32)
+        counts = np.concatenate([rare, background, variable], axis=1)
+        names = ["rare"] + [f"bg{i}" for i in range(12)] + [f"var{i}" for i in range(4)]
+        _, kept, _ = preprocess_celltype_subset(
+            counts,
+            names,
+            min_cells_per_gene=10,
+            top_var_genes=4,
+            normalize_total=True,
+            log1p=True,
+            standardize_expression=False,
+        )
+        self.assertEqual(len(kept), 4)
+        self.assertNotIn("rare", kept)
+        kept_idx = [names.index(name) for name in kept]
+        expressed = (counts[:, kept_idx] > 0).sum(axis=0)
+        self.assertTrue(np.all(expressed >= 10))
+
     def test_preprocess_celltype_subset_expression_pcs(self) -> None:
         rng = np.random.default_rng(3)
         n_cells, n_genes = 80, 40

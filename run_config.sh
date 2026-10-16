@@ -4,7 +4,7 @@
 #SBATCH --time=01:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --partition=l40s
-#SBATCH --account=uchitra1
+#SBATCH --account=uchitra1_stmethod
 #SBATCH --comment=accept_cost
 #SBATCH --cpus-per-task=4
 #SBATCH --mail-type=BEGIN,END,FAIL

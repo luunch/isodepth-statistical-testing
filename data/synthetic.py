@@ -8,7 +8,13 @@ import seaborn as sns
 import torch
 from scipy.spatial import KDTree
 
-from data.schemas import DataConfig, DatasetBundle, KernelConfig, SamplingBiasConfig
+from data.schemas import (
+    DataConfig,
+    DatasetBundle,
+    KernelConfig,
+    SamplingBiasConfig,
+    linear_x_n_signal_genes,
+)
 
 
 def _point_in_spatial_shape(shape: str, x: float, y: float, *, eps: float = 1e-9) -> bool:
@@ -30,7 +36,17 @@ def _point_in_spatial_shape(shape: str, x: float, y: float, *, eps: float = 1e-9
             return False
         in_removed_semicircle = y >= -eps and (x - 0.5) ** 2 + y**2 <= 0.25 + eps
         return not in_removed_semicircle
+    if shape == "kidney":
+        return bool(_kidney_mask(np.array([x]), np.array([y]), eps=eps)[0])
     raise ValueError(f"unknown spatial shape {shape!r}")
+
+
+def _kidney_mask(x: np.ndarray, y: np.ndarray, *, eps: float = 1e-9) -> np.ndarray:
+    """Kidney in native [-3, 3]^2 via r <= 1 - 2 sin(theta) + cos(theta^2), mapped to [0, 1]^2 by p = 6u - 3."""
+    xn = 6.0 * np.asarray(x, dtype=np.float64) - 3.0
+    yn = 6.0 * np.asarray(y, dtype=np.float64) - 3.0
+    theta = np.arctan2(yn, xn)
+    return np.hypot(xn, yn) <= 1.0 - 2.0 * np.sin(theta) + np.cos(theta**2) + eps
 
 
 def _spatial_shape_mask(xy: np.ndarray, shape: str, *, eps: float = 1e-9) -> np.ndarray:
@@ -49,6 +65,8 @@ def _spatial_shape_mask(xy: np.ndarray, shape: str, *, eps: float = 1e-9) -> np.
         in_square = (x >= -eps) & (y >= -eps) & (x <= 1.0 + eps) & (y <= 1.0 + eps)
         in_removed = (y >= -eps) & ((x - 0.5) ** 2 + y**2 <= 0.25 + eps)
         return in_square & ~in_removed
+    if shape == "kidney":
+        return _kidney_mask(x, y, eps=eps)
     raise ValueError(f"unknown spatial shape {shape!r}")
 
 
@@ -214,6 +232,36 @@ def _lattice_axis_coords(count: int, *, cell_centers: bool) -> np.ndarray:
     return np.linspace(0.0, 1.0, n, dtype=np.float64)
 
 
+def _linear_x_design(
+    x: np.ndarray,
+    n_genes: int,
+    *,
+    signal_fraction: float,
+) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Means ``f_g = s_g x`` for the first signal genes and ``f_g = 0`` otherwise.
+
+    ``x`` is on ``[0, 1]``. Signs alternate ``+1, -1, ...``.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    n_genes = int(n_genes)
+    n_signal = linear_x_n_signal_genes(n_genes, signal_fraction)
+    signs = np.empty(n_signal, dtype=np.float64)
+    signs[0::2] = 1.0
+    signs[1::2] = -1.0
+    means = np.zeros((x.shape[0], n_genes), dtype=np.float64)
+    if n_signal > 0:
+        means[:, :n_signal] = np.outer(x, signs)
+        depth = x.copy()
+    else:
+        depth = np.zeros(x.shape[0], dtype=np.float64)
+    info = {
+        "n_signal_genes": int(n_signal),
+        "signal_fraction": float(signal_fraction),
+        "signal_signs": [float(value) for value in signs.tolist()],
+    }
+    return means, depth, info
+
+
 def _square_lattice_coords(side_length: int, *, cell_centers: bool) -> np.ndarray:
     """Full ``side_length`` × ``side_length`` lattice on ``[0, 1]^2``."""
     side = int(side_length)
@@ -260,6 +308,8 @@ class SpatialDataSimulator:
         self.kernel = kernel
         self.delta = float(delta)
         self._L: Optional[np.ndarray] = None
+        self.linear_x_info: Optional[dict] = None
+        self._sampled_per_gene_sigma_um: Optional[np.ndarray] = None
         if self.expression_distribution not in {"gaussian", "poisson"}:
             raise ValueError(
                 f"Unsupported expression_distribution {self.expression_distribution!r}; "
@@ -351,6 +401,7 @@ class SpatialDataSimulator:
         k_min: Optional[int] = None,
         k_max: Optional[int] = None,
         dependent_xy: bool = True,
+        signal_fraction: Optional[float] = None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         if seed is not None:
             np.random.seed(seed)
@@ -377,6 +428,15 @@ class SpatialDataSimulator:
         elif mode == "noise":
             d = np.zeros(self.N, dtype=np.float64)
             A = self._sample_expression_from_manifold(None)
+        elif mode == "linear_x":
+            if signal_fraction is None:
+                raise ValueError("signal_fraction is required when mode='linear_x'")
+            means, d, self.linear_x_info = _linear_x_design(
+                self.S[:, 0],
+                self.G,
+                signal_fraction=float(signal_fraction),
+            )
+            A = self._sample_expression_from_manifold(means)
         else:
             raise ValueError(f"Unsupported synthetic data mode '{mode}'")
 
@@ -472,6 +532,31 @@ class SpatialDataSimulator:
         self._L = np.linalg.cholesky(C)
         return self._L
 
+    def _per_gene_bandwidths_um(self, n_genes: int) -> Optional[np.ndarray]:
+        """Cached ``σ_g ~ Unif[low, high]`` when per-gene smooth bandwidths are on.
+
+        The vector is drawn once, at the simulator's gene count, from the active
+        NumPy RNG.  A one-gene diagnostic draw reuses the mean of that vector.
+        """
+        kernel = self.kernel
+        if kernel is None or kernel.per_gene_sigma_low is None or kernel.per_gene_sigma_high is None:
+            return None
+        cached = self._sampled_per_gene_sigma_um
+        if cached is None or int(cached.shape[0]) != int(self.G):
+            self._sampled_per_gene_sigma_um = np.random.uniform(
+                float(kernel.per_gene_sigma_low),
+                float(kernel.per_gene_sigma_high),
+                size=int(self.G),
+            )
+            cached = self._sampled_per_gene_sigma_um
+        if int(n_genes) == int(self.G):
+            return np.asarray(cached, dtype=np.float64)
+        if int(n_genes) == 1:
+            return np.asarray([float(np.mean(cached))], dtype=np.float64)
+        raise ValueError(
+            f"per-gene smooth bandwidths were drawn for G={self.G}, got a request for {n_genes}"
+        )
+
     def _draw_smoothed_noise(self, N: int, G: int) -> np.ndarray:
         """Gaussian-smoothed white noise (local weighted average over micron coords).
 
@@ -479,8 +564,15 @@ class SpatialDataSimulator:
         ``Z'_i = Σ_j w_ij Z_j`` with
         ``w_ij ∝ exp(-‖S_i-S_j‖² / (2 p²))`` for neighbors within
         ``kernel.effective_cutoff``, row-normalized.  Returns ``σ · Z'``.
+
+        With ``per_gene_sigma_low/high``, each gene uses its own bandwidth.
+        A bandwidth of 0 leaves that gene as white noise.
         """
         assert self.kernel is not None and self.scale is not None
+        per_gene = self._per_gene_bandwidths_um(G)
+        if per_gene is not None:
+            return self._draw_per_gene_smoothed_noise(N, G, per_gene)
+
         S_um = np.asarray(self.S, dtype=np.float64) * float(self.scale)
         bandwidth = float(self.kernel.distance)
         r_max = float(self.kernel.effective_cutoff)
@@ -512,6 +604,55 @@ class SpatialDataSimulator:
         Z_smooth = np.zeros((N, G), dtype=np.float64)
         for j in range(weights.shape[1]):
             Z_smooth += Z[idx[:, j], :] * weights[:, j : j + 1]
+        return self.sigma * Z_smooth
+
+    def _draw_per_gene_smoothed_noise(
+        self,
+        N: int,
+        G: int,
+        bandwidths_um: np.ndarray,
+    ) -> np.ndarray:
+        """Same Gaussian smoother as ``_draw_smoothed_noise``, with one σ per gene."""
+        assert self.kernel is not None and self.scale is not None
+        S_um = np.asarray(self.S, dtype=np.float64) * float(self.scale)
+        bandwidths = np.asarray(bandwidths_um, dtype=np.float64).reshape(G)
+        if self.kernel.max_interaction_distance is not None:
+            cutoffs = np.full(G, float(self.kernel.max_interaction_distance), dtype=np.float64)
+        else:
+            cutoffs = 4.0 * bandwidths
+        Z = np.random.randn(N, G)
+        r_max = float(np.max(cutoffs)) if G else 0.0
+        if r_max <= 0.0:
+            return self.sigma * Z
+
+        area_frac = min(1.0, np.pi * (r_max / float(self.scale)) ** 2)
+        k_est = int(min(N, max(8, int(np.ceil(area_frac * N * 2.0)) + 1)))
+        tree = KDTree(S_um)
+        dists, idx = tree.query(S_um, k=k_est)
+        if k_est == 1:
+            dists = np.asarray(dists, dtype=np.float64).reshape(N, 1)
+            idx = np.asarray(idx, dtype=np.intp).reshape(N, 1)
+        else:
+            dists = np.asarray(dists, dtype=np.float64)
+            idx = np.asarray(idx, dtype=np.intp)
+
+        Z_smooth = np.empty((N, G), dtype=np.float64)
+        for g in range(G):
+            bandwidth = float(bandwidths[g])
+            if bandwidth <= 0.0:
+                Z_smooth[:, g] = Z[:, g]
+                continue
+            valid = dists <= float(cutoffs[g]) + 1e-9
+            weights = np.exp(-0.5 * (dists / bandwidth) ** 2)
+            weights = np.where(valid, weights, 0.0)
+            row_sums = weights.sum(axis=1)
+            empty = row_sums <= 0.0
+            if np.any(empty):
+                weights[empty, :] = 0.0
+                weights[empty, 0] = 1.0
+                row_sums = weights.sum(axis=1)
+            weights = weights / np.maximum(row_sums[:, None], 1e-12)
+            Z_smooth[:, g] = np.sum(Z[idx, g] * weights, axis=1)
         return self.sigma * Z_smooth
 
     def _draw_correlated_noise(self, N: int, G: int) -> np.ndarray:
@@ -629,6 +770,7 @@ def generate_synthetic_dataset(config: DataConfig) -> DatasetBundle:
         k_min=config.k_min,
         k_max=config.k_max,
         dependent_xy=config.dependent_xy,
+        signal_fraction=config.signal_fraction,
     )
     meta = {
         "source": "synthetic",
@@ -652,6 +794,11 @@ def generate_synthetic_dataset(config: DataConfig) -> DatasetBundle:
         meta["shape"] = str(config.shape)
         if simulator.lattice_resolution is not None:
             meta["lattice_resolution"] = int(simulator.lattice_resolution)
+    if config.mode == "linear_x":
+        info = simulator.linear_x_info or {}
+        meta["signal_fraction"] = float(info["signal_fraction"])
+        meta["n_signal_genes"] = int(info["n_signal_genes"])
+        meta["signal_signs"] = list(info["signal_signs"])
     if config.mode == "fourier":
         meta["k_min"] = int(config.k_min)
         meta["k_max"] = int(config.k_max)
@@ -678,12 +825,18 @@ def generate_synthetic_dataset(config: DataConfig) -> DatasetBundle:
         meta["scale_um"] = float(config.scale)
         if config.kernel.type == "smooth":
             meta["noise_model"] = "gaussian_smooth"
-            meta["smooth_bandwidth_um"] = float(config.kernel.distance)
-            meta["smooth_cutoff_um"] = float(config.kernel.effective_cutoff)
             # One example smoothed field for diagnostics (gene-independent draw).
             rng_state = np.random.get_state()
             np.random.seed(int(config.seed) + 9999)
             noise_sample = simulator._draw_smoothed_noise(simulator.N, 1)[:, 0]
+            per_gene = simulator._sampled_per_gene_sigma_um
+            if per_gene is not None:
+                meta["smooth_bandwidth_um_per_gene"] = np.asarray(per_gene, dtype=np.float32)
+                meta["smooth_bandwidth_um_low"] = float(config.kernel.per_gene_sigma_low)
+                meta["smooth_bandwidth_um_high"] = float(config.kernel.per_gene_sigma_high)
+            else:
+                meta["smooth_bandwidth_um"] = float(config.kernel.distance)
+                meta["smooth_cutoff_um"] = float(config.kernel.effective_cutoff)
             np.random.set_state(rng_state)
             meta["kernel_noise_sample"] = noise_sample.astype(np.float32)
         else:

@@ -98,6 +98,178 @@ def apply_spatial_crop(dataset: DatasetBundle, config: DataConfig) -> DatasetBun
     return dataset
 
 
+_PER_SPOT_META_KEYS = (
+    "covariate_values",
+    "covariate_whitening_values",
+    "calicost_tumor_proportion",
+    "plot_cell_type_labels",
+    "cell_type_labels",
+)
+
+
+def label_border_spot_mask(
+    coords: np.ndarray,
+    labels: np.ndarray,
+    *,
+    radius_mult: float = 1.2,
+) -> tuple[np.ndarray, float, float]:
+    """Mark spots that touch a different label within one lattice step.
+
+    The radius is ``radius_mult`` times the median nearest-neighbor distance.
+    On Visium, 1.2 includes the six immediate hex neighbors (spacing = pitch)
+    and excludes the next ring (spacing = pitch * sqrt(3) ≈ 1.73).
+    """
+    coords = np.asarray(coords, dtype=np.float64)
+    labels = np.asarray(labels)
+    n = int(coords.shape[0])
+    border = np.zeros(n, dtype=bool)
+    if n < 2:
+        return border, float("nan"), float("nan")
+
+    tree = cKDTree(coords)
+    nn = tree.query(coords, k=2)[0][:, 1]
+    positive = nn[np.isfinite(nn) & (nn > 0.0)]
+    if positive.size == 0:
+        return border, float("nan"), float("nan")
+
+    pitch = float(np.median(positive))
+    radius = pitch * float(radius_mult)
+    pairs = tree.query_pairs(radius, output_type="ndarray")
+    if len(pairs) == 0:
+        return border, pitch, radius
+
+    different = labels[pairs[:, 0]] != labels[pairs[:, 1]]
+    if not np.any(different):
+        return border, pitch, radius
+    hits = pairs[different]
+    border[hits[:, 0]] = True
+    border[hits[:, 1]] = True
+    return border, pitch, radius
+
+
+def _subset_bundle_rows(dataset: DatasetBundle, keep_mask: np.ndarray) -> None:
+    keep_mask = np.asarray(keep_mask, dtype=bool)
+    n_total = int(keep_mask.shape[0])
+    if keep_mask.shape[0] != dataset.S.shape[0]:
+        raise ValueError(
+            f"Row mask has length {keep_mask.shape[0]} but dataset has {dataset.S.shape[0]} spots"
+        )
+    if not keep_mask.any():
+        raise ValueError("data.drop_label_border_spots removed every spot")
+    if keep_mask.all():
+        return
+    dataset.S = dataset.S[keep_mask]
+    dataset.A = dataset.A[keep_mask]
+    for key in _PER_SPOT_META_KEYS:
+        val = dataset.meta.get(key)
+        if val is None:
+            continue
+        arr = np.asarray(val)
+        if arr.ndim >= 1 and arr.shape[0] == n_total:
+            dataset.meta[key] = arr[keep_mask]
+
+
+def drop_label_border_spots(dataset: DatasetBundle, config: DataConfig) -> DatasetBundle:
+    """Remove spots that sit on the boundary between two layer labels.
+
+    A spot is removed when any spatial neighbor inside one lattice step has a
+    different ``cell_type_labels`` value. Remaining labels smaller than
+    ``min_cells_per_celltype`` are dropped and the surviving labels are
+    renumbered. Tissue-edge spots whose neighbors share their label are kept.
+    """
+    if not getattr(config, "drop_label_border_spots", False):
+        return dataset
+
+    raw_labels = dataset.meta.get("cell_type_labels")
+    raw_names = dataset.meta.get("cell_type_names")
+    if raw_labels is None or not raw_names:
+        raise ValueError(
+            "data.drop_label_border_spots requires cell-type labels from "
+            f"data.cell_type_key={config.cell_type_key!r}"
+        )
+
+    original_names = [str(name) for name in raw_names]
+    labels = np.asarray(raw_labels, dtype=np.int64)
+    if labels.shape[0] != dataset.S.shape[0]:
+        raise ValueError(
+            "cell_type_labels length does not match the number of spots "
+            f"({labels.shape[0]} vs {dataset.S.shape[0]})"
+        )
+    if int(labels.max()) >= len(original_names) or int(labels.min()) < 0:
+        raise ValueError(
+            "cell_type_labels must be contiguous ids into cell_type_names"
+        )
+
+    border, pitch, radius = label_border_spot_mask(
+        dataset.S,
+        labels,
+        radius_mult=float(config.label_border_radius_mult),
+    )
+    n_total = int(border.shape[0])
+    n_dropped = int(border.sum())
+    dropped_by_label = {
+        original_names[i]: int(np.sum(border & (labels == i)))
+        for i in range(len(original_names))
+    }
+    if n_dropped:
+        radius_text = "nan" if not np.isfinite(radius) else f"{radius:.4g}"
+        pitch_text = "nan" if not np.isfinite(pitch) else f"{pitch:.4g}"
+        dropped_text = ", ".join(
+            f"{name}={count}" for name, count in dropped_by_label.items() if count
+        )
+        print(
+            f"[label_border] dropping {n_dropped}/{n_total} spots "
+            f"on a layer boundary (radius={radius_text}, pitch={pitch_text}): "
+            f"{dropped_text}"
+        )
+        _subset_bundle_rows(dataset, ~border)
+
+    labels = np.asarray(dataset.meta["cell_type_labels"], dtype=np.int64)
+    min_cells = int(config.min_cells_per_celltype)
+    counts = np.bincount(labels, minlength=len(original_names))
+    keep_types = [i for i, count in enumerate(counts) if int(count) >= min_cells]
+    removed_types = [
+        original_names[i] for i in range(len(original_names)) if i not in set(keep_types)
+    ]
+    if not keep_types:
+        raise ValueError(
+            "data.drop_label_border_spots left no layer with "
+            f">= {min_cells} spots"
+        )
+    if removed_types:
+        print(
+            "[label_border] dropping layers below "
+            f"min_cells_per_celltype={min_cells}: {removed_types}"
+        )
+        _subset_bundle_rows(dataset, np.isin(labels, keep_types))
+        labels = np.asarray(dataset.meta["cell_type_labels"], dtype=np.int64)
+        old_to_new = {old: new for new, old in enumerate(keep_types)}
+        labels = np.array([old_to_new[int(value)] for value in labels], dtype=np.int64)
+        names = [original_names[i] for i in keep_types]
+        dataset.meta["cell_type_labels"] = labels
+        dataset.meta["cell_type_names"] = names
+    else:
+        names = original_names
+        dataset.meta["cell_type_labels"] = labels
+
+    dataset.meta["n_cell_types"] = len(names)
+    kept_labels = np.asarray(dataset.meta["cell_type_labels"], dtype=np.int64)
+    dataset.meta["label_border"] = {
+        "n_spots_before": n_total,
+        "n_dropped": n_dropped,
+        "n_kept": int(dataset.S.shape[0]),
+        "pitch": None if not np.isfinite(pitch) else float(pitch),
+        "radius": None if not np.isfinite(radius) else float(radius),
+        "radius_mult": float(config.label_border_radius_mult),
+        "dropped_by_label": dropped_by_label,
+        "kept_by_label": {
+            names[i]: int(np.sum(kept_labels == i)) for i in range(len(names))
+        },
+        "removed_labels": removed_types,
+    }
+    return dataset
+
+
 def denoise_spatial_outliers(dataset: DatasetBundle, config: DataConfig) -> DatasetBundle:
     """Drop per-clone spots not in the largest connected component.
 

@@ -33,7 +33,7 @@
     "batch_size": null,
     "verbose": true,
     "coordinate_um_per_unit": 1.0,
-    "variogram_sigma_multiples": [1, 2, 3, 4, 6, 8, 12],
+    "variogram_sigma_multiples": [0, 1, 2, 3, 4, 6, 8, 12],
     "variogram_n_bins": 13,
     "variogram_n_plot_genes": 10
   },

@@ -1,0 +1,11 @@
+dataset,method,rule,n_svgs,expected_if_calibrated,true_svgs
+A: iid Poisson(5),GASTON,native: LLR p < 0.10,20,20.0,0
+A: iid Poisson(5),GASTON,p < 0.05,15,10.0,0
+A: iid Poisson(5),GASTON,BH q < 0.05,0,0.0,0
+A: iid Poisson(5),MorphoGAM,pv.t < 0.05,6,10.0,0
+A: iid Poisson(5),MorphoGAM,BH q < 0.05,0,0.0,0
+B: blur 15 um,GASTON,native: LLR p < 0.10,76,20.0,0
+B: blur 15 um,GASTON,p < 0.05,55,10.0,0
+B: blur 15 um,GASTON,BH q < 0.05,22,0.0,0
+B: blur 15 um,MorphoGAM,pv.t < 0.05,51,10.0,0
+B: blur 15 um,MorphoGAM,BH q < 0.05,18,0.0,0

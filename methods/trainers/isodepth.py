@@ -117,8 +117,8 @@ def gaussian_parametric_decoder_uses_ols(config: TestConfig) -> bool:
     tiny scale, so training uses :func:`closed_form_gaussian_decode_torch` (coefficients
     from ``z.detach()``, applied to ``z``) and evaluation uses
     :func:`fit_closed_form_decoder` on the frozen encoder latent.  Models with
-    concatenated covariates (loss-difference ``h(d, n)``) keep the jointly trained
-    decoder.  ``decoder="nn"`` keeps full GD.
+    concatenated covariates (loss-difference ``h(d, n)``) use the full decoder
+    input in the OLS fit. ``decoder="nn"`` keeps full GD.
     """
     return (
         canonicalize_metric_name(config.metric) == "nll_gaussian_mse"
@@ -127,8 +127,19 @@ def gaussian_parametric_decoder_uses_ols(config: TestConfig) -> bool:
 
 
 def _training_uses_gaussian_ols_decoder(config: TestConfig, model: nn.Module) -> bool:
-    """OLS-in-the-loop for plain linear/quadratic Gaussian isodepth (not h(d, n))."""
-    return gaussian_parametric_decoder_uses_ols(config) and getattr(model, "covariate_values", None) is None
+    """OLS-in-the-loop for linear/quadratic Gaussian isodepth, including h(d, n)."""
+    return gaussian_parametric_decoder_uses_ols(config)
+
+
+def _ols_features_torch(
+    model: nn.Module,
+    spatial: torch.Tensor,
+    cell_indices: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Append fixed covariates, selecting the same cells as the spatial minibatch."""
+    if getattr(model, "covariate_values", None) is None:
+        return spatial
+    return model._concat_covariate(spatial, cell_indices)
 
 
 def _ols_feature_map_torch(z: torch.Tensor, decoder_type: str) -> torch.Tensor:
@@ -1212,6 +1223,7 @@ def _slot_metric_and_prediction(
     poisson_size_factors_np: np.ndarray | None,
     forward_pred_fn,
     encode_latent_fn,
+    ols_group_ids: np.ndarray | None = None,
 ) -> tuple[float, np.ndarray]:
     if poisson_parametric_decoder_uses_irls(config):
         latent_full = encode_latent_fn(model, s_batched_t, slot)
@@ -1230,21 +1242,27 @@ def _slot_metric_and_prediction(
             poisson_size_factors=poisson_size_factors_np,
         )
         return metric_value, pred
-    if (
-        gaussian_parametric_decoder_uses_ols(config)
-        and getattr(model, "covariate_values", None) is None
-    ):
-        # Loss-difference models decode h(d, n); leave those on the jointly
-        # trained head. Plain linear/quadratic isodepth gets exact OLS on z.
+    if gaussian_parametric_decoder_uses_ols(config):
         latent_full = _ols_features_from_encoded_latent(
             model, encode_latent_fn(model, s_batched_t, slot)
         )
-        pred = _ols_pred_for_slot(
-            latent_full=latent_full,
-            a_np=a_np,
-            decoder_type=decoder_type,
-            fit_mask_np=fit_mask_np,
-        )
+        if ols_group_ids is None:
+            pred = _ols_pred_for_slot(
+                latent_full=latent_full,
+                a_np=a_np,
+                decoder_type=decoder_type,
+                fit_mask_np=fit_mask_np,
+            )
+        else:
+            pred = np.empty_like(a_np)
+            for group in np.unique(ols_group_ids):
+                member = ols_group_ids == group
+                pred[member] = _ols_pred_for_slot(
+                    latent_full=latent_full[member],
+                    a_np=a_np[member],
+                    decoder_type=decoder_type,
+                    fit_mask_np=None if fit_mask_np is None else fit_mask_np[member],
+                )
         metric_value = _compute_masked_metric_np(
             metric_name,
             a_np,
@@ -1459,6 +1477,7 @@ def _finalize_batched_parallel_training(
         with torch.no_grad():
             if use_ols_train_loss:
                 z = _encode_parallel_model_slice(model, s_batched_t[start:stop], start, stop)
+                z = _ols_features_torch(model, z)
                 losses = closed_form_gaussian_mse_torch(
                     z, targets_chunk, decoder_type, loss_mask=mask_chunk
                 )
@@ -1612,6 +1631,7 @@ def _finalize_celltype_parallel_training(
         with torch.no_grad():
             if use_ols_train_loss:
                 z = _encode_parallel_celltype_slice(model, s_batched_t[start:stop], start, stop)
+                z = _ols_features_torch(model, z)
                 losses = closed_form_gaussian_mse_grouped_torch(
                     z, targets_chunk, decoder_type, cell_type_t, loss_mask=mask_chunk
                 )
@@ -1669,6 +1689,10 @@ def _finalize_celltype_parallel_training(
             poisson_size_factors_np=poisson_size_factors_np,
             forward_pred_fn=_forward_pred,
             encode_latent_fn=_encode_celltype_slot_latent_np,
+            ols_group_ids=(
+                cell_type_t.detach().cpu().numpy()
+                if isinstance(model, ParallelCellTypeIsoDepthWithFixedCovariateNet) else None
+            ),
         )
 
     best_null_index, worst_null_index = _null_extreme_indices(model_metrics, metric_name)
@@ -1695,6 +1719,10 @@ def _finalize_celltype_parallel_training(
             poisson_size_factors_np=poisson_size_factors_np,
             forward_pred_fn=_forward_pred,
             encode_latent_fn=_encode_celltype_slot_latent_np,
+            ols_group_ids=(
+                cell_type_t.detach().cpu().numpy()
+                if isinstance(model, ParallelCellTypeIsoDepthWithFixedCovariateNet) else None
+            ),
         )
         stored_predictions[model_index] = pred
 
@@ -1804,6 +1832,7 @@ def _batched_parallel_ols_loss(
         batch_indices=batch_indices,
         fixed_latent_t=fixed_latent_t,
     )
+    z = _ols_features_torch(model, z, batch_indices)
     return closed_form_gaussian_mse_torch(
         z, targets, decoder_type, loss_mask=loss_mask, target_sum_squares=target_sum_squares
     )
@@ -1828,6 +1857,7 @@ def _forward_batched_parallel_output(
             batch_indices=batch_indices,
             fixed_latent_t=fixed_latent_t,
         )
+        z = _ols_features_torch(model, z, batch_indices)
         return closed_form_gaussian_decode_torch(
             z, ols_targets, ols_decoder_type, loss_mask=ols_loss_mask
         )
@@ -2508,6 +2538,7 @@ def train_batched_isodepth_model(
                     )
                     if epoch_ols:
                         z = _encode_parallel_model_slice(model, s_batched_t[start:stop], start, stop)
+                        z = _ols_features_torch(model, z)
                         chunk_loss = closed_form_gaussian_mse_torch(
                             z, targets_chunk, decoder_type, loss_mask=mask_chunk,
                             target_sum_squares=sums_chunk
@@ -3225,11 +3256,13 @@ def train_celltype_parallel_isodepth_model(
         *,
         encode_start: int | None = None,
         encode_stop: int | None = None,
+        cell_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if encode_start is None:
             z = model.encoder(x)
         else:
             z = _encode_parallel_celltype_slice(model, x, encode_start, encode_stop)
+        z = _ols_features_torch(model, z, cell_indices)
         return closed_form_gaussian_mse_grouped_torch(
             z, targets, decoder_type, cell_types, loss_mask=mask
         )
@@ -3315,7 +3348,8 @@ def train_celltype_parallel_isodepth_model(
                 optimizer.zero_grad()
                 if use_training_ols:
                     batch_loss_per_model = _celltype_ols_loss(
-                        batch_s, batch_cell_type, batch_a, batch_mask
+                        batch_s, batch_cell_type, batch_a, batch_mask,
+                        cell_indices=batch_indices,
                     )
                 elif isinstance(model, ParallelCellTypeIsoDepthWithFixedCovariateNet):
                     batch_output = model.forward_masked(

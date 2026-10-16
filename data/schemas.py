@@ -20,11 +20,40 @@ CANONICAL_METRICS = {
 SUPPORTED_SYNTHETIC_MODES = {
     "checkerboard",
     "fourier",
+    "linear_x",
     "noise",
     "radial",
 }
 
-SUPPORTED_SPATIAL_SHAPES = frozenset({"square", "semicircle", "circle", "triangle", "square_cutout"})
+
+def linear_x_n_signal_genes(n_genes: int, signal_fraction: float) -> int:
+    """How many genes follow ``d = x`` under ``data.mode='linear_x'``.
+
+    ``signal_fraction * n_genes`` is rounded half-to-even. A fraction in
+    ``(0, 1)`` must land on a nonempty proper subset, so a requested signal
+    level cannot silently become the global null or an all-signal panel.
+    """
+    n_genes = int(n_genes)
+    fraction = float(signal_fraction)
+    if n_genes <= 0:
+        raise ValueError("n_genes must be positive")
+    if not np.isfinite(fraction) or not (0.0 <= fraction <= 1.0):
+        raise ValueError("signal_fraction must lie in [0, 1]")
+    if fraction == 0.0:
+        return 0
+    if fraction == 1.0:
+        return n_genes
+    n_signal = int(np.rint(fraction * n_genes))
+    if n_signal <= 0 or n_signal >= n_genes:
+        raise ValueError(
+            f"signal_fraction={fraction} with n_genes={n_genes} rounds to "
+            f"{n_signal} signal genes; choose a fraction that selects a proper subset"
+        )
+    return n_signal
+
+SUPPORTED_SPATIAL_SHAPES = frozenset(
+    {"square", "semicircle", "circle", "triangle", "square_cutout", "kidney"}
+)
 
 SUPPORTED_BLOCK_SHAPES = frozenset({"hexagon", "square"})
 
@@ -139,7 +168,13 @@ def _sampling_bias_from_raw(raw: Any) -> Optional[SamplingBiasConfig]:
 
 SUPPORTED_KERNEL_TYPES = frozenset({"exp", "trunc", "smooth"})
 
-_KERNEL_ALLOWED_KEYS = frozenset({"type", "distance", "max_interaction_distance"})
+_KERNEL_ALLOWED_KEYS = frozenset({
+    "type",
+    "distance",
+    "max_interaction_distance",
+    "per_gene_sigma_low",
+    "per_gene_sigma_high",
+})
 
 
 @dataclass
@@ -154,6 +189,9 @@ class KernelConfig:
     - ``"smooth"``: draw white noise ``Z`` and replace each cell with a
       Gaussian-weighted local average over nearby cells
       (``Z'_i ∝ Σ_j Z_j exp(-‖S_i-S_j‖² / (2 p²))``).  Does not use ``delta``.
+      When ``per_gene_sigma_low`` and ``per_gene_sigma_high`` are set, each gene
+      draws its own bandwidth ``σ_g ~ Unif[low, high]`` (µm).  ``σ_g = 0`` leaves
+      that gene unsmoothed.  ``distance`` is unused in that mode.
 
     Parameters
     ----------
@@ -178,6 +216,8 @@ class KernelConfig:
     type: str = "exp"
     distance: float = 100.0
     max_interaction_distance: Optional[float] = None
+    per_gene_sigma_low: Optional[float] = None
+    per_gene_sigma_high: Optional[float] = None
 
     @property
     def effective_cutoff(self) -> float:
@@ -204,12 +244,33 @@ class KernelConfig:
                     "data.kernel.max_interaction_distance should be >= distance "
                     f"(got {self.max_interaction_distance} < {self.distance})"
                 )
+        low = self.per_gene_sigma_low
+        high = self.per_gene_sigma_high
+        if (low is None) != (high is None):
+            raise ValueError(
+                "data.kernel.per_gene_sigma_low and data.kernel.per_gene_sigma_high "
+                "must be set together"
+            )
+        if low is not None:
+            if self.type != "smooth":
+                raise ValueError(
+                    "data.kernel.per_gene_sigma_low/high are only supported when "
+                    "data.kernel.type='smooth'"
+                )
+            if float(low) < 0.0 or float(high) <= float(low):
+                raise ValueError(
+                    "data.kernel per-gene sigma requires 0 <= per_gene_sigma_low "
+                    f"< per_gene_sigma_high (got low={low}, high={high})"
+                )
         return self
 
     def to_meta(self) -> Dict[str, Any]:
         m: Dict[str, Any] = {"type": self.type, "distance": float(self.distance)}
         if self.max_interaction_distance is not None:
             m["max_interaction_distance"] = float(self.max_interaction_distance)
+        if self.per_gene_sigma_low is not None and self.per_gene_sigma_high is not None:
+            m["per_gene_sigma_low"] = float(self.per_gene_sigma_low)
+            m["per_gene_sigma_high"] = float(self.per_gene_sigma_high)
         return m
 
 
@@ -329,6 +390,8 @@ class DataConfig:
     n_cells: int = 900
     n_genes: int = 20
     sigma: float = 0.1
+    # linear_x only. Fraction of genes with mean ±x on [0, 1]; the rest are null.
+    signal_fraction: Optional[float] = None
     expression_distribution: str = "gaussian"
     mean_count: float = 5.0
     k: Optional[int] = None
@@ -351,6 +414,13 @@ class DataConfig:
     obs_numeric_filters: Optional[dict] = None
     obs_indices: Optional[str] = None
     obs_drop_na: Optional[list[str]] = None
+    # Drop spots that have an immediate spatial neighbor with a different
+    # cell_type_key label. On a Visium lattice the neighbor radius is
+    # label_border_radius_mult times the median nearest-neighbor distance,
+    # which keeps the first hex ring and excludes the next one. Applied before
+    # coordinate z-scoring so those spots never enter a separate-layer test.
+    drop_label_border_spots: bool = False
+    label_border_radius_mult: float = 1.2
     # Largest-connected-component outlier removal (applied before spatial_region_split and
     # before coordinate z-scoring).  Per clone, spots not in the largest connected component
     # within this radius are dropped.  Radius is in µm; requires coordinate_um_per_unit.
@@ -537,6 +607,10 @@ class DataConfig:
             )
         if self.source != "synthetic" and self.mean_count != 5.0:
             raise ValueError("data.mean_count is only supported when data.source='synthetic'")
+        if self.source != "synthetic" and self.signal_fraction is not None:
+            raise ValueError(
+                "data.signal_fraction is only supported when data.source='synthetic'"
+            )
         if self.expression_distribution not in SUPPORTED_EXPRESSION_DISTRIBUTIONS:
             raise ValueError(
                 f"Unsupported data.expression_distribution '{self.expression_distribution}'. "
@@ -592,6 +666,28 @@ class DataConfig:
                 raise ValueError("data.obs_drop_na must be a non-empty list of obs column names when provided")
             if any(not isinstance(col, str) or not col.strip() for col in self.obs_drop_na):
                 raise ValueError("data.obs_drop_na entries must be non-empty strings")
+        try:
+            self.label_border_radius_mult = float(self.label_border_radius_mult)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("data.label_border_radius_mult must be a number > 1") from exc
+        if (
+            not np.isfinite(self.label_border_radius_mult)
+            or self.label_border_radius_mult <= 1.0
+        ):
+            raise ValueError(
+                "data.label_border_radius_mult must be > 1 "
+                "(1.2 selects immediate Visium neighbors and not the next ring)"
+            )
+        if self.drop_label_border_spots:
+            if self.source != "h5ad":
+                raise ValueError(
+                    "data.drop_label_border_spots is only supported when data.source='h5ad'"
+                )
+            if self.cell_type_mode == "none":
+                raise ValueError(
+                    "data.drop_label_border_spots requires data.cell_type to be "
+                    'true, "together", or "separate" so each spot has a layer label'
+                )
         # --- spatial_region_split validation ---
         rs = self.spatial_region_split
         if rs is not False:
@@ -709,22 +805,40 @@ class DataConfig:
                     raise ValueError("data.k, data.k_min, and data.k_max are only supported when data.mode='fourier'")
                 if self.dependent_xy is not True:
                     raise ValueError("data.dependent_xy is only supported when data.mode='fourier'")
-            if self.mode != "noise" and self.side_length is not None:
-                raise ValueError("data.side_length is only supported when data.mode='noise'")
+            if self.mode == "linear_x":
+                if self.signal_fraction is None:
+                    raise ValueError(
+                        "data.signal_fraction is required when data.mode='linear_x'"
+                    )
+                self.signal_fraction = float(self.signal_fraction)
+                if self.sigma <= 0.0:
+                    raise ValueError("data.sigma must be > 0 when data.mode='linear_x'")
+                if self.expression_distribution != "gaussian":
+                    raise ValueError("data.mode='linear_x' requires data.expression_distribution='gaussian'")
+                linear_x_n_signal_genes(self.n_genes, self.signal_fraction)
+            elif self.signal_fraction is not None:
+                raise ValueError(
+                    "data.signal_fraction is only supported when data.mode='linear_x'"
+                )
+            if self.mode not in {"noise", "linear_x"} and self.side_length is not None:
+                raise ValueError(
+                    "data.side_length is only supported when data.mode is 'noise' or 'linear_x'"
+                )
             if self.shape != "square" and self.side_length is not None:
                 raise ValueError(
                     "data.side_length is only supported when data.shape='square'; "
-                    "omit side_length for semicircle, circle, or triangle (the lattice is sized from data.n_cells)"
+                    "omit side_length for semicircle, circle, triangle, square_cutout, or kidney "
+                    "(the lattice is sized from data.n_cells)"
                 )
             if (
-                self.mode == "noise"
+                self.mode in {"noise", "linear_x"}
                 and self.side_length is not None
                 and self.shape == "square"
                 and self.sampling_bias is None
             ):
                 if self.n_cells % int(self.side_length) != 0:
                     raise ValueError(
-                        "When data.side_length is set for noise mode, data.n_cells must be divisible by data.side_length"
+                        "When data.side_length is set, data.n_cells must be divisible by data.side_length"
                     )
             if (
                 self.lattice_cell_centers
@@ -997,6 +1111,10 @@ class TestConfig:
     # ``cpu`` batches on the CPU. CUDA products stay float64.
     variogram_backend: str = "cuda"
     variogram_perm_batch_size: Optional[int] = None
+    # ``legacy`` is the nonnegative coefficient fit with final moment restoration.
+    # ``variance_constrained`` is the notebook fit a + b*gamma_Y with a + b*Var(Y) = 1,
+    # selecting on that theoretical SSE, then restoring the winning field's moments.
+    variogram_fit_mode: str = "legacy"
 
     def validate(self) -> "TestConfig":
         if self.method not in SUPPORTED_PERMUTATION_METHODS:
@@ -1094,6 +1212,13 @@ class TestConfig:
                 self.variogram_perm_batch_size = int(self.variogram_perm_batch_size)
                 if self.variogram_perm_batch_size <= 0:
                     raise ValueError("test.variogram_perm_batch_size must be > 0 when provided")
+            fit_mode = str(self.variogram_fit_mode).strip().lower()
+            if fit_mode not in {"legacy", "variance_constrained"}:
+                raise ValueError(
+                    "test.variogram_fit_mode must be 'legacy' or 'variance_constrained' "
+                    f"(got {self.variogram_fit_mode!r})"
+                )
+            self.variogram_fit_mode = fit_mode
 
         if self.method == "block_permutation":
             if self.block_radius is None:

@@ -148,6 +148,9 @@ def load_dataset(config: DataConfig, *, covariate=None) -> DatasetBundle:
             "obs_key": keys[0] if len(keys) == 1 else keys,
             "obs_keys": keys,
         }
+    if getattr(config, "drop_label_border_spots", False):
+        from data.spatial_regions import drop_label_border_spots
+        dataset = drop_label_border_spots(dataset, config)
     if getattr(config, "spatial_denoise_radius_um", None):
         from data.spatial_regions import denoise_spatial_outliers
         dataset = denoise_spatial_outliers(dataset, config)

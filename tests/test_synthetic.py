@@ -22,8 +22,9 @@ from data.schemas import (
     SamplingBiasConfig,
     TestConfig,
     TestResult,
+    run_config_from_mapping,
 )
-from data.synthetic import SpatialDataSimulator, generate_synthetic_dataset
+from data.synthetic import SpatialDataSimulator, generate_synthetic_dataset, spatial_shape_mask
 from experiments.configuration import save_standardized_outputs
 
 
@@ -226,6 +227,41 @@ class TestSyntheticGeneration(unittest.TestCase):
         self.assertTrue(np.all(S <= 1.0 + 1e-5))
         in_removed = (S[:, 1] >= -1e-5) & ((S[:, 0] - 0.5) ** 2 + S[:, 1] ** 2 <= 0.25 + 1e-5)
         self.assertFalse(np.any(in_removed))
+
+    def test_noise_kidney_lattice_cell_count_and_region(self) -> None:
+        dataset = generate_synthetic_dataset(
+            DataConfig(
+                source="synthetic",
+                mode="noise",
+                n_cells=900,
+                n_genes=3,
+                sigma=0.1,
+                seed=42,
+                shape="kidney",
+            )
+        )
+        self.assertEqual(dataset.n_cells, 900)
+        self.assertEqual(dataset.meta["shape"], "kidney")
+        self.assertIn("lattice_resolution", dataset.meta)
+        S = np.asarray(dataset.S, dtype=np.float64)
+        self.assertTrue(np.all(spatial_shape_mask(S, "kidney")))
+        xn, yn = 6.0 * S[:, 0] - 3.0, 6.0 * S[:, 1] - 3.0
+        theta = np.arctan2(yn, xn)
+        bound = 1.0 - 2.0 * np.sin(theta) + np.cos(theta**2)
+        self.assertTrue(np.all(np.hypot(xn, yn) <= bound + 1e-5))
+
+    def test_kidney_mask_matches_polar_formula(self) -> None:
+        def unit(xn: float, yn: float) -> list[float]:
+            return [(xn + 3.0) / 6.0, (yn + 3.0) / 6.0]
+
+        # theta = -pi/2: bound is 3 + cos(pi^2/4), about 2.22.
+        self.assertTrue(bool(spatial_shape_mask(np.array([unit(0.0, -2.1)]), "kidney")[0]))
+        self.assertFalse(bool(spatial_shape_mask(np.array([unit(0.0, -2.3)]), "kidney")[0]))
+        # theta = pi/2: bound is negative, so the upper axis is outside the tissue.
+        self.assertFalse(bool(spatial_shape_mask(np.array([unit(0.0, 0.1)]), "kidney")[0]))
+        # theta = 0: bound is 2.
+        self.assertTrue(bool(spatial_shape_mask(np.array([unit(1.9, 0.0)]), "kidney")[0]))
+        self.assertFalse(bool(spatial_shape_mask(np.array([unit(2.1, 0.0)]), "kidney")[0]))
 
     def test_noise_uniform_sampling_bias_cell_count_and_region(self) -> None:
         dataset = generate_synthetic_dataset(
@@ -658,6 +694,148 @@ class TestSyntheticGeneration(unittest.TestCase):
         )
         _S, _A, _d = simulator.generate(mode="noise", seed=5)
         self.assertIsNone(simulator._L)
+
+    def test_per_gene_smooth_bandwidths_are_uniform_and_reproducible(self) -> None:
+        config = DataConfig(
+            source="synthetic",
+            mode="noise",
+            n_cells=80,
+            n_genes=6,
+            sigma=0.5,
+            seed=4,
+            scale=960.0,
+            sampling_bias={"type": "uniform"},
+            kernel={
+                "type": "smooth",
+                "distance": 25.0,
+                "per_gene_sigma_low": 0.0,
+                "per_gene_sigma_high": 25.0,
+            },
+            delta=0.0,
+        ).validate()
+        dataset_a = generate_synthetic_dataset(config)
+        dataset_b = generate_synthetic_dataset(config)
+        bandwidths = np.asarray(dataset_a.meta["smooth_bandwidth_um_per_gene"], dtype=np.float64)
+        self.assertEqual(bandwidths.shape, (6,))
+        self.assertTrue(np.all(bandwidths >= 0.0))
+        self.assertTrue(np.all(bandwidths <= 25.0))
+        self.assertGreater(float(np.std(bandwidths)), 0.0)
+        self.assertNotIn("smooth_bandwidth_um", dataset_a.meta)
+        np.testing.assert_allclose(dataset_a.A, dataset_b.A)
+        np.testing.assert_allclose(bandwidths, dataset_b.meta["smooth_bandwidth_um_per_gene"])
+
+    def test_per_gene_zero_bandwidth_is_less_correlated_than_wide_bandwidth(self) -> None:
+        scale = 500.0
+        simulator = SpatialDataSimulator(
+            N=250,
+            G=2,
+            sigma=1.0,
+            scale=scale,
+            sampling_bias=SamplingBiasConfig(type="uniform"),
+            lattice_seed=0,
+            kernel=KernelConfig(
+                type="smooth",
+                distance=40.0,
+                per_gene_sigma_low=0.0,
+                per_gene_sigma_high=40.0,
+            ),
+        )
+        simulator._sampled_per_gene_sigma_um = np.asarray([0.0, 40.0], dtype=np.float64)
+        _S, A, _d = simulator.generate(mode="noise", seed=0)
+
+        def nn_corr(gene: np.ndarray) -> float:
+            from scipy.spatial import KDTree
+
+            S_um = np.asarray(simulator.S, dtype=np.float64) * scale
+            _dists, idx = KDTree(S_um).query(S_um, k=2)
+            neighbor = A[idx[:, 1], gene]
+            column = A[:, gene]
+            return float(np.corrcoef(column, neighbor)[0, 1])
+
+        self.assertGreater(nn_corr(1), nn_corr(0) + 0.2)
+
+    def test_linear_x_unit_square_uses_edge_to_edge_slope(self) -> None:
+        config = DataConfig(
+            source="synthetic",
+            mode="linear_x",
+            n_cells=1024,
+            n_genes=200,
+            side_length=32,
+            sigma=1.0,
+            signal_fraction=0.1,
+            seed=0,
+        )
+        dataset = generate_synthetic_dataset(config)
+        x = np.asarray(dataset.S[:, 0], dtype=np.float64)
+        expression = np.asarray(dataset.A, dtype=np.float64)
+
+        self.assertEqual(dataset.S.shape, (1024, 2))
+        self.assertEqual(expression.shape, (1024, 200))
+        self.assertEqual(len(np.unique(np.round(x, decimals=8))), 32)
+        self.assertEqual(len(np.unique(np.round(dataset.S[:, 1], decimals=8))), 32)
+        self.assertGreaterEqual(float(x.min()), 0.0)
+        self.assertLessEqual(float(x.max()), 1.0)
+        self.assertEqual(dataset.meta["n_signal_genes"], 20)
+        self.assertEqual(dataset.meta["signal_signs"], [1.0, -1.0] * 10)
+        np.testing.assert_allclose(dataset.meta["synthetic_true_curve"], x, atol=1e-6)
+
+        signed_corr = np.empty(expression.shape[1], dtype=np.float64)
+        for gene in range(expression.shape[1]):
+            signed_corr[gene] = float(np.corrcoef(x, expression[:, gene])[0, 1])
+        self.assertGreater(float(signed_corr[:20:2].min()), 0.0)
+        self.assertLess(float(signed_corr[1:20:2].max()), 0.0)
+        self.assertGreater(float(np.abs(signed_corr[:20]).mean()), 0.2)
+        self.assertLess(float(np.abs(signed_corr[20:]).mean()), 0.1)
+
+    def test_linear_x_zero_fraction_is_null(self) -> None:
+        dataset = generate_synthetic_dataset(
+            DataConfig(
+                source="synthetic",
+                mode="linear_x",
+                n_cells=64,
+                n_genes=8,
+                sigma=1.0,
+                signal_fraction=0.0,
+                seed=1,
+            )
+        )
+        self.assertEqual(dataset.meta["n_signal_genes"], 0)
+        self.assertEqual(dataset.meta["signal_signs"], [])
+        np.testing.assert_allclose(
+            dataset.meta["synthetic_true_curve"],
+            np.zeros(64, dtype=np.float32),
+        )
+
+    def test_linear_x_fields_are_mode_specific(self) -> None:
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="synthetic",
+                mode="radial",
+                n_cells=16,
+                n_genes=4,
+                signal_fraction=0.5,
+            ).validate()
+        with self.assertRaises(ValueError):
+            DataConfig(
+                source="synthetic",
+                mode="linear_x",
+                n_cells=16,
+                n_genes=4,
+                sigma=1.0,
+                signal_fraction=0.01,
+            ).validate()
+
+    def test_linear_x_existence_config_loads(self) -> None:
+        payload = json.loads((REPO_ROOT / "configs/synthetic/linear_x_existence.json").read_text())
+        config = run_config_from_mapping(payload)
+        self.assertEqual(config.data.mode, "linear_x")
+        self.assertEqual(config.data.n_cells, 1024)
+        self.assertEqual(config.data.n_genes, 200)
+        self.assertEqual(config.data.side_length, 32)
+        self.assertEqual(config.data.signal_fraction, 0.01)
+        self.assertEqual(config.test.method, "correlated_null_adaptive_permutation")
+        self.assertEqual(config.test.variogram_fit_mode, "variance_constrained")
+        self.assertEqual(config.test.n_reruns, 30)
 
 
 if __name__ == "__main__":

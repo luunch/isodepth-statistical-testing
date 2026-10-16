@@ -1,0 +1,65 @@
+{
+  "data": {
+    "source": "synthetic",
+    "mode": "noise",
+    "n_cells": 1024,
+    "n_genes": 200,
+    "sigma": 0.5,
+    "expression_distribution": "poisson",
+    "mean_count": 5.0,
+    "poly_degree": 1,
+    "seed": 42,
+    "shape": "square",
+    "scale": 960,
+    "sampling_bias": {
+      "type": "uniform"
+    },
+    "kernel": {
+      "type": "smooth",
+      "distance": 25.0,
+      "per_gene_sigma_low": 0.0,
+      "per_gene_sigma_high": 25.0
+    },
+    "delta": 0
+  },
+  "test": {
+    "method": "correlated_null_adaptive_permutation",
+    "variogram_fit_mode": "variance_constrained",
+    "metric": "nll_gaussian_mse",
+    "n_perms": 99,
+    "epochs": 500,
+    "n_reruns": 30,
+    "sgd_batch_size": 128,
+    "lr": 0.001,
+    "patience": 0,
+    "seed": 42,
+    "device": "cuda",
+    "decoder": "linear",
+    "batch_size": null,
+    "verbose": true,
+    "coordinate_um_per_unit": 960.0,
+    "variogram_nn_candidates": [
+      0,
+      0.02,
+      0.05,
+      0.1,
+      0.2,
+      0.3,
+      0.4,
+      0.5,
+      0.6,
+      0.7,
+      0.8,
+      0.9
+    ],
+    "variogram_n_bins": 13,
+    "variogram_n_plot_genes": 10,
+    "variogram_backend": "cuda"
+  },
+  "output": {
+    "out_dir": "results/synthetic_smooth",
+    "run_name": "kernel_blurred_per_gene_sigma_unif0_25_variance_constrained",
+    "save_preds": false,
+    "save_perm_stats": true
+  }
+}

@@ -7,8 +7,11 @@ import numpy as np
 import torch
 
 from data.schemas import TestConfig
+from data.transforms import celltype_expression_residuals
+from methods.architectures import ParallelIsoDepthWithFixedCovariateNet
 from methods.metrics import compute_metric
 from methods.trainers.isodepth import (
+    _batched_parallel_ols_loss,
     _solve_ols_beta,
     closed_form_gaussian_decode_torch,
     closed_form_gaussian_mse_torch,
@@ -17,11 +20,97 @@ from methods.trainers.isodepth import (
     gaussian_parametric_decoder_uses_ols,
     get_training_metadata,
     poisson_parametric_decoder_uses_irls,
+    train_celltype_parallel_isodepth_model,
     train_parallel_isodepth_model,
 )
 
 
 class TestGaussianOlsRefit(unittest.TestCase):
+    def test_fixed_covariate_minibatch_ols_uses_matching_rows(self) -> None:
+        torch.manual_seed(7)
+        rng = np.random.default_rng(7)
+        cov = rng.normal(size=20).astype(np.float32)
+        model = ParallelIsoDepthWithFixedCovariateNet(2, 3, cov, decoder_type="linear")
+        coords = torch.randn(2, 20, 2)
+        rows = torch.tensor([13, 2, 17, 4, 8, 0, 19, 6])
+        targets = torch.tensor(rng.normal(size=(2, len(rows), 3)), dtype=torch.float32)
+        loss = _batched_parallel_ols_loss(
+            model, coords, batch_indices=rows, fixed_latent_t=None,
+            targets=targets, decoder_type="linear", loss_mask=None,
+        )
+        spatial = model.encoder(coords[:, rows]).detach().numpy()
+        cov_rows = model.covariate_values.detach().numpy()[rows]
+        expected = []
+        for slot in range(2):
+            design = np.c_[np.ones(len(rows)), spatial[slot], cov_rows]
+            y = targets[slot].numpy()
+            pred = design @ np.linalg.lstsq(design, y, rcond=None)[0]
+            expected.append(np.mean((y - pred) ** 2))
+        np.testing.assert_allclose(loss.detach().numpy(), expected, atol=2e-6)
+        loss.sum().backward()
+        self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all()
+                            for p in model.encoder.parameters()))
+
+    def test_fixed_covariate_ols_training_selection_and_slot_metrics(self) -> None:
+        rng = np.random.default_rng(42)
+        n_cells = 40
+        coords = rng.normal(size=(n_cells, 2)).astype(np.float32)
+        cov = rng.normal(size=(n_cells, 2)).astype(np.float32)
+        groups = np.arange(n_cells) % 2
+        targets = np.stack([
+            cov @ rng.normal(size=(2, 3)) + 0.1 * rng.normal(size=(n_cells, 3))
+            for _ in range(3)
+        ]).astype(np.float32)
+        coords_batched = np.repeat(coords[None], 3, axis=0)
+        for grouped in (False, True):
+            # Opposite nuisance slopes require distinct cell-type decoders.
+            y_slots = targets * (1 - 2 * groups)[None, :, None] if grouped else targets
+            y_slots = y_slots.astype(np.float32)
+            expected_targets = np.stack([
+                celltype_expression_residuals(y, groups, n_cell_types=2)
+                for y in y_slots
+            ]) if grouped else y_slots
+            for decoder in ("linear", "quadratic"):
+                for batch_size in (None, 16):
+                    with self.subTest(grouped=grouped, decoder=decoder, batch_size=batch_size):
+                        config = TestConfig(
+                            metric="nll_gaussian_mse", decoder=decoder, n_perms=2,
+                            n_reruns=2, epochs=3, lr=0.001, sgd_batch_size=batch_size,
+                            device="cpu", verbose=False, seed=8,
+                        )
+                        train = train_celltype_parallel_isodepth_model if grouped else train_parallel_isodepth_model
+                        kwargs = {"cell_type_labels": groups, "n_cell_types": 2} if grouped else {}
+                        model, outputs, _ = train(
+                            coords, y_slots[0], config, s_batched=coords_batched,
+                            a_batched=y_slots, fixed_covariate_values=cov, **kwargs,
+                        )
+                        with torch.no_grad():
+                            spatial = model.encoder(torch.tensor(coords_batched)).numpy()
+                        cov_fit = model.covariate_values.numpy()
+                        expected_metrics = []
+                        for slot in range(3):
+                            z = np.c_[spatial[slot], cov_fit].astype(np.float64)
+                            features = np.c_[z, z ** 2] if decoder == "quadratic" else z
+                            design = np.c_[np.ones(n_cells), features]
+                            y = expected_targets[slot]
+                            pred = np.empty_like(y)
+                            fit_groups = groups if grouped else np.zeros(n_cells)
+                            for group in np.unique(fit_groups):
+                                member = fit_groups == group
+                                x = design[member]
+                                pred[member] = x @ np.linalg.lstsq(x, y[member], rcond=None)[0]
+                            expected_metrics.append(np.mean((y - pred) ** 2))
+                            if slot == 0:
+                                np.testing.assert_allclose(outputs.pred_true, pred, atol=2e-5)
+                        np.testing.assert_allclose(outputs.model_metrics, expected_metrics, atol=2e-6)
+                        metadata = get_training_metadata(model)
+                        np.testing.assert_allclose(
+                            metadata["train_loss_per_rerun"].min(axis=1),
+                            expected_metrics, atol=2e-5,
+                        )
+                        # Nuisance-only targets should fit immediately, including during training.
+                        self.assertLess(float(metadata["loss_history"][0]), 0.03)
+
     def test_gaussian_parametric_decoder_uses_ols_predicate(self) -> None:
         gauss_linear = TestConfig(
             metric="nll_gaussian_mse",

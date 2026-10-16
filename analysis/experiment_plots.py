@@ -186,6 +186,55 @@ def save_pvalue_vs_kmax_plot(
     return out_path
 
 
+def save_pvalue_vs_signal_fraction_plot(
+    per_run_rows: Iterable[Mapping[str, object]],
+    summary_rows: Iterable[Mapping[str, object]],
+    out_path: str | Path,
+    *,
+    title: str,
+    alpha: float | None = None,
+) -> Path | None:
+    rows = list(per_run_rows)
+    summaries = list(summary_rows)
+    if not rows or not summaries:
+        return None
+
+    out_path = Path(out_path)
+    fig, ax = plt.subplots(1, 1, figsize=(8, 5))
+
+    grouped: dict[float, list[Mapping[str, object]]] = {}
+    for row in rows:
+        grouped.setdefault(round(float(row["signal_fraction"]), 8), []).append(row)
+    xs: list[float] = []
+    ys: list[float] = []
+    for fraction in sorted(grouped):
+        group = sorted(grouped[fraction], key=lambda row: int(row["seed"]))
+        n_group = len(group)
+        offsets = np.linspace(-0.004, 0.004, n_group) if n_group > 1 else np.zeros(1)
+        for row, offset in zip(group, offsets):
+            xs.append(fraction + float(offset))
+            ys.append(float(row["p_value"]))
+    ax.scatter(xs, ys, alpha=0.75, color="steelblue", edgecolors="none", label="Per-run p-values")
+
+    summaries = sorted(summaries, key=lambda row: float(row["signal_fraction"]))
+    summary_x = np.asarray([float(row["signal_fraction"]) for row in summaries], dtype=np.float64)
+    summary_y = np.asarray([float(row["p_value_mean"]) for row in summaries], dtype=np.float64)
+    ax.plot(summary_x, summary_y, color="black", linewidth=1.5, marker="o", label="Mean p-value")
+    if alpha is not None:
+        ax.axhline(float(alpha), color="crimson", linestyle="--", linewidth=1.0, label=f"alpha={float(alpha):.2f}")
+
+    ax.set_title(title)
+    ax.set_xlabel("Signal fraction")
+    ax.set_ylabel("p-value")
+    ax.set_ylim(-0.02, 1.02)
+    ax.grid(alpha=0.25, linewidth=0.5)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
 def save_grouped_pvalue_vs_kmax_plot(
     per_run_rows: Iterable[Mapping[str, object]],
     summary_rows: Iterable[Mapping[str, object]],

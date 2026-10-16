@@ -353,11 +353,37 @@ def poisson_low_rank_factorization(
     )
 
 
+def _restrict_to_highly_variable_genes(
+    filtered: np.ndarray,
+    keep_mask: np.ndarray,
+    top_var_genes: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Keep the top Seurat HVGs among genes that already passed count filters.
+
+    ``keep_mask`` indexes the matrix before filtering. The returned mask is that
+    same length and is True only for genes that passed the filters and the HVG
+    cut. HVG is the last gene-selection step: normalization and scaling happen
+    afterward.
+    """
+    n_top = int(top_var_genes or 0)
+    filtered = np.asarray(filtered)
+    if n_top <= 0 or n_top >= filtered.shape[1]:
+        return filtered, keep_mask
+    # Lazy import: h5ad_loader imports this module at load time.
+    from data.h5ad_loader import _select_hvg_mask_from_counts
+
+    hvg_mask = _select_hvg_mask_from_counts(np.asarray(filtered, dtype=np.float32), n_top)
+    composed = np.zeros(keep_mask.shape, dtype=bool)
+    composed[np.flatnonzero(keep_mask)[hvg_mask]] = True
+    return filtered[:, hvg_mask], composed
+
+
 def apply_expression_transforms(
     a: np.ndarray,
     *,
     min_cells_per_gene: int = 0,
     min_sparsity_percentage: float = 0.0,
+    top_var_genes: int = 0,
     normalize_total: bool = False,
     log1p: bool = False,
     standardize_expression: bool = True,
@@ -371,11 +397,15 @@ def apply_expression_transforms(
         min_cells_per_gene=min_cells_per_gene,
         min_sparsity_percentage=min_sparsity_percentage,
     )
+    transformed, keep_mask = _restrict_to_highly_variable_genes(
+        transformed, keep_mask, top_var_genes
+    )
     metadata: dict[str, Any] = {
         "gene_keep_mask": keep_mask,
         "representation": "gene_expression",
         "min_cells_per_gene": int(min_cells_per_gene),
         "min_sparsity_percentage": float(min_sparsity_percentage),
+        "top_var_genes": int(top_var_genes or 0),
         "min_expressed_cells_required": expressed_cells_required(
             np.asarray(a).shape[0],
             min_cells_per_gene=min_cells_per_gene,
@@ -435,6 +465,7 @@ def apply_expression_transforms_by_celltype(
     *,
     min_cells_per_gene: int = 0,
     min_sparsity_percentage: float = 0.0,
+    top_var_genes: int = 0,
     normalize_total: bool = False,
     log1p: bool = False,
     standardize_expression: bool = True,
@@ -460,6 +491,9 @@ def apply_expression_transforms_by_celltype(
         a,
         min_cells_per_gene=min_cells_per_gene,
         min_sparsity_percentage=min_sparsity_percentage,
+    )
+    filtered, keep_mask = _restrict_to_highly_variable_genes(
+        filtered, keep_mask, top_var_genes
     )
     labels = np.asarray(cell_type_labels, dtype=np.int64)
     if labels.shape[0] != filtered.shape[0]:

@@ -16,6 +16,7 @@
   },
   "test": {
     "method": "correlated_null_adaptive_permutation",
+    "variogram_fit_mode": "variance_constrained",
     "metric": "nll_gaussian_mse",
     "covariate": null,
     "n_perms": 99,

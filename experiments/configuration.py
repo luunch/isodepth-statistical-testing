@@ -418,9 +418,11 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
             "min_cells_per_celltype",
             "obs_filters",
             "obs_indices",
-        "obs_drop_na",
-        "covariate_whitening",
-    }
+            "obs_drop_na",
+            "covariate_whitening",
+        }
+    if data.get("drop_label_border_spots"):
+        data_keys |= {"drop_label_border_spots", "label_border_radius_mult"}
     if data.get("mode") == "fourier":
         data_keys |= {"k_min", "k_max"}
     if data.get("source") == "synthetic":
@@ -476,6 +478,7 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
             "variogram_n_plot_genes",
             "variogram_backend",
             "variogram_perm_batch_size",
+            "variogram_fit_mode",
         }
     if method == "correlated_null_adaptive_permutation":
         test_keys |= {
@@ -484,6 +487,7 @@ def _compact_run_config(run_config: RunConfig) -> dict[str, Any]:
             "variogram_n_plot_genes",
             "variogram_backend",
             "variogram_perm_batch_size",
+            "variogram_fit_mode",
         }
     if method == "block_permutation":
         test_keys |= {

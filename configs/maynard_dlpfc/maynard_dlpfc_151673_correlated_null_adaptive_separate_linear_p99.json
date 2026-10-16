@@ -9,7 +9,7 @@
       "Region"
     ],
     "top_var_genes": 3000,
-    "min_cells_per_gene": 20,
+    "min_cells_per_gene": 10,
     "min_sparsity_percentage": 5,
     "min_cells_per_celltype": 10,
     "normalize_total": true,
@@ -22,6 +22,7 @@
   },
   "test": {
     "method": "correlated_null_adaptive_permutation",
+    "variogram_fit_mode": "variance_constrained",
     "metric": "nll_gaussian_mse",
     "covariate": null,
     "n_perms": 99,
@@ -38,10 +39,7 @@
     "coordinate_um_per_unit": 1.0,
     "variogram_nn_candidates": [
       0,
-      0.01,
       0.02,
-      0.03,
-      0.04,
       0.05,
       0.1,
       0.2,

@@ -130,11 +130,11 @@ def preprocess_celltype_subset(
 ) -> tuple[np.ndarray, list[str], str]:
     """Apply the full expression-preprocessing pipeline to one cell-type subset.
 
-    Mirrors the global ordering used by :func:`load_h5ad_dataset` (HVG selection on
-    raw counts, then gene filtering + normalize/log1p/standardize/q), but every
-    statistic (HVG dispersion, ``min_cells_per_gene`` support,
-    ``min_sparsity_percentage`` of this subset, per-gene z-score
-    mean/std, Poisson low-rank factorization) is computed *within this subset only*.
+    Mirrors the global ordering used by :func:`load_h5ad_dataset`: count filters
+    first, then HVG selection, then normalize/log1p/standardize/q. Every
+    statistic (``min_cells_per_gene`` support, ``min_sparsity_percentage`` of
+    this subset, HVG dispersion, per-gene z-score mean/std, Poisson low-rank
+    factorization) is computed *within this subset only*.
 
     Returns ``(A_c, var_names_c, feature_space)`` where ``var_names_c`` are the
     surviving gene names (or Poisson-latent / PC feature names when ``q`` /
@@ -150,17 +150,11 @@ def preprocess_celltype_subset(
             f"var_names length {len(var_names)} != counts genes {n_genes_full}"
         )
 
-    surviving = np.arange(n_genes_full, dtype=np.int64)
-    work = counts
-    if top_var_genes and int(top_var_genes) > 0 and int(top_var_genes) < work.shape[1]:
-        hvg_mask = _select_hvg_mask_from_counts(work, int(top_var_genes))
-        work = work[:, hvg_mask]
-        surviving = surviving[hvg_mask]
-
     transformed, transform_meta = apply_expression_transforms(
-        work,
+        counts,
         min_cells_per_gene=min_cells_per_gene,
         min_sparsity_percentage=min_sparsity_percentage,
+        top_var_genes=top_var_genes,
         normalize_total=normalize_total,
         log1p=log1p,
         standardize_expression=standardize_expression,
@@ -170,7 +164,7 @@ def preprocess_celltype_subset(
         return_metadata=True,
     )
     keep_mask = np.asarray(transform_meta["gene_keep_mask"], dtype=bool)
-    surviving = surviving[keep_mask]
+    surviving = np.flatnonzero(keep_mask)
     if gene_counts is not None:
         gene_counts["n_genes_input"] = int(n_genes_full)
         gene_counts["n_genes_kept"] = int(surviving.size)
@@ -687,16 +681,16 @@ def load_h5ad_dataset(
     # expression transforms to per-cell-type processing (see
     # methods.permutation._process_single_celltype_separate); keep raw counts here.
     defer_preprocessing = isinstance(cell_type, str) and cell_type == "separate"
-    if top_var_genes and int(top_var_genes) > 0 and not defer_preprocessing:
-        n_top = int(top_var_genes)
-        if n_top >= adata.n_vars:
-            warnings.warn(
-                f"data.top_var_genes={n_top} >= number of available genes ({adata.n_vars}); "
-                "keeping all genes."
-            )
-        else:
-            hvg_mask = _select_hvg_mask(adata, n_top)
-            adata = adata[:, hvg_mask].copy()
+    if (
+        top_var_genes
+        and int(top_var_genes) > 0
+        and int(top_var_genes) >= adata.n_vars
+        and not defer_preprocessing
+    ):
+        warnings.warn(
+            f"data.top_var_genes={int(top_var_genes)} >= number of available genes "
+            f"({adata.n_vars}); keeping all genes."
+        )
     s = _extract_coordinates(
         adata,
         spatial_key=spatial_key,
@@ -837,6 +831,7 @@ def load_h5ad_dataset(
             cell_type_labels,
             min_cells_per_gene=min_cells_per_gene,
             min_sparsity_percentage=min_sparsity_percentage,
+            top_var_genes=top_var_genes,
             log1p=log1p,
             standardize_expression=standardize_expression,
             q=q,
@@ -848,6 +843,7 @@ def load_h5ad_dataset(
             a,
             min_cells_per_gene=min_cells_per_gene,
             min_sparsity_percentage=min_sparsity_percentage,
+            top_var_genes=top_var_genes,
             normalize_total=normalize_total,
             log1p=log1p,
             standardize_expression=standardize_expression,

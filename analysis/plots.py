@@ -831,10 +831,17 @@ def save_pre_aggregation_dataset_plot(
             alpha=0.9,
         )
         plt.colorbar(scatter, ax=axes[1], fraction=0.046, pad=0.04)
-        bandwidth = dataset.meta.get("smooth_bandwidth_um")
-        if bandwidth is None:
-            bandwidth = (dataset.meta.get("kernel") or {}).get("distance")
-        bw_label = f", σ={float(bandwidth):g} µm" if bandwidth is not None else ""
+        per_gene_low = dataset.meta.get("smooth_bandwidth_um_low")
+        per_gene_high = dataset.meta.get("smooth_bandwidth_um_high")
+        if per_gene_low is not None and per_gene_high is not None:
+            bw_label = (
+                f", per-gene σ ~ Unif[{float(per_gene_low):g}, {float(per_gene_high):g}] µm"
+            )
+        else:
+            bandwidth = dataset.meta.get("smooth_bandwidth_um")
+            if bandwidth is None:
+                bandwidth = (dataset.meta.get("kernel") or {}).get("distance")
+            bw_label = f", σ={float(bandwidth):g} µm" if bandwidth is not None else ""
         axes[1].set_title(f"Gaussian-blurred noise (1 gene{bw_label})")
         axes[1].set_xlabel("x")
         axes[1].set_ylabel("y")
@@ -1407,7 +1414,7 @@ def save_synthetic_true_curve_plot(
         return None
 
     mode = str(dataset.meta.get("mode", ""))
-    if mode not in {"radial", "fourier", "noise"}:
+    if mode not in {"radial", "fourier", "noise", "linear_x"}:
         return None
 
     true_curve = dataset.meta.get("synthetic_true_curve")
@@ -1421,6 +1428,8 @@ def save_synthetic_true_curve_plot(
         title = "True Synthetic Isodepth (Fourier)"
     elif mode == "radial":
         title = "True Synthetic Isodepth (Radial)"
+    elif mode == "linear_x":
+        title = "True Synthetic Isodepth (Linear x)"
 
     gh = int(dataset.meta.get("grid_height", 0) or 0)
     gw = int(dataset.meta.get("grid_width", 0) or 0)
@@ -4814,6 +4823,11 @@ def save_variogram_matching_plots(
     variogram_final = np.asarray(diagnostics["variogram_final"], dtype=np.float64)
     fitted = np.asarray(diagnostics["fitted_variograms_candidates"], dtype=np.float64)
     algorithm_version = int(diagnostics.get("algorithm_version", 2))
+    fit_mode = str(diagnostics.get("variogram_fit_mode", "legacy"))
+    constrained = fit_mode == "variance_constrained" or algorithm_version >= 4
+    final_normalized = constrained and "final_variogram_scale" in diagnostics
+    empirical_selection = diagnostics.get("selection_objective") == "final_surrogate_empirical_variogram"
+    candidates_normalized = diagnostics.get("candidate_variogram_scale") == "after_candidate_normalization"
     realized_candidates = diagnostics.get("realized_variograms_candidates")
     plot_realized = algorithm_version >= 3 and realized_candidates is not None
     if plot_realized:
@@ -4853,7 +4867,7 @@ def save_variogram_matching_plots(
                     color=colors[k],
                     linewidth=1.0,
                     linestyle=":",
-                    label=("Theoretical fit" if k == 0 else None),
+                    label=("Constrained theoretical fit" if constrained and k == 0 else "Theoretical fit" if k == 0 else None),
                 )
             else:
                 ax.plot(
@@ -4883,7 +4897,14 @@ def save_variogram_matching_plots(
         ax.axis("off")
     handles, labels = axes_flat[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="outside lower center", ncol=6, frameon=False)
-    if plot_realized:
+    if plot_realized and constrained:
+        family = "Adaptive locfit nn" if blur_mode == "adaptive" else "Uniform Gaussian bandwidth"
+        candidate_scale = "normalized" if candidates_normalized else "unnormalized"
+        cand_title = (
+            f"{family}: realized, {candidate_scale} surrogates "
+            "(dotted: constrained theoretical fit)"
+        )
+    elif plot_realized:
         family = "Adaptive locfit nn" if blur_mode == "adaptive" else "Uniform Gaussian bandwidth"
         cand_title = (
             f"{family} candidates — realized final-surrogate variograms "
@@ -4910,8 +4931,20 @@ def save_variogram_matching_plots(
         ax.plot(
             lag_centers, variogram_permuted[:, j], "s--", color="slategray", label="Permuted"
         )
+        if constrained:
+            winner = int(np.flatnonzero(np.isclose(candidates, best_cand[j]))[0])
+            ax.plot(
+                lag_centers,
+                fitted[winner, :, j],
+                ":",
+                color="black",
+                label="Constrained fit (before rescaling)" if final_normalized else "Constrained theoretical fit",
+            )
+            final_label = "Final, variance restored" if final_normalized else "Realized, unnormalized"
+        else:
+            final_label = "Final surrogate"
         ax.plot(
-            lag_centers, variogram_final[:, j], "^-", color="teal", label="Final surrogate"
+            lag_centers, variogram_final[:, j], "^-", color="teal", label=final_label
         )
         ax.set(
             title=f"{gene} | optimal {title_suffix}={best_cand[j]:g}",
@@ -4924,12 +4957,20 @@ def save_variogram_matching_plots(
         ax.legend(frameon=False, fontsize=8)
     for ax in axes_flat[n_plot:]:
         ax.axis("off")
-    final_scale = (
-        "surrogate on input expression scale"
-        if diagnostics.get("variance_matching") == "input_gene_moments"
-        else "z-scored surrogate"
-    )
-    fig.suptitle(f"Best variogram match — final {final_scale} (perm slot 1)", fontsize=16)
+    variance_matching = diagnostics.get("variance_matching")
+    if final_normalized:
+        final_scale = "final surrogate with input variance restored"
+        final_heading = "Winner selected by final surrogate empirical SSE" if empirical_selection else "Winner selected by constrained theoretical SSE"
+    elif constrained or variance_matching == "input_units_unnormalized_surrogate":
+        final_scale = "realized, unnormalized surrogate on the input expression scale"
+        final_heading = "Winner selected by final surrogate empirical SSE" if empirical_selection else "Winner selected by constrained theoretical SSE"
+    elif variance_matching == "input_gene_moments":
+        final_scale = "surrogate on input expression scale"
+        final_heading = "Best variogram match"
+    else:
+        final_scale = "z-scored surrogate"
+        final_heading = "Best variogram match"
+    fig.suptitle(f"{final_heading} — {final_scale} (perm slot 1)", fontsize=16)
     best_path = vm_dir / "variogram_best_match.png"
     fig.savefig(best_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -4952,11 +4993,12 @@ def save_variogram_matching_plots(
         for row, j in enumerate(chunk):
             fields = (x_true[:, j], x_perm[:, j], y_blur[:, j], x_final[:, j])
             blur_tag = f"{cand_label}={best_cand[j]:g}"
+            surrogate_label = "Final, variance restored" if final_normalized else "Realized, unnormalized" if constrained else "Final surrogate"
             labels = (
                 "True",
                 "Permuted",
                 f"Blurred ({blur_tag})",
-                "Final surrogate",
+                surrogate_label,
             )
             shared_min = min(float(fields[k].min()) for k in (0, 1, 3))
             shared_max = max(float(fields[k].max()) for k in (0, 1, 3))
@@ -4982,10 +5024,12 @@ def save_variogram_matching_plots(
                     points, ax=ax, shrink=0.8, pad=0.025,
                     label=("Raw blur (own scale)" if column == 2 else "Expression scale (shared)"),
                 )
-        fig.suptitle(
-            "True, permutation, best blur, and final surrogate (perm slot 1)",
-            fontsize=16,
+        spatial_title = (
+            "True, permutation, best blur, and realized unnormalized surrogate (perm slot 1)"
+            if constrained and not final_normalized
+            else "True, permutation, best blur, and final surrogate (perm slot 1)"
         )
+        fig.suptitle(spatial_title, fontsize=16)
         spatial_name = f"spatial_genes_{start + 1:02d}-{min(start + 5, n_plot):02d}.png"
         spatial_path = vm_dir / spatial_name
         fig.savefig(spatial_path, dpi=150, bbox_inches="tight")
@@ -5004,11 +5048,36 @@ def save_variogram_matching_plots(
         if coefficient_sse is not None:
             header.append("coefficient_SSE")
             coefficient_sse = np.asarray(coefficient_sse, dtype=np.float64)
+        realized_best = diagnostics.get("realized_sse_best_plot")
+        if realized_best is not None:
+            header.append("realized_SSE")
+            realized_best = np.asarray(realized_best, dtype=np.float64)
+        extra_columns = (
+            ("noise_variance", "noise_variance_best_plot"),
+            ("smooth_multiplier", "smooth_multiplier_best_plot"),
+            ("component_variance", "component_variance_best_plot"),
+            ("realized_variance_ratio", "realized_variance_ratio_best_plot"),
+            ("pre_normalization_variance_ratio", "pre_normalization_variance_ratio_best_plot"),
+            ("final_variogram_scale", "final_variogram_scale_best_plot"),
+            ("pre_normalization_SSE", "pre_normalization_sse_best_plot"),
+            ("smooth_noise_covariance", "smooth_noise_covariance_best_plot"),
+            ("covariance_variance_contribution", "covariance_variance_contribution_best_plot"),
+        )
+        extra_values = []
+        for column_name, key in extra_columns:
+            if key not in diagnostics:
+                continue
+            header.append(column_name)
+            extra_values.append(np.asarray(diagnostics[key], dtype=np.float64))
         writer.writerow(header)
         for j, gene in enumerate(gene_names):
             row = [gene, best_cand[j], intercept[j], slope[j], sse[j]]
             if coefficient_sse is not None:
                 row.append(coefficient_sse[j])
+            if realized_best is not None:
+                row.append(realized_best[j])
+            for values in extra_values:
+                row.append(values[j])
             writer.writerow(row)
         writer.writerow([])
         writer.writerow(["selection_counts_across_all_genes_and_perms"])
@@ -5020,6 +5089,21 @@ def save_variogram_matching_plots(
         writer.writerow(
             ["total_selections"] + [int(counts[:, k].sum()) for k in range(len(count_cols))]
         )
+        for frequency_key in (
+            "upper_boundary_frequency",
+            "pure_noise_frequency",
+            "identity_selection_frequency",
+        ):
+            if frequency_key in diagnostics:
+                writer.writerow([frequency_key, float(diagnostics[frequency_key])])
+        if "upper_boundary_label" in diagnostics:
+            writer.writerow(["upper_boundary_label", float(diagnostics["upper_boundary_label"])])
+        if "variogram_fit_mode" in diagnostics:
+            writer.writerow(["variogram_fit_mode", diagnostics["variogram_fit_mode"]])
+        if "selection_objective" in diagnostics:
+            writer.writerow(["selection_objective", diagnostics["selection_objective"]])
+        if "algorithm_version" in diagnostics:
+            writer.writerow(["algorithm_version", int(diagnostics["algorithm_version"])])
     paths["selected_sigma_summary"] = str(csv_path)
     # Keep numerical diagnostics so fit quality and marginal variance can be
     # checked later without regenerating random surrogates from a newer method.
@@ -5027,5 +5111,3 @@ def save_variogram_matching_plots(
     np.savez_compressed(diagnostics_path, **diagnostics)
     paths["diagnostics"] = str(diagnostics_path)
     return paths
-
-

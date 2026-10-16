@@ -4,6 +4,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -18,10 +19,14 @@ from methods.correlated_null_permutation import (
     _adaptive_blur_expression,
     _build_variogram_geometry,
     _classical_variogram,
+    _covariance_variance_contribution,
+    _fit_variance_constrained_coefficients,
     _fit_variogram_sse,
     _median_nearest_neighbor_distance,
     _precompute_adaptive_blur_plan,
     _score_restored_candidate,
+    _standardize_noise_columns,
+    _strictly_better,
     build_correlated_null_adaptive_surrogates,
     build_correlated_null_surrogates,
 )
@@ -374,41 +379,44 @@ class TestCorrelatedNullPermutation(unittest.TestCase):
             verbose=False,
             collect_trace=True,
         )
-        for builder, candidates in (
-            (build_correlated_null_adaptive_surrogates, {"nn_candidates": [0.2, 0.0, 0.5]}),
-            (build_correlated_null_surrogates, {"sigma_multiples": [1.0, 2.0]}),
-        ):
-            reference, ref_diag = builder(expression, coords, backend="sequential", **common, **candidates)
-            actual, diag = builder(
-                expression,
-                coords,
-                backend="cuda",
-                perm_batch_size=2,
-                **common,
-                **candidates,
-            )
-            np.testing.assert_array_equal(diag["trace_permutations"], ref_diag["trace_permutations"])
-            np.testing.assert_array_equal(diag["trace_noise"], ref_diag["trace_noise"])
-            np.testing.assert_allclose(
-                diag["trace_gamma_y"], ref_diag["trace_gamma_y"], rtol=1e-6, atol=1e-6, equal_nan=True
-            )
-            np.testing.assert_allclose(
-                diag["trace_sse"], ref_diag["trace_sse"], rtol=1e-6, atol=1e-6, equal_nan=True
-            )
-            np.testing.assert_allclose(
-                diag["trace_coefficient_sse"],
-                ref_diag["trace_coefficient_sse"],
-                rtol=1e-6,
-                atol=1e-6,
-                equal_nan=True,
-            )
-            np.testing.assert_allclose(diag["trace_slope"], ref_diag["trace_slope"], rtol=1e-6, atol=1e-6)
-            np.testing.assert_allclose(
-                diag["trace_intercept"], ref_diag["trace_intercept"], rtol=1e-6, atol=1e-6
-            )
-            _assert_bandwidths_agree(ref_diag, diag, rtol=1e-6, atol=1e-6)
-            np.testing.assert_allclose(actual, reference, rtol=1e-5, atol=1e-5)
-            self.assertEqual(diag["variogram_backend"], "cuda")
+        for fit_mode in ("legacy", "variance_constrained"):
+            common["fit_mode"] = fit_mode
+            for builder, candidates in (
+                (build_correlated_null_adaptive_surrogates, {"nn_candidates": [0.2, 0.0, 0.5]}),
+                (build_correlated_null_surrogates, {"sigma_multiples": [1.0, 2.0]}),
+            ):
+                reference, ref_diag = builder(expression, coords, backend="sequential", **common, **candidates)
+                actual, diag = builder(
+                    expression,
+                    coords,
+                    backend="cuda",
+                    perm_batch_size=2,
+                    **common,
+                    **candidates,
+                )
+                np.testing.assert_array_equal(diag["trace_permutations"], ref_diag["trace_permutations"])
+                np.testing.assert_array_equal(diag["trace_noise"], ref_diag["trace_noise"])
+                np.testing.assert_allclose(
+                    diag["trace_gamma_y"], ref_diag["trace_gamma_y"], rtol=1e-6, atol=1e-6, equal_nan=True
+                )
+                np.testing.assert_allclose(
+                    diag["trace_sse"], ref_diag["trace_sse"], rtol=1e-6, atol=1e-6, equal_nan=True
+                )
+                np.testing.assert_allclose(
+                    diag["trace_coefficient_sse"],
+                    ref_diag["trace_coefficient_sse"],
+                    rtol=1e-6,
+                    atol=1e-6,
+                    equal_nan=True,
+                )
+                np.testing.assert_allclose(diag["trace_slope"], ref_diag["trace_slope"], rtol=1e-6, atol=1e-6)
+                np.testing.assert_allclose(
+                    diag["trace_intercept"], ref_diag["trace_intercept"], rtol=1e-6, atol=1e-6
+                )
+                _assert_bandwidths_agree(ref_diag, diag, rtol=1e-6, atol=1e-6)
+                np.testing.assert_allclose(actual, reference, rtol=1e-5, atol=1e-5)
+                self.assertEqual(diag["variogram_backend"], "cuda")
+                self.assertEqual(diag["variogram_fit_mode"], fit_mode)
 
     def test_draw_order_is_permutation_then_noise(self) -> None:
         coords = _grid_coords(6)
@@ -528,6 +536,444 @@ class TestCorrelatedNullPermutation(unittest.TestCase):
         )
         # One noise matrix per permutation, drawn after that permutation.
         self.assertEqual(diag["trace_noise"].shape[0], 2)
+
+    def test_variance_constrained_coefficients_match_the_clipped_projection(self) -> None:
+        variance = np.array([1.5, 0.5, 0.0, 2.0])
+        gamma_y = np.array(
+            [
+                [1.0, 0.2, 0.0, 2.0],
+                [2.0, 0.8, 0.0, 2.0],
+                [1.5, 0.5, 0.0, 2.0],
+            ]
+        )
+        # Column 0 solves at b=0.5. Column 1 is above 1/v. Column 2 is a
+        # constant smooth. Column 3 has q=0, so the denominator vanishes.
+        gamma_x = np.array(
+            [
+                [0.25 + 0.5 * 1.0, 0.0, 0.0, 1.0],
+                [0.25 + 0.5 * 2.0, 0.0, 0.0, 1.0],
+                [0.25 + 0.5 * 1.5, 0.0, 0.0, 1.0],
+            ]
+        )
+        gamma_x[:, 1] = 1.0 + 10.0 * (gamma_y[:, 1] - variance[1])
+        valid = np.ones(3, dtype=bool)
+        noise_variance, smooth_multiplier, sse = _fit_variance_constrained_coefficients(
+            gamma_x, gamma_y, variance, valid
+        )
+        np.testing.assert_allclose(smooth_multiplier, [0.5, 2.0, 0.0, 0.0], atol=1e-12)
+        np.testing.assert_allclose(noise_variance, [0.25, 0.0, 1.0, 1.0], atol=1e-12)
+        np.testing.assert_allclose(noise_variance + smooth_multiplier * variance, 1.0, atol=1e-12)
+        fitted = noise_variance + smooth_multiplier * gamma_y
+        expected_sse = np.sum((fitted - gamma_x) ** 2, axis=0)
+        np.testing.assert_allclose(sse, expected_sse, atol=1e-12)
+
+    def test_constrained_fit_mode_is_explicit_and_legacy_stays_the_default(self) -> None:
+        legacy = TestConfig(method="correlated_null_adaptive_permutation").validate()
+        self.assertEqual(legacy.variogram_fit_mode, "legacy")
+        constrained = TestConfig(
+            method="correlated_null_adaptive_permutation",
+            variogram_fit_mode="variance_constrained",
+        ).validate()
+        self.assertEqual(constrained.variogram_fit_mode, "variance_constrained")
+        with self.assertRaisesRegex(ValueError, "variogram_fit_mode"):
+            TestConfig(
+                method="correlated_null_permutation",
+                variogram_fit_mode="notebook",
+            ).validate()
+
+    def test_constrained_ties_keep_the_earlier_bandwidth(self) -> None:
+        best = np.array([np.inf])
+        chosen = -1
+        for index, score in enumerate((0.4, 0.4, 0.2, 0.2)):
+            improved = _strictly_better(np.array([score]), best)
+            if index == 0:
+                improved = np.array([True])
+            if improved[0]:
+                best[0] = score
+                chosen = index
+        self.assertEqual(chosen, 2)
+
+    def test_variance_constrained_winner_restores_input_moments(self) -> None:
+        coords = _grid_coords(8)
+        expression = np.random.default_rng(4).normal(2.0, 0.5, (len(coords), 4))
+        expression[:, -1] = 7.0
+        surr, diag = build_correlated_null_adaptive_surrogates(
+            expression,
+            coords,
+            n_perms=2,
+            seed=8,
+            nn_candidates=[0.0, 0.3, 0.7],
+            n_bins=8,
+            n_plot_genes=4,
+            verbose=False,
+            collect_trace=True,
+            fit_mode="variance_constrained",
+        )
+        self.assertEqual(diag["variogram_fit_mode"], "variance_constrained")
+        self.assertEqual(int(diag["algorithm_version"]), 6)
+        self.assertEqual(diag["selection_objective"], "final_surrogate_empirical_variogram")
+        self.assertEqual(diag["variance_matching"], "input_gene_moments")
+        np.testing.assert_array_equal(
+            diag["trace_best_k"],
+            np.argmin(diag["trace_sse"], axis=1),
+        )
+        _assert_constrained_selection(expression, coords, surr, diag, nn_candidates=[0.0, 0.3, 0.7], n_bins=8)
+        nonconstant = expression.std(axis=0, ddof=0) > 0
+        np.testing.assert_allclose(diag["component_variance"][nonconstant], 1.0, atol=1e-8)
+        np.testing.assert_allclose(
+            diag["pre_normalization_variance_ratio"][nonconstant],
+            diag["component_variance"][nonconstant] + diag["covariance_variance_contribution"][nonconstant],
+            atol=1e-6,
+        )
+        np.testing.assert_allclose(diag["realized_variance_ratio"][nonconstant], 1.0, atol=1e-6)
+        np.testing.assert_allclose(surr.var(axis=1), np.broadcast_to(expression.var(axis=0), (2, 4)), atol=1e-6)
+        np.testing.assert_allclose(surr.mean(axis=1), np.broadcast_to(expression.mean(axis=0), (2, 4)), atol=1e-6)
+        geom = _build_variogram_geometry(coords, 8)
+        # Independent pair-difference calculation validates the analytic final curve.
+        gamma = _brute_classical_variogram(surr[0].astype(np.float64), geom, geom.pairs, geom.bin_index)
+        indices = diag["plot_gene_indices"]
+        np.testing.assert_allclose(diag["variogram_final"], gamma[:, indices], rtol=1e-5, atol=1e-6, equal_nan=True)
+        candidate_gamma = diag["realized_variograms_candidates"]
+        selected = np.column_stack([candidate_gamma[diag["trace_best_k"][0, g], :, j] for j, g in enumerate(indices)])
+        np.testing.assert_allclose(diag["variogram_final"], selected, rtol=1e-6, equal_nan=True)
+        actual_sse = np.sum((gamma[geom.valid_bins][:, indices] - diag["variogram_real"][geom.valid_bins])**2, axis=0)
+        np.testing.assert_allclose(diag["realized_sse_best_plot"], actual_sse, rtol=1e-4, atol=1e-6)
+        np.testing.assert_allclose(diag["sse_best_plot"], actual_sse, rtol=1e-4, atol=1e-6)
+        before_gamma = gamma[:, indices] / diag["final_variogram_scale"][indices]
+        before_sse = np.sum((before_gamma[geom.valid_bins] - diag["variogram_real"][geom.valid_bins])**2, axis=0)
+        np.testing.assert_allclose(diag["pre_normalization_sse_best_plot"], before_sse, rtol=1e-4, atol=1e-6)
+        self.assertEqual(float(diag["component_variance"][-1]), 0.0)
+        np.testing.assert_allclose(surr[:, :, -1], 7.0, atol=1e-5)
+        for key in (
+            "upper_boundary_frequency",
+            "pure_noise_frequency",
+            "identity_selection_frequency",
+            "upper_boundary_label",
+        ):
+            self.assertIn(key, diag)
+        self.assertGreaterEqual(float(diag["identity_selection_frequency"]), 0.0)
+        self.assertLessEqual(float(diag["upper_boundary_frequency"]), 1.0)
+
+    def test_constrained_identity_is_the_exact_permutation(self) -> None:
+        coords = _grid_coords(8)
+        expression = np.random.default_rng(7).normal(5.0, 3.0, (len(coords), 4))
+        surr, diag = build_correlated_null_adaptive_surrogates(
+            expression,
+            coords,
+            n_perms=2,
+            seed=6,
+            nn_candidates=[0.0],
+            n_bins=8,
+            n_plot_genes=4,
+            verbose=False,
+            fit_mode="variance_constrained",
+        )
+        for sample in surr:
+            order = np.argsort(sample[:, 0])
+            np.testing.assert_allclose(sample[order], expression[np.argsort(expression[:, 0])], atol=1e-6)
+        self.assertEqual(float(diag["identity_selection_frequency"]), 1.0)
+        self.assertEqual(float(diag["pure_noise_frequency"]), 0.0)
+
+    def test_constrained_field_is_affine_equivariant_after_restoring_moments(self) -> None:
+        coords = _grid_coords(8)
+        expression = np.random.default_rng(12).standard_normal((len(coords), 4))
+        scale = np.array([0.3, 2.0, 7.0, 4.0])
+        shift = np.array([10.0, -20.0, 30.0, 5.0])
+        kwargs = dict(
+            n_perms=2,
+            seed=13,
+            nn_candidates=[0.0, 0.25, 0.6],
+            n_bins=8,
+            n_plot_genes=2,
+            verbose=False,
+            fit_mode="variance_constrained",
+        )
+        base, diag = build_correlated_null_adaptive_surrogates(expression, coords, **kwargs)
+        transformed = expression * scale + shift
+        actual, _ = build_correlated_null_adaptive_surrogates(transformed, coords, **kwargs)
+        np.testing.assert_allclose(actual, base * scale + shift, atol=1e-5)
+        ratio = diag["realized_variance_ratio"]
+        self.assertTrue(np.all(np.isfinite(ratio)))
+
+    def test_constrained_tensor_scoring_and_finalization_match_numpy(self) -> None:
+        import torch
+        from methods.correlated_null_permutation import (
+            _score_variance_constrained_candidate, _finalize_constrained_field,
+        )
+        from methods.variogram_matching_accel import (
+            _score_variance_constrained_candidate_torch, _finalize_constrained_field_torch,
+            _TorchVariogram,
+        )
+        coords = _grid_coords(6)
+        geom = _build_variogram_geometry(coords, 6)
+        x = np.random.default_rng(27).normal(size=(len(coords), 4))
+        x[:, -1] = 0.0
+        x[:, :-1] = (x[:, :-1] - x[:, :-1].mean(axis=0)) / x[:, :-1].std(axis=0)
+        noise = _standardize_noise_columns(np.random.default_rng(28).normal(size=x.shape))
+        noise[:, -1] = 0.0
+        mean = np.array([2., 3., -5., 7.])
+        std = np.array([.5, 3., 2., 0.])
+        gamma_x = _classical_variogram(x, geom)
+        # Exercise the actual sparse tensor variogram implementation on CPU.
+        operator = _TorchVariogram.__new__(_TorchVariogram)
+        operator._torch = torch
+        operator.pair_counts = geom.pair_counts
+        operator._bins, operator._degrees = [], []
+        for k, matrix in enumerate(geom.bin_matrices):
+            if not geom.valid_bins[k]:
+                operator._bins.append(None); operator._degrees.append(None)
+                continue
+            coo = matrix.tocoo()
+            operator._bins.append(torch.sparse_coo_tensor(
+                np.vstack([coo.row, coo.col]), coo.data, coo.shape, dtype=torch.float64
+            ).coalesce())
+            operator._degrees.append(torch.tensor(geom.degrees[k], dtype=torch.float64))
+        for identity in (False, True):
+            for columns in (None, np.array([0, 3])):
+                kwargs = dict(identity=identity, gamma_target=gamma_x * std**2, realized_columns=columns)
+                expected = _score_variance_constrained_candidate(
+                    x, noise, gamma_x, geom.valid_bins, geom, input_mean=mean, input_std=std, **kwargs
+                )
+                actual = _score_variance_constrained_candidate_torch(
+                    torch.tensor(x), torch.tensor(noise), gamma_x, geom.valid_bins, operator,
+                    input_mean=torch.tensor(mean), input_std=torch.tensor(std), **kwargs
+                )
+                for key in expected:
+                    if key.startswith("timing"):
+                        continue
+                    value = actual[key].numpy() if isinstance(actual[key], torch.Tensor) else actual[key]
+                    # At a pure-smooth optimum, O(eps) nugget rounding produces
+                    # O(sqrt(eps)) differences in the generated field.
+                    tolerance = 5e-7 if key in {"field", "standardized"} else 1e-10
+                    np.testing.assert_allclose(value, expected[key], atol=tolerance, rtol=1e-9, equal_nan=True)
+                mask = np.full(x.shape[1], identity, dtype=bool)
+                expected_field, expected_scale = _finalize_constrained_field(expected["standardized"], mean, std, mask)
+                actual_field, actual_scale = _finalize_constrained_field_torch(
+                    actual["standardized"], torch.tensor(mean), torch.tensor(std), mask
+                )
+                np.testing.assert_allclose(actual_field.numpy(), expected_field, atol=5e-7)
+                np.testing.assert_allclose(actual_scale, expected_scale, atol=5e-7)
+
+    def test_constrained_backends_match_on_cpu(self) -> None:
+        coords = _grid_coords(8)
+        expression = np.random.default_rng(4).normal(2.0, 0.5, (len(coords), 5))
+        common = dict(
+            n_perms=3,
+            seed=8,
+            n_bins=8,
+            n_plot_genes=3,
+            verbose=False,
+            collect_trace=True,
+            fit_mode="variance_constrained",
+        )
+        cases = [
+            (build_correlated_null_adaptive_surrogates, {"nn_candidates": [0.2, 0.0, 0.5]}),
+            (build_correlated_null_surrogates, {"sigma_multiples": [1.0, 2.0]}),
+        ]
+        for builder, candidates in cases:
+            reference, ref_diag = builder(expression, coords, backend="sequential", **common, **candidates)
+            wide, wide_diag = builder(
+                expression, coords, backend="cpu", perm_batch_size=3, **common, **candidates
+            )
+            blocked, blocked_diag = builder(
+                expression,
+                coords,
+                backend="cpu",
+                perm_batch_size=3,
+                weight_cache_bytes=0,
+                **common,
+                **candidates,
+            )
+            for actual, diag in ((wide, wide_diag), (blocked, blocked_diag)):
+                _assert_backend_matches_reference(reference, ref_diag, actual, diag)
+                np.testing.assert_allclose(
+                    diag["trace_realized_sse"],
+                    ref_diag["trace_realized_sse"],
+                    rtol=1e-8,
+                    atol=1e-8,
+                    equal_nan=True,
+                )
+                self.assertEqual(diag["variogram_fit_mode"], "variance_constrained")
+                self.assertEqual(int(diag["algorithm_version"]), 6)
+
+    def test_constrained_and_legacy_diagnostics_both_plot(self) -> None:
+        coords = _grid_coords(8)
+        expression = np.random.default_rng(1).normal(size=(len(coords), 4))
+        _, constrained = build_correlated_null_adaptive_surrogates(
+            expression,
+            coords,
+            n_perms=1,
+            seed=2,
+            nn_candidates=[0.0, 0.4],
+            n_bins=6,
+            n_plot_genes=4,
+            verbose=False,
+            fit_mode="variance_constrained",
+        )
+        _, legacy = build_correlated_null_adaptive_surrogates(
+            expression,
+            coords,
+            n_perms=1,
+            seed=2,
+            nn_candidates=[0.0, 0.4],
+            n_bins=6,
+            n_plot_genes=4,
+            verbose=False,
+            fit_mode="legacy",
+        )
+        older = dict(legacy)
+        older.pop("variogram_fit_mode", None)
+        older["algorithm_version"] = 2
+        older.pop("realized_variograms_candidates", None)
+        with tempfile.TemporaryDirectory() as tmp:
+            constrained_paths = save_variogram_matching_plots(constrained, Path(tmp) / "constrained")
+            legacy_paths = save_variogram_matching_plots(legacy, Path(tmp) / "legacy")
+            older_paths = save_variogram_matching_plots(older, Path(tmp) / "older")
+            self.assertIn("variogram_candidates", constrained_paths)
+            self.assertIn("variogram_best_match", legacy_paths)
+            self.assertIn("variogram_candidates", older_paths)
+            summary = (Path(tmp) / "constrained" / "variogram-matching" / "selected_sigma_summary.csv").read_text()
+            self.assertIn("noise_variance", summary)
+            self.assertIn("smooth_multiplier", summary)
+            self.assertIn("component_variance", summary)
+            self.assertIn("final_surrogate_empirical_variogram", summary)
+            self.assertIn("upper_boundary_frequency", summary)
+
+    def test_constrained_match_scores_every_returned_candidate(self) -> None:
+        coords = _grid_coords(6)
+        expression = np.random.default_rng(3).normal(size=(len(coords), 4))
+        n_candidates = 2
+        n_perms = 4
+        batch = 2
+        n_plot = 1
+        shapes: list[tuple[int, ...]] = []
+        real = _classical_variogram
+
+        def _record(expression_columns: np.ndarray, geom):
+            values = np.asarray(expression_columns)
+            shapes.append(tuple(values.shape))
+            return real(values, geom)
+
+        with patch(
+            "methods.correlated_null_permutation._classical_variogram", side_effect=_record,
+        ), patch(
+            "methods.variogram_matching_accel._classical_variogram", side_effect=_record,
+        ):
+            _surrogates, diag = build_correlated_null_adaptive_surrogates(
+                expression,
+                coords,
+                n_perms=n_perms,
+                seed=5,
+                nn_candidates=[0.0, 0.4],
+                n_bins=6,
+                n_plot_genes=n_plot,
+                verbose=False,
+                backend="cpu",
+                perm_batch_size=batch,
+                fit_mode="variance_constrained",
+            )
+        wide = sum(1 for shape in shapes if shape[1] == expression.shape[1] * batch)
+        plot = sum(1 for shape in shapes if shape[1] == n_plot)
+        # Every bandwidth scores both the smooth field and the actual
+        # normalized noisy candidate for all genes, even without traces.
+        self.assertEqual(wide, 2 * n_candidates * (n_perms // batch))
+        self.assertEqual(plot, 0)
+        # Only the input target and slot-0 permutation use an all-gene narrow pass.
+        self.assertEqual(sum(shape[1] == expression.shape[1] for shape in shapes), 2)
+        valid = np.asarray(diag["valid_bins"], dtype=bool)
+        curves = np.asarray(diag["realized_variograms_candidates"])
+        self.assertTrue(np.all(np.isfinite(curves[:, valid, :])))
+        self.assertTrue(np.all(np.isfinite(diag["realized_sse_candidates"])))
+        self.assertEqual(diag["selection_objective"], "final_surrogate_empirical_variogram")
+
+
+def _assert_constrained_selection(
+    expression: np.ndarray,
+    coords: np.ndarray,
+    surrogates: np.ndarray,
+    diagnostics: dict,
+    *,
+    nn_candidates: list[float],
+    n_bins: int,
+) -> None:
+    expression = np.asarray(expression, dtype=np.float64)
+    input_mean = expression.mean(axis=0)
+    input_std = expression.std(axis=0, ddof=0)
+    standardized = (expression - input_mean) / np.where(input_std > 0, input_std, 1.0)
+    geom = _build_variogram_geometry(coords, n_bins)
+    gamma_x = _classical_variogram(standardized, geom)
+    plan = _precompute_adaptive_blur_plan(coords, nn_candidates)
+    n_genes = expression.shape[1]
+    n_cells = expression.shape[0]
+    for perm_index in range(surrogates.shape[0]):
+        perm = diagnostics["trace_permutations"][perm_index]
+        noise = diagnostics["trace_noise"][perm_index]
+        raw_noise = (noise @ standardized) / np.sqrt(float(n_cells))
+        r_noise = _standardize_noise_columns(raw_noise)
+        permuted = standardized[perm]
+        blurred = _adaptive_blur_expression(permuted, coords, plan)
+        theoretical = np.empty((len(nn_candidates), n_genes), dtype=np.float64)
+        empirical = np.empty_like(theoretical)
+        fields = []
+        for k in range(len(nn_candidates)):
+            identity = k == int(plan.identity_index)
+            if identity:
+                smooth = permuted
+                variance = smooth.var(axis=0, ddof=0)
+                gamma_y = _classical_variogram(smooth, geom)
+                noise_variance = np.zeros(n_genes)
+                smooth_multiplier = np.ones(n_genes)
+                z = np.array(permuted, copy=True)
+            else:
+                smooth = blurred[k] - blurred[k].mean(axis=0)
+                variance = smooth.var(axis=0, ddof=0)
+                gamma_y = _classical_variogram(smooth, geom)
+                noise_variance, smooth_multiplier, _sse = _fit_variance_constrained_coefficients(
+                    gamma_x, gamma_y, variance, geom.valid_bins
+                )
+                z = np.sqrt(smooth_multiplier) * smooth + np.sqrt(noise_variance) * r_noise
+            constant = input_std <= 0
+            if np.any(constant):
+                z[:, constant] = 0.0
+                if not identity:
+                    noise_variance = np.array(noise_variance, copy=True)
+                    smooth_multiplier = np.array(smooth_multiplier, copy=True)
+                    noise_variance[constant] = 0.0
+                    smooth_multiplier[constant] = 0.0
+            fitted = noise_variance + smooth_multiplier * gamma_y
+            theoretical[k] = np.sum((fitted[geom.valid_bins] - gamma_x[geom.valid_bins]) ** 2, axis=0)
+            theoretical[k, constant] = 0.0
+            np.testing.assert_allclose(
+                smooth_multiplier, diagnostics["trace_slope"][perm_index, k], atol=1e-8
+            )
+            np.testing.assert_allclose(
+                noise_variance, diagnostics["trace_intercept"][perm_index, k], atol=1e-8
+            )
+            centered_z = z - z.mean(axis=0)
+            z_std = centered_z.std(axis=0)
+            restored = centered_z / np.where(z_std > 0, z_std, 1.0) * input_std + input_mean
+            if identity:
+                restored = permuted * input_std + input_mean
+            fields.append(restored)
+            gamma_final = _brute_classical_variogram(restored, geom, geom.pairs, geom.bin_index)
+            empirical[k] = np.sum(
+                (gamma_final[geom.valid_bins] - (gamma_x * input_std**2)[geom.valid_bins])**2,
+                axis=0,
+            )
+            if not identity:
+                contribution = _covariance_variance_contribution(
+                    noise_variance, smooth_multiplier, np.mean(smooth * r_noise, axis=0)
+                )
+                realized = z.var(axis=0, ddof=0)
+                component = noise_variance + smooth_multiplier * variance
+                active = ~constant
+                np.testing.assert_allclose(realized[active], (component + contribution)[active], atol=1e-8)
+        np.testing.assert_allclose(theoretical, diagnostics["trace_coefficient_sse"][perm_index], atol=1e-8)
+        np.testing.assert_allclose(empirical, diagnostics["trace_sse"][perm_index], atol=1e-8)
+        chosen = np.argmin(empirical, axis=0)
+        np.testing.assert_array_equal(chosen, diagnostics["trace_best_k"][perm_index])
+        winner = np.column_stack([fields[int(chosen[g])][:, g] for g in range(n_genes)])
+        np.testing.assert_allclose(surrogates[perm_index], winner, rtol=1e-5, atol=1e-5)
 
 
 def _assert_finalized_selection(

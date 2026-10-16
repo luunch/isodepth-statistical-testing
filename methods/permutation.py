@@ -435,9 +435,9 @@ def _preprocess_separate_subset(
 ) -> tuple[np.ndarray, list[str] | None, str | None]:
     """Apply per-cell-type expression preprocessing for separate mode.
 
-    When the loader deferred preprocessing (``cell_type="separate"``), HVG
-    selection, gene filtering and z-scoring are computed *within this cell type
-    only*.  ``min_sparsity_percentage`` is a percent of this domain, so the
+    When the loader deferred preprocessing (``cell_type="separate"``), gene
+    filtering, then HVG selection, then z-scoring are computed *within this
+    cell type only*.  ``min_sparsity_percentage`` is a percent of this domain, so the
     implied expressing-cell threshold differs across domains.  Falls back to the
     already-transformed matrix for datasets that did not
     defer (e.g. synthetic bundles or legacy callers).
@@ -1085,7 +1085,8 @@ def run_correlated_null_permutation_method(
     if config.verbose:
         print(
             "Correlated null permutation: fixed S, variogram-matched expression nulls "
-            f"(sigma multiples={list(config.variogram_sigma_multiples)})",
+            f"(sigma multiples={list(config.variogram_sigma_multiples)}, "
+            f"fit mode={config.variogram_fit_mode})",
             flush=True,
         )
 
@@ -1134,7 +1135,8 @@ def run_correlated_null_adaptive_permutation_method(
     if config.verbose:
         print(
             "Correlated null adaptive permutation (STCompare locfit): fixed S, "
-            f"nn candidates={list(config.variogram_nn_candidates)}",
+            f"nn candidates={list(config.variogram_nn_candidates)}, "
+            f"fit mode={config.variogram_fit_mode}",
             flush=True,
         )
 

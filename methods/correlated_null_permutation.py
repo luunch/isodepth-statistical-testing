@@ -199,6 +199,370 @@ def _fit_variogram_sse(
     return sse, intercept, slope
 
 
+LEGACY_VARIOGRAM_ALGORITHM_VERSION = 3
+VARIANCE_CONSTRAINED_ALGORITHM_VERSION = 6
+VARIOGRAM_FIT_MODES = ("legacy", "variance_constrained")
+
+
+def _normalize_variogram_fit_mode(fit_mode: str) -> str:
+    name = str(fit_mode).strip().lower()
+    if name not in VARIOGRAM_FIT_MODES:
+        raise ValueError(
+            "variogram_fit_mode must be 'legacy' or 'variance_constrained' "
+            f"(got {fit_mode!r})"
+        )
+    return name
+
+
+def _center_columns(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    return values - values.mean(axis=0, keepdims=True)
+
+
+def _population_column_variance(values: np.ndarray) -> np.ndarray:
+    return np.asarray(values, dtype=np.float64).var(axis=0, ddof=0)
+
+
+def _standardize_noise_columns(noise: np.ndarray) -> np.ndarray:
+    """Center each noise column and scale nonconstant columns to variance one.
+
+    A constant column stays zero. Dividing it by its standard deviation is
+    undefined, and the correlated projection of a constant gene is constant.
+    """
+    centered = _center_columns(noise)
+    std = centered.std(axis=0, ddof=0)
+    safe = np.where(std > 0.0, std, 1.0)
+    return centered / safe
+
+
+def _fit_variance_constrained_coefficients(
+    gamma_x: np.ndarray,
+    gamma_y: np.ndarray,
+    smooth_variance: np.ndarray,
+    valid_bins: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Fit ``gamma = noise_variance + smooth_multiplier * gamma_Y``.
+
+    The coefficients satisfy ``noise_variance + smooth_multiplier * v = 1``
+    and are nonnegative. With ``q_h = gamma_Y(h) - v``,
+
+        smooth_multiplier = clip(sum q_h (gamma_X(h) - 1) / sum q_h^2, 0, 1/v)
+        noise_variance = 1 - smooth_multiplier * v
+
+    A constant smooth or a zero denominator is the pure-noise solution
+    ``smooth_multiplier = 0``, ``noise_variance = 1``. ``gamma_*`` are shaped
+    ``(n_bins, n_columns)`` on the standardized scale.
+    """
+    gamma_x = np.asarray(gamma_x, dtype=np.float64)
+    gamma_y = np.asarray(gamma_y, dtype=np.float64)
+    if gamma_y.shape != gamma_x.shape:
+        raise ValueError(
+            f"gamma_y shape {gamma_y.shape} does not match gamma_x shape {gamma_x.shape}"
+        )
+    n_columns = int(gamma_x.shape[1])
+    variance = np.asarray(smooth_variance, dtype=np.float64).reshape(n_columns)
+    q = gamma_y[valid_bins] - variance
+    denominator = np.sum(q * q, axis=0)
+    numerator = np.sum(q * (gamma_x[valid_bins] - 1.0), axis=0)
+    smooth_multiplier = np.divide(
+        numerator,
+        denominator,
+        out=np.zeros(n_columns, dtype=np.float64),
+        where=denominator > 0.0,
+    )
+    upper = np.divide(
+        np.ones(n_columns, dtype=np.float64),
+        variance,
+        out=np.zeros(n_columns, dtype=np.float64),
+        where=variance > 0.0,
+    )
+    smooth_multiplier = np.clip(smooth_multiplier, 0.0, upper)
+    noise_variance = np.maximum(1.0 - smooth_multiplier * variance, 0.0)
+    theoretical_sse = _constrained_theoretical_sse(
+        noise_variance, smooth_multiplier, gamma_y, gamma_x, valid_bins
+    )
+    return noise_variance, smooth_multiplier, theoretical_sse
+
+
+def _constrained_theoretical_sse(
+    noise_variance: np.ndarray,
+    smooth_multiplier: np.ndarray,
+    gamma_y: np.ndarray,
+    gamma_x: np.ndarray,
+    valid_bins: np.ndarray,
+) -> np.ndarray:
+    fitted = noise_variance + smooth_multiplier * gamma_y
+    difference = fitted[valid_bins] - gamma_x[valid_bins]
+    return np.sum(difference * difference, axis=0)
+
+
+def _identity_constrained_coefficients(
+    gamma_x: np.ndarray,
+    gamma_y: np.ndarray,
+    valid_bins: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The nn=0 baseline is the permutation itself: no noise, multiplier one."""
+    n_columns = int(gamma_x.shape[1])
+    noise_variance = np.zeros(n_columns, dtype=np.float64)
+    smooth_multiplier = np.ones(n_columns, dtype=np.float64)
+    theoretical_sse = _constrained_theoretical_sse(
+        noise_variance, smooth_multiplier, gamma_y, gamma_x, valid_bins
+    )
+    return noise_variance, smooth_multiplier, theoretical_sse
+
+
+def _mix_variance_constrained(
+    smooth: np.ndarray,
+    noise_variance: np.ndarray,
+    smooth_multiplier: np.ndarray,
+    noise: np.ndarray,
+) -> np.ndarray:
+    """``Z = sqrt(smooth_multiplier) * Y + sqrt(noise_variance) * R``."""
+    return smooth * np.sqrt(smooth_multiplier) + noise * np.sqrt(noise_variance)
+
+
+def _to_input_units(
+    standardized: np.ndarray,
+    input_mean: np.ndarray,
+    input_std: np.ndarray,
+) -> np.ndarray:
+    """Map a standardized field back by the input mean and standard deviation.
+
+    This does not divide by the realized standard deviation of ``standardized``.
+    """
+    return standardized * input_std + input_mean
+
+
+def _finalize_constrained_field(
+    standardized: np.ndarray,
+    input_mean: np.ndarray,
+    input_std: np.ndarray,
+    identity_columns: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Normalize only the winning mixture; return its variogram scale factor.
+
+    Centering leaves pair differences unchanged. Dividing by its SD multiplies
+    every already-computed variogram bin by 1 / Var(Z). Identity columns retain
+    the original permutation, and constant input genes remain constant.
+    """
+    centered = _center_columns(standardized)
+    variance = np.mean(centered * centered, axis=0)
+    active = np.asarray(input_std) > 0.0
+    if np.any(active & ((variance <= 0.0) | ~np.isfinite(variance))):
+        raise ValueError("A selected variance-constrained surrogate has invalid variance.")
+    scale = np.ones_like(variance)
+    rescale = active & ~np.asarray(identity_columns, dtype=bool)
+    np.divide(1.0, variance, out=scale, where=rescale)
+    normalized = centered * np.sqrt(scale)
+    normalized[:, identity_columns] = standardized[:, identity_columns]
+    return _to_input_units(normalized, input_mean, input_std), scale
+
+
+def _smooth_noise_covariance(smooth: np.ndarray, noise: np.ndarray) -> np.ndarray:
+    return np.mean(smooth * noise, axis=0)
+
+
+def _covariance_variance_contribution(
+    noise_variance: np.ndarray,
+    smooth_multiplier: np.ndarray,
+    covariance: np.ndarray,
+) -> np.ndarray:
+    """``2 * sqrt(noise_variance * smooth_multiplier) * Cov(Y, R)``.
+
+    For centered unit-variance noise this is ``Var(Z) - (noise_variance + smooth_multiplier * Var(Y))``.
+    """
+    return 2.0 * np.sqrt(noise_variance * smooth_multiplier) * covariance
+
+
+def _diagnostic_realized_columns(
+    n_columns: int,
+    plot_gene_indices: np.ndarray,
+    *,
+    record_slot0: bool,
+    collect_trace: bool,
+) -> np.ndarray | None:
+    """Columns whose realized candidate curves are retained for diagnostics.
+
+    Every gene is scored for selection. A trace retains every curve; otherwise
+    only the slot-0 plot genes are retained.
+    """
+    if collect_trace:
+        return np.arange(int(n_columns), dtype=np.int64)
+    if record_slot0:
+        return np.asarray(plot_gene_indices, dtype=np.int64)
+    return None
+
+
+def _realized_variogram_columns(
+    field: np.ndarray,
+    gamma_target: np.ndarray,
+    valid_bins: np.ndarray,
+    geom: _VariogramGeometry,
+    columns: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Empirical variogram and SSE on ``columns``, with NaN elsewhere."""
+    n_bins = int(geom.lag_centers.size)
+    n_columns = int(field.shape[1])
+    realized_gamma = np.full((n_bins, n_columns), np.nan, dtype=np.float64)
+    realized_sse = np.full(n_columns, np.nan, dtype=np.float64)
+    if columns is None:
+        return realized_gamma, realized_sse
+    columns = np.asarray(columns, dtype=np.int64)
+    if columns.size == 0:
+        return realized_gamma, realized_sse
+    gamma_columns = _classical_variogram(field[:, columns], geom)
+    sse_columns = _empirical_variogram_sse(
+        gamma_columns,
+        np.asarray(gamma_target, dtype=np.float64)[:, columns],
+        valid_bins,
+    )
+    realized_gamma[:, columns] = gamma_columns
+    realized_sse[columns] = sse_columns
+    return realized_gamma, realized_sse
+
+
+def _score_variance_constrained_candidate(
+    smooth_raw: np.ndarray,
+    noise: np.ndarray,
+    gamma_x: np.ndarray,
+    valid_bins: np.ndarray,
+    geom: _VariogramGeometry,
+    *,
+    identity: bool,
+    input_mean: np.ndarray,
+    input_std: np.ndarray,
+    gamma_target: np.ndarray,
+    gamma_y: np.ndarray | None = None,
+    realized_columns: np.ndarray | None = None,
+) -> dict[str, Any]:
+    """Fit and score one variance-constrained noisy surrogate.
+
+    Nonconstant genes are already standardized. Constant input genes stay
+    constant. The identity bandwidth returns the exact permutation, with noise
+    variance 0 and smooth multiplier 1. Other bandwidths of a constant gene use
+    a zero mixture rather than unit noise the projection cannot supply.
+
+    ``gamma_y``, when given, is the smooth variogram and is not recomputed.
+    Coefficients are fitted on the constrained theoretical curve, then the
+    actual noisy mixture is normalized to the input moments and scored on its
+    realized variogram. ``realized_columns`` limits the returned variogram
+    curves, but the returned SSE is computed for every gene because it drives
+    candidate selection.
+    """
+    variogram_seconds = 0.0
+    smooth_raw = np.asarray(smooth_raw, dtype=np.float64)
+    noise = np.asarray(noise, dtype=np.float64)
+    input_std = np.asarray(input_std, dtype=np.float64)
+    n_columns = int(smooth_raw.shape[1])
+    if gamma_y is not None:
+        gamma_y = np.asarray(gamma_y, dtype=np.float64)
+        expected = (len(geom.bin_matrices), n_columns)
+        if gamma_y.shape != expected:
+            raise ValueError(
+                f"gamma_y shape {gamma_y.shape} does not match {expected}"
+            )
+    constant_input = input_std <= 0.0
+    if identity:
+        # Shift-invariant variogram of the exact permutation.
+        if gamma_y is None:
+            t_var = time.perf_counter()
+            gamma_y = _classical_variogram(smooth_raw, geom)
+            variogram_seconds += time.perf_counter() - t_var
+        smooth_variance = _population_column_variance(smooth_raw)
+        noise_variance, smooth_multiplier, theoretical_sse = _identity_constrained_coefficients(
+            gamma_x, gamma_y, valid_bins
+        )
+        standardized = np.array(smooth_raw, copy=True)
+        centered_smooth = _center_columns(smooth_raw)
+        smooth_standardized = standardized
+    else:
+        centered_smooth = _center_columns(smooth_raw)
+        smooth_variance = _population_column_variance(centered_smooth)
+        if gamma_y is None:
+            t_var = time.perf_counter()
+            gamma_y = _classical_variogram(centered_smooth, geom)
+            variogram_seconds += time.perf_counter() - t_var
+        noise_variance, smooth_multiplier, theoretical_sse = _fit_variance_constrained_coefficients(
+            gamma_x, gamma_y, smooth_variance, valid_bins
+        )
+        standardized = _mix_variance_constrained(
+            centered_smooth, noise_variance, smooth_multiplier, noise
+        )
+        smooth_standardized = centered_smooth
+    if np.any(constant_input):
+        # A constant gene has no unit-variance model. Keep the constant field.
+        # Identity stays the exact permutation (coefficients 0 and 1). Every
+        # other bandwidth is recorded as a zero mixture rather than unit noise
+        # that the projection cannot actually supply.
+        theoretical_sse = np.array(theoretical_sse, copy=True)
+        smooth_variance = np.array(smooth_variance, copy=True)
+        theoretical_sse[constant_input] = 0.0
+        smooth_variance[constant_input] = 0.0
+        standardized[:, constant_input] = 0.0
+        if not identity:
+            noise_variance = np.array(noise_variance, copy=True)
+            smooth_multiplier = np.array(smooth_multiplier, copy=True)
+            noise_variance[constant_input] = 0.0
+            smooth_multiplier[constant_input] = 0.0
+    # Candidate selection must see the field that will be returned.  In
+    # particular, the shared noise draw creates finite-sample cross-terms and
+    # the final moment normalization rescales its variogram.  Score that
+    # normalized realization rather than only the theoretical mixture curve.
+    identity_columns = np.full(n_columns, bool(identity), dtype=bool)
+    selection_field, _selection_scale = _finalize_constrained_field(
+        standardized, input_mean, input_std, identity_columns
+    )
+    t_var = time.perf_counter()
+    selection_gamma = _classical_variogram(selection_field, geom)
+    selection_sse = _empirical_variogram_sse(
+        selection_gamma, gamma_target, valid_bins
+    )
+    realized_gamma = np.full_like(selection_gamma, np.nan)
+    if realized_columns is not None and len(realized_columns):
+        realized_columns = np.asarray(realized_columns, dtype=np.int64)
+        realized_gamma[:, realized_columns] = selection_gamma[:, realized_columns]
+    variogram_seconds += time.perf_counter() - t_var
+    covariance = _smooth_noise_covariance(centered_smooth, noise)
+    if np.any(constant_input):
+        covariance = np.array(covariance, copy=True)
+        covariance[constant_input] = 0.0
+    return {
+        "timing_variogram_sec": variogram_seconds,
+        "gamma_y": gamma_y,
+        "noise_variance": noise_variance,
+        "smooth_multiplier": smooth_multiplier,
+        "theoretical_sse": theoretical_sse,
+        "realized_sse": selection_sse,
+        "realized_gamma": realized_gamma,
+        "field": _to_input_units(standardized, input_mean, input_std),
+        "standardized": standardized,
+        "smooth_variance": smooth_variance,
+        "covariance": covariance,
+        "smooth_standardized": smooth_standardized,
+    }
+
+
+def _selection_frequency_counts(
+    best_k: np.ndarray,
+    noise_variance: np.ndarray,
+    smooth_multiplier: np.ndarray,
+    labels: np.ndarray,
+    identity_index: int | None,
+) -> tuple[int, int, int]:
+    """Upper-boundary, pure-noise, and identity counts for one permutation.
+
+    Upper boundary is the largest candidate label. Pure noise is the
+    constrained solution ``noise_variance = 1``, ``smooth_multiplier = 0``.
+    Identity is the nn=0 permutation baseline.
+    """
+    upper_index = int(np.argmax(labels))
+    n_upper = int(np.count_nonzero(best_k == upper_index))
+    pure = (np.asarray(smooth_multiplier) == 0.0) & (np.asarray(noise_variance) == 1.0)
+    n_pure = int(np.count_nonzero(pure))
+    n_identity = 0 if identity_index is None else int(np.count_nonzero(best_k == int(identity_index)))
+    return n_upper, n_pure, n_identity
+
+
 def _apply_blur_weights(
     weights: np.ndarray | csr_matrix,
     expression: np.ndarray,
@@ -399,6 +763,7 @@ def _slot0_variogram_diagnostics(
     *,
     blur_mode: str,
     backend: str,
+    fit_mode: str,
     input_variance: np.ndarray,
     input_std: np.ndarray,
     input_mean: np.ndarray,
@@ -423,13 +788,19 @@ def _slot0_variogram_diagnostics(
     plot_gene_indices: np.ndarray,
     plot_gene_names: list[str],
     extra_diagnostics: dict[str, Any],
+    smooth_variance_best: np.ndarray | None = None,
+    smooth_noise_covariance_best: np.ndarray | None = None,
+    final_variogram_scale: np.ndarray | None = None,
 ) -> dict[str, Any]:
     """Diagnostics for permutation slot 0, on the original expression scale.
 
-    ``sse`` is the nonnegative coefficient residual on the standardized
-    blurred field. ``realized_sse`` and ``realized_gamma`` are the empirical
-    variogram of each moment-restored candidate, which is the selection
-    objective.
+    ``slope`` multiplies the smooth variogram and ``intercept`` is the nugget.
+    In variance-constrained mode those are ``smooth_multiplier`` and
+    ``noise_variance``. ``sse`` is the coefficient or constrained theoretical
+    residual on the standardized variogram. ``realized_sse`` is the empirical
+    variogram error after candidate normalization.
+    Both fit modes use the realized error of the normalized candidate for
+    candidate selection.
     """
     n_candidates = int(labels.size)
     n_bins = int(geom.lag_centers.size)
@@ -442,13 +813,33 @@ def _slot0_variogram_diagnostics(
             )
     best_label_slot0 = np.array([labels[int(best_k[g])] for g in plot_gene_indices])
     realized_plot = np.asarray(realized_gamma, dtype=np.float64)[:, :, plot_gene_indices]
+    constrained = fit_mode == "variance_constrained"
+    algorithm_version = (
+        VARIANCE_CONSTRAINED_ALGORITHM_VERSION if constrained else LEGACY_VARIOGRAM_ALGORITHM_VERSION
+    )
+    theoretical_best_plot = np.array(
+        [sse[int(best_k[g]), g] * input_variance[g] ** 2 for g in plot_gene_indices],
+        dtype=np.float32,
+    )
+    realized_best_plot = np.array(
+        [realized_sse[int(best_k[g]), g] for g in plot_gene_indices],
+        dtype=np.float32,
+    )
+    # Every plotted winner already has an empirical candidate variogram on the
+    # same final scale used for selection.
+    final_gamma = np.column_stack([
+        realized_gamma[int(best_k[g]), :, g] for g in plot_gene_indices
+    ]) if n_plot else np.empty((n_bins, 0), dtype=np.float64)
     diagnostics = {
         "variogram_blur_mode": blur_mode,
         "variogram_backend": backend,
+        "variogram_fit_mode": fit_mode,
         "variance_matching": "input_gene_moments",
-        "algorithm_version": 3,
+        "algorithm_version": algorithm_version,
         "selection_objective": "final_surrogate_empirical_variogram",
-        "variogram_fit": "nonnegative_least_squares",
+        "variogram_fit": (
+            "variance_constrained" if constrained else "nonnegative_least_squares"
+        ),
         "input_gene_variance": input_variance.copy(),
         "surrogate_gene_variance": x_final.var(axis=0),
         "coords": coords.astype(np.float32),
@@ -464,23 +855,60 @@ def _slot0_variogram_diagnostics(
         "X_final": x_final[:, plot_gene_indices].astype(np.float32),
         "variogram_real": (gamma_x * input_variance)[:, plot_gene_indices].astype(np.float32),
         "variogram_permuted": (gamma_pi * input_variance)[:, plot_gene_indices].astype(np.float32),
-        "variogram_final": _classical_variogram(x_final, geom)[:, plot_gene_indices].astype(np.float32),
+        "variogram_final": final_gamma.astype(np.float32),
         "fitted_variograms_candidates": fitted_curves.astype(np.float32),
         "realized_variograms_candidates": realized_plot.astype(np.float32),
         "best_candidate_per_plot_gene": best_label_slot0.astype(np.float32),
         "intercept_best_plot": (b_best * input_variance)[plot_gene_indices].astype(np.float32),
         "slope_best_plot": a_best[plot_gene_indices].astype(np.float32),
-        "coefficient_sse_best_plot": np.array(
-            [sse[best_k[g], g] * input_variance[g] ** 2 for g in plot_gene_indices],
-            dtype=np.float32,
-        ),
-        "sse_best_plot": np.array(
-            [realized_sse[int(best_k[g]), g] for g in plot_gene_indices],
-            dtype=np.float32,
-        ),
+        "coefficient_sse_best_plot": theoretical_best_plot,
+        "sse_best_plot": realized_best_plot,
+        "realized_sse_best_plot": realized_best_plot,
+        "theoretical_sse_candidates": (
+            np.asarray(sse, dtype=np.float64)[:, plot_gene_indices]
+            * input_variance[plot_gene_indices] ** 2
+        ).astype(np.float32),
         "realized_sse_candidates": np.asarray(realized_sse, dtype=np.float64)[:, plot_gene_indices].astype(np.float32),
         **extra_diagnostics,
     }
+    if constrained:
+        if smooth_variance_best is None or smooth_noise_covariance_best is None:
+            raise ValueError("Variance-constrained diagnostics require smooth variance and covariance")
+        component = b_best + a_best * smooth_variance_best
+        contribution = _covariance_variance_contribution(
+            b_best, a_best, smooth_noise_covariance_best
+        )
+        realized_z = x_final.var(axis=0) / np.where(input_variance > 0.0, input_variance, np.nan)
+        scale = np.ones_like(input_variance) if final_variogram_scale is None else final_variogram_scale
+        before_z = np.where(input_variance > 0.0, 1.0 / scale, np.nan)
+        unnormalized_best_plot = _empirical_variogram_sse(
+            final_gamma / scale[plot_gene_indices],
+            (gamma_x * input_variance)[:, plot_gene_indices],
+            geom.valid_bins,
+        ).astype(np.float32)
+        diagnostics.update(
+            {
+                "final_variogram_scale": np.asarray(scale, dtype=np.float64),
+                "final_variogram_scale_best_plot": np.asarray(scale[plot_gene_indices], dtype=np.float32),
+                "pre_normalization_variance_ratio": before_z,
+                "pre_normalization_variance_ratio_best_plot": before_z[plot_gene_indices].astype(np.float32),
+                "pre_normalization_sse_best_plot": unnormalized_best_plot,
+                "candidate_variogram_scale": "after_candidate_normalization",
+                "noise_variance_best": np.asarray(b_best, dtype=np.float64),
+                "smooth_multiplier_best": np.asarray(a_best, dtype=np.float64),
+                "smooth_variance_best": np.asarray(smooth_variance_best, dtype=np.float64),
+                "component_variance": np.asarray(component, dtype=np.float64),
+                "realized_variance_ratio": realized_z.astype(np.float64),
+                "smooth_noise_covariance": np.asarray(smooth_noise_covariance_best, dtype=np.float64),
+                "covariance_variance_contribution": np.asarray(contribution, dtype=np.float64),
+                "noise_variance_best_plot": np.asarray(b_best, dtype=np.float64)[plot_gene_indices].astype(np.float32),
+                "smooth_multiplier_best_plot": np.asarray(a_best, dtype=np.float64)[plot_gene_indices].astype(np.float32),
+                "component_variance_best_plot": np.asarray(component, dtype=np.float64)[plot_gene_indices].astype(np.float32),
+                "realized_variance_ratio_best_plot": realized_z[plot_gene_indices].astype(np.float32),
+                "smooth_noise_covariance_best_plot": np.asarray(smooth_noise_covariance_best, dtype=np.float64)[plot_gene_indices].astype(np.float32),
+                "covariance_variance_contribution_best_plot": np.asarray(contribution, dtype=np.float64)[plot_gene_indices].astype(np.float32),
+            }
+        )
     if blur_mode == "uniform":
         diagnostics["sigma_multiples"] = labels.astype(np.float32)
         diagnostics["best_multiplier_per_plot_gene"] = best_label_slot0.astype(np.float32)
@@ -504,6 +932,7 @@ def _run_variogram_matching(
     blur_mode: str,
     identity_index: int | None,
     extra_diagnostics: dict[str, Any],
+    fit_mode: str = "legacy",
     verbose: bool = True,
     progress_label: str | None = None,
     collect_trace: bool = False,
@@ -548,12 +977,18 @@ def _run_variogram_matching(
     else:
         plot_gene_names = [f"gene_{i}" for i in plot_gene_indices]
 
+    fit_mode = _normalize_variogram_fit_mode(fit_mode)
+    constrained = fit_mode == "variance_constrained"
     A_surr = np.empty((n_perms, n_cells, n_genes), dtype=np.float32)
     selection_counts = np.zeros((n_genes, n_candidates), dtype=np.int64)
+    n_upper_boundary = 0
+    n_pure_noise = 0
+    n_identity_selections = 0
     diagnostics: dict[str, Any] | None = None
     trace_perms = trace_noise = None
     trace_gamma = trace_sse = trace_coefficient_sse = None
     trace_slope = trace_intercept = trace_best = None
+    trace_realized_sse = None
     if collect_trace:
         trace_perms = np.empty((n_perms, n_cells), dtype=np.int64)
         trace_noise = np.empty((n_perms, n_cells, n_cells), dtype=np.float64)
@@ -563,6 +998,8 @@ def _run_variogram_matching(
         trace_slope = np.empty_like(trace_sse)
         trace_intercept = np.empty_like(trace_sse)
         trace_best = np.empty((n_perms, n_genes), dtype=np.int64)
+        if constrained:
+            trace_realized_sse = np.empty_like(trace_sse)
     gamma_target = gamma_x * input_variance
     desc = "variogram matching"
     if progress_label:
@@ -575,65 +1012,132 @@ def _run_variogram_matching(
         perm = rng.permutation(n_cells)
         w_noise = rng.standard_normal((n_cells, n_cells))
         r_noise = (w_noise @ X) / np.sqrt(float(n_cells))
+        if constrained:
+            # One centered, unit-variance noise column per gene, shared by every bandwidth.
+            r_noise = _standardize_noise_columns(r_noise)
         x_pi = X[perm]
         t_var = time.perf_counter()
-        gamma_pi = _classical_variogram(x_pi, geom)
+        gamma_pi = (
+            _classical_variogram(x_pi, geom)
+            if p == 0 or not constrained else None
+        )
         timing_variogram += time.perf_counter() - t_var
 
         t_smooth = time.perf_counter()
         y_blurred = candidate_builder(x_pi).astype(np.float64)
         timing_smooth += time.perf_counter() - t_smooth
-        t_var = time.perf_counter()
-        gamma_y = np.stack(
-            [_classical_variogram(y_blurred[k], geom) for k in range(n_candidates)],
-            axis=0,
-        )
-        timing_variogram += time.perf_counter() - t_var
-        t_fit = time.perf_counter()
-        sse, intercept, slope = _fit_variogram_sse(gamma_x, gamma_y, geom.valid_bins)
-        if identity_index is not None:
-            # The identity branch is the raw row permutation, not an affine
-            # mixture. Coefficients stay a=1, b=0; selection scores the
-            # moment-restored permutation itself.
-            slope[identity_index] = 1.0
-            intercept[identity_index] = 0.0
-            sse[identity_index] = np.sum(
-                (gamma_x[geom.valid_bins] - gamma_y[identity_index, geom.valid_bins])**2,
-                axis=0,
-            )
-        timing_fit += time.perf_counter() - t_fit
-
+        n_lag = int(geom.lag_centers.size)
+        gamma_y = np.empty((n_candidates, n_lag, n_genes), dtype=np.float64)
+        slope = np.empty((n_candidates, n_genes), dtype=np.float64)
+        intercept = np.empty_like(slope)
+        sse = np.empty_like(slope)
+        realized_sse = np.empty_like(slope)
+        realized_gamma = np.empty((n_candidates, n_lag, n_genes), dtype=np.float64)
         best_sse = np.full(n_genes, np.inf, dtype=np.float64)
         best_k = np.zeros(n_genes, dtype=np.int64)
         best_final = np.empty((n_cells, n_genes), dtype=np.float64)
         y_best = np.empty((n_cells, n_genes), dtype=np.float64)
         a_best = np.empty(n_genes, dtype=np.float64)
         b_best = np.empty(n_genes, dtype=np.float64)
-        realized_sse = np.empty((n_candidates, n_genes), dtype=np.float64)
-        realized_gamma = np.empty((n_candidates, geom.lag_centers.size, n_genes), dtype=np.float64)
-        for k in range(n_candidates):
-            t_var = time.perf_counter()
-            restored, gamma_k, sse_k = _score_restored_candidate(
-                y_blurred[k],
-                slope[k],
-                intercept[k],
-                r_noise,
-                identity=identity_index is not None and k == int(identity_index),
-                input_mean=input_mean,
-                input_std=input_std,
-                gamma_target=gamma_target,
-                geom=geom,
+        smooth_variance_best = np.empty(n_genes, dtype=np.float64)
+        covariance_best = np.empty(n_genes, dtype=np.float64)
+        final_variogram_scale = None
+        if constrained:
+            z_best = np.empty((n_cells, n_genes), dtype=np.float64)
+            realized_columns = _diagnostic_realized_columns(
+                n_genes,
+                plot_gene_indices,
+                record_slot0=p == 0,
+                collect_trace=collect_trace,
             )
+            for k in range(n_candidates):
+                t_fit = time.perf_counter()
+                scored = _score_variance_constrained_candidate(
+                    y_blurred[k],
+                    r_noise,
+                    gamma_x,
+                    geom.valid_bins,
+                    geom,
+                    identity=identity_index is not None and k == int(identity_index),
+                    input_mean=input_mean,
+                    input_std=input_std,
+                    gamma_target=gamma_target,
+                    realized_columns=realized_columns,
+                )
+                timing_fit += time.perf_counter() - t_fit - scored["timing_variogram_sec"]
+                timing_variogram += scored["timing_variogram_sec"]
+                gamma_y[k] = scored["gamma_y"]
+                # slope is the smooth multiplier; intercept is the noise variance.
+                slope[k] = scored["smooth_multiplier"]
+                intercept[k] = scored["noise_variance"]
+                sse[k] = scored["theoretical_sse"]
+                realized_sse[k] = scored["realized_sse"]
+                realized_gamma[k] = scored["realized_gamma"]
+                # Select on the normalized, noisy field returned by the
+                # generator. The constrained theoretical SSE remains a
+                # diagnostic of the coefficient fit.
+                improved = _strictly_better(realized_sse[k], best_sse)
+                if k == 0:
+                    improved = np.ones(n_genes, dtype=bool)
+                best_sse[improved] = realized_sse[k, improved]
+                best_k[improved] = k
+                y_best[:, improved] = scored["smooth_standardized"][:, improved]
+                a_best[improved] = slope[k, improved]
+                b_best[improved] = intercept[k, improved]
+                smooth_variance_best[improved] = scored["smooth_variance"][improved]
+                covariance_best[improved] = scored["covariance"][improved]
+                z_best[:, improved] = scored["standardized"][:, improved]
+            identity_columns = np.zeros(n_genes, dtype=bool) if identity_index is None else best_k == identity_index
+            best_final, final_variogram_scale = _finalize_constrained_field(
+                z_best, input_mean, input_std, identity_columns
+            )
+            n_upper, n_pure, n_identity = _selection_frequency_counts(
+                best_k, b_best, a_best, labels, identity_index
+            )
+            n_upper_boundary += n_upper
+            n_pure_noise += n_pure
+            n_identity_selections += n_identity
+        else:
+            t_var = time.perf_counter()
+            for k in range(n_candidates):
+                gamma_y[k] = _classical_variogram(y_blurred[k], geom)
             timing_variogram += time.perf_counter() - t_var
-            realized_sse[k] = sse_k
-            realized_gamma[k] = gamma_k
-            improved = _strictly_better(sse_k, best_sse)
-            best_sse[improved] = sse_k[improved]
-            best_k[improved] = k
-            best_final[:, improved] = restored[:, improved]
-            y_best[:, improved] = y_blurred[k][:, improved]
-            a_best[improved] = slope[k, improved]
-            b_best[improved] = intercept[k, improved]
+            t_fit = time.perf_counter()
+            sse, intercept, slope = _fit_variogram_sse(gamma_x, gamma_y, geom.valid_bins)
+            if identity_index is not None:
+                # The identity branch is the raw row permutation, not an affine
+                # mixture. Coefficients stay slope=1, intercept=0; selection
+                # scores the moment-restored permutation itself.
+                slope[identity_index] = 1.0
+                intercept[identity_index] = 0.0
+                sse[identity_index] = np.sum(
+                    (gamma_x[geom.valid_bins] - gamma_y[identity_index, geom.valid_bins])**2,
+                    axis=0,
+                )
+            timing_fit += time.perf_counter() - t_fit
+            for k in range(n_candidates):
+                t_var = time.perf_counter()
+                restored, gamma_k, sse_k = _score_restored_candidate(
+                    y_blurred[k],
+                    slope[k],
+                    intercept[k],
+                    r_noise,
+                    identity=identity_index is not None and k == int(identity_index),
+                    input_mean=input_mean,
+                    input_std=input_std,
+                    gamma_target=gamma_target,
+                    geom=geom,
+                )
+                timing_variogram += time.perf_counter() - t_var
+                realized_sse[k] = sse_k
+                realized_gamma[k] = gamma_k
+                improved = _strictly_better(sse_k, best_sse)
+                best_sse[improved] = sse_k[improved]
+                best_k[improved] = k
+                best_final[:, improved] = restored[:, improved]
+                y_best[:, improved] = y_blurred[k][:, improved]
+                a_best[improved] = slope[k, improved]
+                b_best[improved] = intercept[k, improved]
         selection_counts[np.arange(n_genes), best_k] += 1
         A_surr[p] = best_final
         if collect_trace:
@@ -649,11 +1153,14 @@ def _run_variogram_matching(
             trace_slope[p] = slope
             trace_intercept[p] = intercept
             trace_best[p] = best_k
+            if trace_realized_sse is not None:
+                trace_realized_sse[p] = realized_sse
 
         if p == 0:
             diagnostics = _slot0_variogram_diagnostics(
                 blur_mode=blur_mode,
                 backend="sequential",
+                fit_mode=fit_mode,
                 input_variance=input_variance,
                 input_std=input_std,
                 input_mean=input_mean,
@@ -678,11 +1185,20 @@ def _run_variogram_matching(
                 plot_gene_indices=plot_gene_indices,
                 plot_gene_names=plot_gene_names,
                 extra_diagnostics=extra_diagnostics,
+                smooth_variance_best=smooth_variance_best if constrained else None,
+                smooth_noise_covariance_best=covariance_best if constrained else None,
+                final_variogram_scale=final_variogram_scale,
             )
 
     assert diagnostics is not None
     diagnostics["selection_counts"] = selection_counts
     diagnostics["selection_counts_columns"] = labels.astype(np.float64)
+    if constrained:
+        n_selections = float(n_perms * n_genes)
+        diagnostics["upper_boundary_label"] = float(np.max(labels))
+        diagnostics["upper_boundary_frequency"] = n_upper_boundary / n_selections
+        diagnostics["pure_noise_frequency"] = n_pure_noise / n_selections
+        diagnostics["identity_selection_frequency"] = n_identity_selections / n_selections
     if collect_timings:
         diagnostics["timing_smooth_sec"] = float(timing_smooth)
         diagnostics["timing_variogram_sec"] = float(timing_variogram)
@@ -697,6 +1213,8 @@ def _run_variogram_matching(
         diagnostics["trace_slope"] = trace_slope
         diagnostics["trace_intercept"] = trace_intercept
         diagnostics["trace_best_k"] = trace_best
+        if trace_realized_sse is not None:
+            diagnostics["trace_realized_sse"] = trace_realized_sse
     return A_surr, diagnostics
 
 
@@ -717,6 +1235,7 @@ def build_correlated_null_surrogates(
     weight_cache_bytes: int | None = None,
     collect_trace: bool = False,
     collect_timings: bool = False,
+    fit_mode: str = "legacy",
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """Uniform-bandwidth variogram nulls (σ = m × median NN distance)."""
     multiples = [float(m) for m in sigma_multiples]
@@ -756,6 +1275,7 @@ def build_correlated_null_surrogates(
             collect_trace=collect_trace,
             blur_weights=blur_weights,
             adaptive_plan=None,
+            fit_mode=fit_mode,
         )
 
     def _builder(x_pi: np.ndarray) -> np.ndarray:
@@ -774,6 +1294,7 @@ def build_correlated_null_surrogates(
         blur_mode="uniform",
         identity_index=None,
         extra_diagnostics={"median_nn_distance": base_d},
+        fit_mode=fit_mode,
         verbose=verbose,
         progress_label=progress_label,
         collect_trace=collect_trace,
@@ -798,6 +1319,7 @@ def build_correlated_null_adaptive_surrogates(
     weight_cache_bytes: int | None = None,
     collect_trace: bool = False,
     collect_timings: bool = False,
+    fit_mode: str = "legacy",
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """STCompare-style adaptive locfit Gaussian blur (nn fraction candidates, nn=0 identity)."""
     resolved_backend = _normalize_variogram_backend(backend)
@@ -831,6 +1353,7 @@ def build_correlated_null_adaptive_surrogates(
             collect_trace=collect_trace,
             blur_weights=None,
             adaptive_plan=plan,
+            fit_mode=fit_mode,
         )
 
     def _builder(x_pi: np.ndarray) -> np.ndarray:
@@ -849,6 +1372,7 @@ def build_correlated_null_adaptive_surrogates(
         blur_mode="adaptive",
         identity_index=plan.identity_index,
         extra_diagnostics={"locfit_gaussian_factor": LOCFIT_GAUSSIAN_FACTOR},
+        fit_mode=fit_mode,
         verbose=verbose,
         progress_label=progress_label,
         collect_trace=collect_trace,
@@ -886,6 +1410,7 @@ def build_correlated_null_surrogates_from_dataset(
         backend=str(config.variogram_backend),
         perm_batch_size=config.variogram_perm_batch_size,
         collect_timings=True,
+        fit_mode=str(config.variogram_fit_mode),
     )
 
 
@@ -919,4 +1444,5 @@ def build_correlated_null_adaptive_surrogates_from_dataset(
         backend=str(config.variogram_backend),
         perm_batch_size=config.variogram_perm_batch_size,
         collect_timings=True,
+        fit_mode=str(config.variogram_fit_mode),
     )
